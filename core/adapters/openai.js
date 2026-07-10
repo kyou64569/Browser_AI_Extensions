@@ -30,11 +30,13 @@ export class OpenAIAdapter extends ModelClient {
   }
 
   async *_stream(req, signal) {
-    const { maxTokens, ...otherOptions } = req.options || {};
+    const { maxTokens, thinkingStrength, ...otherOptions } = req.options || {};
     const body = {
       model: this.config.model,
       messages: this._toVendor(req),
       stream: true,
+      ...(maxTokens != null ? { max_tokens: maxTokens } : {}),
+      ...(thinkingStrength && thinkingStrength !== 'off' ? { reasoning_effort: thinkingStrength } : {}),
       ...otherOptions,
     };
     const res = await fetchWithTimeout(this.endpoint, {
@@ -75,11 +77,13 @@ export class OpenAIAdapter extends ModelClient {
   }
 
   async *_nonStream(req, signal) {
-    const { maxTokens, ...otherOptions } = req.options || {};
+    const { maxTokens, thinkingStrength, ...otherOptions } = req.options || {};
     const body = {
       model: this.config.model,
       messages: this._toVendor(req),
       stream: false,
+      ...(maxTokens != null ? { max_tokens: maxTokens } : {}),
+      ...(thinkingStrength && thinkingStrength !== 'off' ? { reasoning_effort: thinkingStrength } : {}),
       ...otherOptions,
     };
     const json = await postJson(

@@ -95,9 +95,9 @@ export class FallbackManager {
     let lastErr;
     for (let i = 0; i < pool.length; i++) {
       const cfg = pool[i];
+      let produced = false;
       try {
         const client = createClient(cfg);
-        let produced = false;
         for await (const chunk of client.chat(req)) {
           produced = true;
           yield { ...chunk, model: cfg.name, index: i };

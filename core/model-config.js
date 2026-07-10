@@ -14,10 +14,13 @@
  * @property {string} apiBase      API Base URL（如 https://api.openai.com/v1）
  * @property {string} apiKey       API Key（存于 storage.local，明文不入库）
  * @property {string} model        厂商模型名（如 gpt-4o、claude-3-5-sonnet）
- * @property {boolean} supportsVision  是否支持视觉/多模态
+ * @property {boolean} supportsVision  是否设为视觉模型（图片识别专用，全局互斥）
  * @property {boolean} supportsStream  是否支持流式
  * @property {number} timeoutMs    单次调用超时（默认 60000）
- * @property {boolean} [enabled]   是否启用（默认 true）
+ * @property {boolean} [enabled]   是否启用（默认 true；仅"多模型协作"模式下参与协作对话）
+ * @property {boolean} [isPrimary] 是否设为主模型（仅"多模型协作"模式生效，单选）
+ * @property {boolean} [supportsThinking] 是否开启"思考"能力
+ * @property {string}  [thinkingStrength] 思考强度：'off'|'low'|'medium'|'high'（默认 'off'）
  */
 
 /**
@@ -37,6 +40,9 @@ export function createModelConfig(overrides = {}) {
     supportsStream: overrides.supportsStream ?? true,
     timeoutMs: overrides.timeoutMs || 60000,
     enabled: overrides.enabled ?? true,
+    isPrimary: overrides.isPrimary ?? false,
+    supportsThinking: overrides.supportsThinking ?? false,
+    thinkingStrength: overrides.thinkingStrength || 'off',
   };
 }
 

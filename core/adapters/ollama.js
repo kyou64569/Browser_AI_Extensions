@@ -18,7 +18,7 @@ export class OllamaAdapter extends ModelClient {
         const images = m.attachments
           .map(a => {
             const m2 = a.data.match(/^data:(.+?);base64,(.+)$/);
-            return m2 ? m2[1] : null; // Ollama 图片要裸 base64
+            return m2 ? m2[2] : null; // Ollama 图片要裸 base64（m2[2] 为 base64 数据，m2[1] 是 MIME）
           })
           .filter(Boolean);
         return { role: m.role, content: m.content, images };
@@ -34,6 +34,7 @@ export class OllamaAdapter extends ModelClient {
       model: this.config.model,
       messages: this._toVendor(req),
       stream: true,
+      ...(maxTokens != null ? { max_tokens: maxTokens } : {}),
       ...otherOptions,
     };
     const res = await fetchWithTimeout(this.endpoint, {
@@ -67,7 +68,7 @@ export class OllamaAdapter extends ModelClient {
 
   async *_nonStream(req, signal) {
     const { maxTokens, ...otherOptions } = req.options || {};
-    const body = { model: this.config.model, messages: this._toVendor(req), stream: false, ...otherOptions };
+    const body = { model: this.config.model, messages: this._toVendor(req), stream: false, ...(maxTokens != null ? { max_tokens: maxTokens } : {}), ...otherOptions };
     const json = await postJson(this.endpoint, body, {}, this.config.timeoutMs);
     yield { delta: json.message?.content || '', done: true, meta: { raw: json } };
   }

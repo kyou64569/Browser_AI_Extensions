@@ -7,7 +7,7 @@
 
 import { Router } from '../core/router.js';
 import { FallbackManager } from '../core/fallback.js';
-import { hasCred } from '../shared/utils.js';
+import { hasCred, optionsFromModel } from '../shared/utils.js';
 
 /**
  * 生成总结 prompt
@@ -57,6 +57,7 @@ export async function summarizePage(ctx, page, opts = {}) {
   const req = {
     messages: buildMessages(page.title, page.text, kbChunks),
     stream: opts.stream ?? true,
+    options: optionsFromModel(candidates[0]),
     ...(opts.signal ? { signal: opts.signal } : {}),
   };
   return fb.call(candidates, req);

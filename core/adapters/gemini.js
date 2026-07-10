@@ -36,12 +36,19 @@ export class GeminiAdapter extends ModelClient {
   }
 
   async *_stream(req, signal) {
+    const { maxTokens, temperature, topP, top_p } = req.options || {};
     const body = this._toVendor(req);
-    const { maxTokens, ...otherOptions } = req.options || {};
+    const generationConfig = {
+      ...(maxTokens != null ? { maxOutputTokens: maxTokens } : {}),
+      ...(temperature != null ? { temperature } : {}),
+      ...(topP != null ? { topP } : {}),
+      ...(top_p != null ? { topP: top_p } : {}),
+    };
+    if (Object.keys(generationConfig).length) body.generationConfig = generationConfig;
     const res = await fetchWithTimeout(this._endpoint(true), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...body, ...otherOptions }),
+      body: JSON.stringify(body),
       signal,
     }, this.config.timeoutMs);
     const reader = res.body.getReader();
@@ -69,9 +76,16 @@ export class GeminiAdapter extends ModelClient {
   }
 
   async *_nonStream(req, signal) {
+    const { maxTokens, temperature, topP, top_p } = req.options || {};
     const body = this._toVendor(req);
-    const { maxTokens, ...otherOptions } = req.options || {};
-    const json = await postJson(this._endpoint(false), { ...body, ...otherOptions }, {}, this.config.timeoutMs);
+    const generationConfig = {
+      ...(maxTokens != null ? { maxOutputTokens: maxTokens } : {}),
+      ...(temperature != null ? { temperature } : {}),
+      ...(topP != null ? { topP } : {}),
+      ...(top_p != null ? { topP: top_p } : {}),
+    };
+    if (Object.keys(generationConfig).length) body.generationConfig = generationConfig;
+    const json = await postJson(this._endpoint(false), body, {}, this.config.timeoutMs);
     const candidate = json.candidates?.[0];
     if (!candidate?.content?.parts) {
       yield { delta: '', done: true, meta: { raw: json } };

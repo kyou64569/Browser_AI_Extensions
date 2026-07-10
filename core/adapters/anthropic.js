@@ -5,6 +5,17 @@
 import { ModelClient } from '../model-base.js';
 import { postJson, fetchWithTimeout } from '../http.js';
 
+/** Anthropic 思考预算（tokens）档位映射 */
+const ANTHROPIC_THINKING_BUDGET = { low: 2000, medium: 8000, high: 16000 };
+
+/** 把 thinkingStrength 转成 Anthropic thinking 参数；'off'/无则返回 null */
+function mapAnthropicThinking(strength) {
+  if (!strength || strength === 'off') return null;
+  const budget = ANTHROPIC_THINKING_BUDGET[strength];
+  if (!budget) return null;
+  return { type: 'enabled', budget_tokens: budget };
+}
+
 export class AnthropicAdapter extends ModelClient {
   get endpoint() {
     return this.config.apiBase.replace(/\/$/, '') + '/messages';
@@ -39,13 +50,18 @@ export class AnthropicAdapter extends ModelClient {
 
   async *_stream(req, signal) {
     const { system, messages } = this._toVendor(req);
-    const { maxTokens, ...otherOptions } = req.options || {};
+    const { maxTokens, thinkingStrength, ...otherOptions } = req.options || {};
+    const thinking = mapAnthropicThinking(thinkingStrength);
+    // Anthropic 要求 max_tokens 大于 thinking 预算
+    const budget = thinking?.budget_tokens || 0;
+    const maxTokensEff = Math.max(maxTokens ?? 1024, budget + 1024);
     const body = {
       model: this.config.model,
       messages,
-      max_tokens: maxTokens ?? 1024,
+      max_tokens: maxTokensEff,
       stream: true,
       ...(system ? { system } : {}),
+      ...(thinking ? { thinking } : {}),
       ...otherOptions,
     };
     const res = await fetchWithTimeout(this.endpoint, {
@@ -88,13 +104,17 @@ export class AnthropicAdapter extends ModelClient {
 
   async *_nonStream(req, signal) {
     const { system, messages } = this._toVendor(req);
-    const { maxTokens, ...otherOptions } = req.options || {};
+    const { maxTokens, thinkingStrength, ...otherOptions } = req.options || {};
+    const thinking = mapAnthropicThinking(thinkingStrength);
+    const budget = thinking?.budget_tokens || 0;
+    const maxTokensEff = Math.max(maxTokens ?? 1024, budget + 1024);
     const body = {
       model: this.config.model,
       messages,
-      max_tokens: maxTokens ?? 1024,
+      max_tokens: maxTokensEff,
       stream: false,
       ...(system ? { system } : {}),
+      ...(thinking ? { thinking } : {}),
       ...otherOptions,
     };
     const json = await postJson(

@@ -6,7 +6,7 @@
 
 import { Router } from '../core/router.js';
 import { FallbackManager } from '../core/fallback.js';
-import { hasCred } from '../shared/utils.js';
+import { hasCred, optionsFromModel } from '../shared/utils.js';
 
 /**
  * @typedef {'translate'|'explain'|'ask'} SelectionAction
@@ -41,6 +41,7 @@ export async function processSelection(ctx, text, action, opts = {}) {
       { role: 'user', content: user },
     ],
     stream: true,
+    options: optionsFromModel(candidates[0]),
   });
 }
 
