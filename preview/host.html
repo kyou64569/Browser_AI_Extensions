@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>演示宿主页 · 侧边栏嵌入</title>
+  <link rel="stylesheet" href="host.css" />
+</head>
+<body>
+  <!-- 宿主页面（模拟一个普通网页，验证侧边栏不阻塞其交互） -->
+  <div class="layout" id="layout">
+    <main class="page">
+      <article>
+        <header class="doc-head">
+          <p class="kicker">产品文档</p>
+          <h1>如何把 AI 助手做成可嵌入的侧边栏</h1>
+          <p class="byline">阅读本文，并试着在右侧侧边栏里向 AI 提问、选中下方文字让助手解释。</p>
+        </header>
+
+        <p>侧边栏是一种常见但不容易做好的 UI 形态。它既要足够窄以节省空间，又要足够好用以承载完整交互。
+        关键在于：<strong>主页面内容保持完全可交互</strong>，侧边栏只是并排存在，而非浮层遮挡。</p>
+
+        <h2>1. 布局策略</h2>
+        <p>使用 <code>display:flex</code> 的三栏结构：主内容区 <code>flex:1</code> 自动伸缩，中间一条可拖拽的
+        分隔条，右侧侧边栏固定宽度。拖拽分隔条时只改变侧边栏宽度，主内容区宽度随之变化，但滚动、选中、点击都不受影响。</p>
+
+        <h2>2. 宽度可调</h2>
+        <p>分隔条捕获指针事件，按鼠标位置计算侧边栏宽度并夹紧在合理区间（如 280–560px）。
+        你可以现在就按住右侧那条竖线左右拖动试试。</p>
+
+        <blockquote>小技巧：选中这一段文字后，打开右侧侧边栏，把文字粘到“功能 → 划词处理”里让 AI 解释或翻译。</blockquote>
+
+        <h2>3. 非阻塞</h2>
+        <p>因为侧边栏是文档流中的兄弟节点而非覆盖层，主页面的任何区域都不会被遮住，
+        用户可以在阅读长文的同时随时与 AI 对话，互不干扰。</p>
+
+        <p>（以下为占位长文，用于验证滚动与选中交互。）</p>
+        <p>大型语言模型（LLM）是基于海量文本训练的深度神经网络，能够理解和生成自然语言。常见的代表包括 GPT、Claude、Gemini 等。它们通常采用 Transformer 架构，通过自回归方式逐 token 生成文本。在应用层面，LLM 可用于摘要、翻译、问答、代码生成等任务，是当下 AI 助手的核心能力来源。</p>
+        <p>模型适配层的目标是把不同厂商的接口统一成一套内部格式，使上层功能不感知具体厂商。备用降级机制则在某个模型失败（超额、超时、鉴权失败、5xx）时自动切换到下一个可用模型，并记录失败冷却时间以避免反复重试已知失败的模型。</p>
+        <p>任务路由根据任务类型与要求（是否需要视觉、是否需要流式、是否优先免费额度）从模型列表里筛选候选。网页总结、划词处理等功能模块只依赖模型客户端与任务路由，彼此解耦。</p>
+        <p>知识库连接器提供统一的检索/写入抽象接口：本地知识库通过 HTTP 调用你的私有接口实现；在线知识库（如 NotebookLM、腾讯 ima 等）当前多无稳定官方 API，先预留扩展点，待调研后再实现。</p>
+        <p>更多内容……更多内容……更多内容……更多内容……更多内容……更多内容……更多内容……更多内容……</p>
+      </article>
+    </main>
+
+    <!-- 可拖拽分隔条 -->
+    <div class="resizer" id="resizer" title="拖动调整侧边栏宽度"></div>
+
+    <!-- 侧边栏：iframe 加载聊天应用 -->
+    <aside class="sidebar" id="sidebar">
+      <iframe id="sbFrame" src="index.html" title="AI 助手侧边栏"></iframe>
+    </aside>
+  </div>
+
+  <button class="sb-toggle" id="sbToggle">收起侧边栏</button>
+
+  <script type="module" src="host.js"></script>
+</body>
+</html>

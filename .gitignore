@@ -1,0 +1,5 @@
+node_modules/
+preview/secrets.json
+server.log
+server.err
+.DS_Store

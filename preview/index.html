@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AI 助手 · 侧边栏</title>
+  <link rel="stylesheet" href="preview.css" />
+</head>
+<body>
+  <!-- 顶部应用栏：左侧功能 / 右侧设置 -->
+  <div class="app-bar">
+    <button class="icon-btn" id="navFeatures" title="功能">
+      <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
+    </button>
+    <div class="app-title">
+      <span class="dot"></span>
+      <span id="barTitle">AI 助手</span>
+    </div>
+    <button class="icon-btn" id="navSettings" title="设置">
+      <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+    </button>
+  </div>
+
+  <!-- 视图容器 -->
+  <div class="views">
+
+    <!-- 视图 1：聊天（主页面） -->
+    <section class="view view-chat is-active" id="view-chat">
+      <div class="chat-scroll" id="chatScroll">
+        <div class="welcome" id="welcome">
+          <div class="welcome-logo">AI</div>
+          <h2>有什么可以帮你的？</h2>
+          <p>提问、翻译、解释、总结 —— 都由统一模型链路驱动。</p>
+        </div>
+      </div>
+
+      <div class="status-bar" id="chatStatus"></div>
+
+      <form class="composer" id="composer">
+        <div class="chat-box">
+          <div class="attachments" id="attachments"></div>
+          <textarea id="chatInput" rows="2" placeholder="给 AI 助手发消息…  (Enter 发送，Shift+Enter 换行)"></textarea>
+          <div class="composer-bar">
+            <div class="composer-left">
+              <button type="button" class="icon-btn plus-btn" id="plusBtn" title="上传文件或图片">
+                <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+              </button>
+              <select id="modelSelect" class="model-select" title="选择模型"></select>
+              <input type="file" id="fileInput" accept="image/*,text/*,.txt,.md,.json,.csv,.pdf,.js,.ts,.py,.html,.css" multiple hidden />
+            </div>
+            <button type="submit" id="sendBtn" class="send-btn" title="发送" disabled>
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+            </button>
+          </div>
+        </div>
+      </form>
+    </section>
+
+    <!-- 视图 2：功能 -->
+    <section class="view view-features" id="view-features">
+      <div class="page">
+        <h2 class="page-title">功能</h2>
+
+        <div class="card">
+          <div class="card-head">
+            <h3>网页总结</h3>
+            <button class="mini" id="loadSample">加载示例</button>
+          </div>
+          <label class="field">标题 <input id="sumTitle" placeholder="示例网页" /></label>
+          <label class="field">正文
+            <textarea id="sumText" rows="6" placeholder="粘贴正文，或点“加载示例”"></textarea>
+          </label>
+          <div class="status-bar" id="sumStatus"></div>
+          <div class="actions">
+            <button class="primary" id="runSummarize">总结本页</button>
+          </div>
+          <pre class="result" id="sumResult"></pre>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h3>划词处理</h3></div>
+          <label class="field">选中文本
+            <textarea id="selText" rows="4" placeholder="选中或输入一段文本"></textarea>
+          </label>
+          <div class="status-bar" id="selStatus"></div>
+          <div class="actions">
+            <button data-act="translate">翻译</button>
+            <button data-act="explain">解释</button>
+            <button data-act="ask">追问</button>
+          </div>
+          <pre class="result" id="selResult"></pre>
+        </div>
+      </div>
+    </section>
+
+    <!-- 视图 3：设置 -->
+    <section class="view view-settings" id="view-settings">
+      <div class="page">
+        <h2 class="page-title">设置</h2>
+
+        <div class="card">
+          <div class="card-head">
+            <h3>模型配置</h3>
+            <button class="mini" id="addModel">+ 添加模型</button>
+          </div>
+          <div id="modelList" class="model-list"></div>
+        </div>
+
+        <div class="card">
+          <h3>本地知识库（可选）</h3>
+          <label class="field">服务地址 <input id="kbBase" placeholder="http://localhost:8000" /></label>
+        </div>
+
+        <div class="card tip">
+          <p>提示：在扩展侧边栏中可直接调用各厂商接口（含官方端点）；Ollama 等本地服务也支持浏览器直连。</p>
+        </div>
+      </div>
+    </section>
+
+  </div>
+
+  <script type="module" src="preview.js"></script>
+</body>
+</html>

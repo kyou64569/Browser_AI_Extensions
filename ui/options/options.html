@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <link rel="stylesheet" href="options.css" />
+</head>
+<body>
+  <h2>模型配置</h2>
+  <div id="modelList"></div>
+  <button id="addModel">+ 添加模型</button>
+
+  <h2>本地知识库</h2>
+  <label>服务地址 <input id="kbBase" placeholder="http://localhost:8000" /></label>
+  <label>API Key（可选） <input id="kbKey" type="password" /></label>
+
+  <div class="actions">
+    <button id="save">保存</button>
+    <span id="msg"></span>
+  </div>
+  <script type="module" src="options.js"></script>
+</body>
+</html>

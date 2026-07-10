@@ -1,0 +1,11 @@
+{
+  "name": "browser-ai-ext",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "个人用 AI 助手浏览器扩展（核心框架）+ 浏览器内预览。",
+  "scripts": {
+    "start": "node dev-server.mjs",
+    "start:py": "python dev-server.py"
+  }
+}

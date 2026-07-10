@@ -1,0 +1,40 @@
+{
+  "manifest_version": 3,
+  "name": "AI 助手（个人）",
+  "version": "0.1.0",
+  "description": "个人用 AI 助手扩展：模型适配层 + 备用降级 + 网页总结。",
+  "permissions": ["storage", "activeTab", "sidePanel", "scripting"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background/service-worker.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "AI 助手"
+  },
+  "side_panel": {
+    "default_path": "preview/index.html"
+  },
+  "options_page": "ui/options/options.html",
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content/extract.js", "content/sidebar-inject.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "preview/index.html",
+        "preview/preview.css",
+        "preview/preview.js",
+        "core/*",
+        "features/*",
+        "connectors/*",
+        "shared/*"
+      ],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}

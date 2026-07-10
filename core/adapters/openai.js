@@ -1,0 +1,102 @@
+// core/adapters/openai.js
+// OpenAI 兼容格式 adapter。适用于 OpenAI、OpenRouter 及各类国产兼容接口。
+// 输入：统一 ChatRequest -> 输出：厂商 /v1/chat/completions -> 转回 ChatResponseChunk
+
+import { ModelClient } from '../model-base.js';
+import { postJson, fetchWithTimeout, HttpError } from '../http.js';
+
+export class OpenAIAdapter extends ModelClient {
+  get endpoint() {
+    // 兼容末尾带 / 或不带
+    return this.config.apiBase.replace(/\/$/, '') + '/chat/completions';
+  }
+
+  /** 统一消息 -> OpenAI messages */
+  _toVendor(req) {
+    return req.messages.map(m => {
+      if (m.attachments && m.attachments.length) {
+        // 多模态：content 变成 parts
+        const parts = [{ type: 'text', text: m.content }];
+        for (const a of m.attachments) {
+          parts.push({
+            type: 'image_url',
+            image_url: { url: a.data },
+          });
+        }
+        return { role: m.role, content: parts };
+      }
+      return { role: m.role, content: m.content };
+    });
+  }
+
+  async *_stream(req, signal) {
+    const { maxTokens, ...otherOptions } = req.options || {};
+    const body = {
+      model: this.config.model,
+      messages: this._toVendor(req),
+      stream: true,
+      ...otherOptions,
+    };
+    const res = await fetchWithTimeout(this.endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${this.config.apiKey}`,
+      },
+      body: JSON.stringify(body),
+      signal,
+    }, this.config.timeoutMs);
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split('\n');
+      buf = lines.pop() || '';
+      for (const line of lines) {
+        const t = line.trim();
+        if (!t || !t.startsWith('data:')) continue;
+        const data = t.slice(5).trim();
+        if (data === '[DONE]') {
+          yield { delta: '', done: true };
+          return;
+        }
+        try {
+          const json = JSON.parse(data);
+          const delta = json.choices?.[0]?.delta?.content || '';
+          if (delta) yield { delta, done: false, meta: { raw: json } };
+        } catch (e) { console.warn('[openai] Failed to parse stream chunk:', e); }
+      }
+    }
+    yield { delta: '', done: true };
+  }
+
+  async *_nonStream(req, signal) {
+    const { maxTokens, ...otherOptions } = req.options || {};
+    const body = {
+      model: this.config.model,
+      messages: this._toVendor(req),
+      stream: false,
+      ...otherOptions,
+    };
+    const json = await postJson(
+      this.endpoint, body,
+      { Authorization: `Bearer ${this.config.apiKey}` },
+      this.config.timeoutMs
+    );
+    const text = json.choices?.[0]?.message?.content || '';
+    yield { delta: text, done: true, meta: { raw: json } };
+  }
+
+  async *chat(req) {
+    const signal = req.signal;
+    if (req.stream && this.config.supportsStream) {
+      yield* this._stream(req, signal);
+    } else {
+      yield* this._nonStream(req, signal);
+    }
+  }
+}
