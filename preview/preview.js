@@ -29,9 +29,14 @@ function ensureBgPort() {
   try {
     _bgPort = chrome.runtime.connect({ name: 'sidepanel' });
     _bgPort.onDisconnect.addListener(() => {
+      // 关键：读取并“消费” runtime.lastError，否则当端口因页面进入
+      // 前进/后退缓存（bfcache）被浏览器强制关闭时，会抛出
+      // "Unchecked runtime.lastError: The page keeping the extension port
+      // is moved into back/forward cache, so the message channel is closed."
+      const err = chrome.runtime.lastError;
       _bgPort = null;
       if (_bgHeartbeat) { clearInterval(_bgHeartbeat); _bgHeartbeat = null; }
-      // SW 重启后自动重连，维持保活
+      // SW 重启 / 页面从 bfcache 恢复后自动重连，维持保活
       setTimeout(ensureBgPort, 200);
     });
     // 心跳：周期性轻量消息，确保浏览器认为该连接始终处于活动状态，
@@ -46,6 +51,28 @@ function ensureBgPort() {
   return _bgPort;
 }
 ensureBgPort();
+
+// ---------- bfcache 生命周期处理 ----------
+// 当用户通过前进/后退按钮导航，使“持有本扩展端口”的页面进入前进/后退缓存
+// （back/forward cache，简称 bfcache）时，浏览器会冻结该页面并强制关闭其消息通道，
+// 触发 onDisconnect（runtime.lastError 即上述 bfcache 文案）。
+// 在冻结前主动释放端口、恢复后重建，可避免向已死通道发送消息导致消息静默丢失，
+// 也避免页面 JS 被冻结期间定时器（心跳）与在途请求被挂起。
+window.addEventListener('pagehide', (e) => {
+  if (e.persisted) { // 页面被缓存（而非真正卸载）
+    if (_bgPort) { try { _bgPort.disconnect(); } catch (_) {} _bgPort = null; }
+    if (_bgHeartbeat) { clearInterval(_bgHeartbeat); _bgHeartbeat = null; }
+  }
+});
+window.addEventListener('pageshow', (e) => {
+  if (e.persisted) { _bgPort = null; ensureBgPort(); } // 从 bfcache 恢复，重建端口
+});
+// Page Lifecycle API：部分场景下比 pagehide/pageshow 更早、更可靠
+document.addEventListener('freeze', () => {
+  if (_bgPort) { try { _bgPort.disconnect(); } catch (_) {} _bgPort = null; }
+  if (_bgHeartbeat) { clearInterval(_bgHeartbeat); _bgHeartbeat = null; }
+});
+document.addEventListener('resume', () => { _bgPort = null; ensureBgPort(); });
 
 function defaultModel() {
   return {
@@ -644,7 +671,7 @@ function sendAutomateOnce(name, args, timeoutMs = 60000) {
 }
 
 /** 瞬时性错误（SW 重启 / 端口断开 / 扩展上下文失效）：可被重试自愈 */
-const TRANSIENT_ERR = /port closed before a response|receiving end does not exist|extension context invalidated|cannot establish|message port/i;
+const TRANSIENT_ERR = /port closed before a response|receiving end does not exist|extension context invalidated|cannot establish|message port|back\/forward cache|bfcache/i;
 
 /**
  * 调用 background 的 AUTOMATE 接口执行某个网页工具。
@@ -737,6 +764,8 @@ async function runAutomation(userText) {
   }
   const ref = currentRefModel();
   const ts = (ref && ref.supportsThinking) ? thinkingStrength : undefined;
+  // 是否存在支持看图的模型：决定是否在工具执行后回灌截图（用于读取图表/图片中的目标数据）
+  const visionOk = models.some(m => m.supportsVision);
 
   let a = null;
   let acc = '';
@@ -778,31 +807,62 @@ async function runAutomation(userText) {
         for (const call of calls) {
           setStatus('正在执行操作…');
           const result = await execToolCall(call.name, call.args);
-          // 结构化工具消息（归属 AI）：界面展示 + 历史持久化，仅保留“AI 使用了什么工具”的简洁提示
+          // 视觉回灌：工具结果若已含截图则用之；否则当任一模型支持看图时主动截图，
+          // 便于模型读取图表 / 图片中的目标数据（解决“数据在图表中读不到”的问题）。
+          let shotUrl = (result && result.ok && result.result && result.result.dataUrl) || null;
+          if (!shotUrl && visionOk) {
+            try {
+              const s = await execToolCall('screenshot', {});
+              if (s && s.ok && s.result && s.result.dataUrl) shotUrl = s.result.dataUrl;
+            } catch (_) { /* 截图失败不影响主流程 */ }
+          }
+          // 把截图并入结果（工具卡片展示用；持久化时 buildToolResult 会剔除 base64 以免撑爆存储）
+          if (shotUrl) { result.result = result.result || {}; result.result.dataUrl = shotUrl; }
+          // 结构化工具消息（归属 AI）：界面展示 + 历史持久化，仅保留“AI 使用了什么工具”的简洁提示。
+          // 注意：content 必须是中性确认语，绝不能写成“调用工具：name”这类会被模型原样复读的指令式
+          // 中文——否则会作为历史回灌给下一个模型，被它误读为一次新的工具调用，进而在 T1 分支被误判为
+          // “已完成”而提前结束（曾导致 SenseNova 第二次截图时输出“调用工具：screenshot”即收尾）。
           const toolMsg = {
             role: 'assistant',
-            content: display || ('调用工具：' + call.name),
+            content: display || (`已对网页执行 ${call.name} 操作`),
             tool: buildToolResult(call.name, call.args, result),
           };
           // 移除本轮流式气泡，改用工具卡片展示，避免重复呈现
           if (a && a.el) a.el.remove();
           pushToolMessage(toolMsg);
           messages.push(toolMsg);
-          // 后台循环上下文：把工具返回结果回灌给 AI 续跑（仅用于模型上下文，不写入用户可见历史）
-          loop.push({
+          // 后台循环上下文：把工具返回结果回灌给 AI 续跑（仅用于模型上下文，不写入用户可见历史）。
+          // 回灌文本剔除截图 base64（图片已作为附件单独传递），避免上下文臃肿。
+          const resForText = (result && result.ok && result.result) ? { ...result.result } : null;
+          if (resForText && resForText.dataUrl) delete resForText.dataUrl;
+          const loopMsg = {
             role: 'user',
             content: `[工具执行结果]\n工具: ${call.name}\n参数: ${JSON.stringify(call.args || {})}\n` +
               (result && result.ok
-                ? '成功: ' + JSON.stringify(result.result)
+                ? '成功: ' + JSON.stringify(resForText)
                 : '失败: ' + (result && result.error || '未知错误')) +
-              '\n请基于以上结果继续操作，或直接给出最终回答。',
-          });
+              '\n请基于以上结果继续操作，或直接给出最终回答。' +
+              (shotUrl ? '\n（已附上当前页面截图，若目标数据以图表/图片形式呈现，请直接读取截图内容提取。）' : ''),
+          };
+          if (shotUrl) loopMsg.attachments = [{ type: 'image', data: shotUrl }];
+          loop.push(loopMsg);
         }
         a = null; // 下一轮新建气泡（继续让 AI 决定后续动作，直到给出最终回答）
         continue;
       }
 
-      // 无工具调用 → 最终回答
+      // 兜底防误终止：若本轮未解析到规范工具调用，但回复文本疑似仍含工具调用意图
+      // （如模型用中文“调用工具：name”、或残留 tool_call/toolcall 等关键字），且尚未达到最大步数，
+      // 则不要立即判定为“已完成最终回答”（否则会像 SenseNova 那样把“调用工具：screenshot”当答案提前结束）。
+      // 改为作为一次观察回灌并继续循环，引导模型改用规范格式，由 MAX_TOOL_ITERS 兜住任何潜在的死循环。
+      const hasToolIntent = /(?:调用|使用|执行)\s*工具|tool_?call|function_?call|toolcall/i.test(acc);
+      if (!calls.length && hasToolIntent && iter < MAX_TOOL_ITERS) {
+        loop.push({ role: 'user', content: '[系统提示] 你刚才的回复疑似包含工具调用，但格式未被正确识别（例如中文“调用工具：name”缺少 JSON 参数，或拼写不规范）。请改用规范的 toolcall 代码块重新发起工具调用：\n```toolcall\n{"name":"工具名","args":{}}\n```\n若任务确实已全部完成，请直接给出最终的自然语言回答。' });
+        a = null;
+        continue;
+      }
+
+      // 无工具调用且无疑似意图 → 最终回答
       messages.push({ role: 'assistant', content: acc });
       setStatus('');
       break;
