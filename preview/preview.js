@@ -185,7 +185,6 @@ async function syncConfigFromStorage() {
   if (imgUp && JSON.stringify(imgUp) !== JSON.stringify(imgUploadCfg)) {
     imgUploadCfg = imgUp;
     LS.set('preview.imgUpload', imgUploadCfg);
-    syncImgUploadUI();
   }
 }
 
@@ -1269,72 +1268,6 @@ async function runSummarizeInChat(instruction) {
 }
 
 // ============================================================
-// 功能视图
-// ============================================================
-function setStatusEl(id, msg, kind = '') {
-  const el = $(id);
-  el.textContent = msg;
-  el.className = 'status-bar' + (kind ? ' ' + kind : '');
-}
-
-$('#loadSample').onclick = () => {
-  $('#sumTitle').value = '大型语言模型简介';
-  $('#sumText').value = `大型语言模型（LLM）是基于海量文本训练的深度神经网络，能够理解和生成自然语言。
-
-常见的代表包括 GPT、Claude、Gemini 等。它们通常采用 Transformer 架构，通过自回归方式逐 token 生成文本。
-
-在应用层面，LLM 可用于摘要、翻译、问答、代码生成等任务，是当下 AI 助手的核心能力来源。`;
-};
-
-$('#runSummarize').onclick = async () => {
-  setStatusEl('#sumStatus', '正在获取当前网页…');
-  let page;
-  try { page = await getActivePage(); }
-  catch (e) { setStatusEl('#sumStatus', '获取网页失败：' + e.message, 'err'); return; }
-  // 自动获取失败：仅在用户主动在文本框粘贴了内容时才用手动内容，并明确标注来源；
-  // 不再静默回退到“加载示例”预填的硬编码文本，避免出现“预设的示例内容”。
-  if (!page.text || !page.text.trim()) {
-    const manual = $('#sumText').value.trim();
-    if (manual) {
-      page = { title: $('#sumTitle').value.trim() || '手动粘贴内容', text: manual };
-      setStatusEl('#sumStatus', '（未能自动获取当前网页，已使用文本框中手动粘贴的内容）', 'err');
-    } else {
-      setStatusEl('#sumStatus', '未能获取当前网页正文，请在文本框粘贴正文后重试', 'err');
-      return;
-    }
-  }
-  setStatusEl('#sumStatus', '正在总结…');
-  $('#sumResult').textContent = '';
-  try {
-    const res = await summarizePage({ models: prepareModels() }, page, {
-      kb: makeKb(), stream: false,
-      onFallback: (i, cfg, reason) => setStatusEl('#sumStatus', `已切换到备用模型 #${i + 1}：${cfg.name}（${reason}）`),
-    });
-    $('#sumResult').textContent = res.text;
-    setStatusEl('#sumStatus', `完成 · 使用模型：${res.used.name}`, 'ok');
-  } catch (e) {
-    setStatusEl('#sumStatus', '错误：' + e.message, 'err');
-  }
-};
-
-// 注意：限定到“划词处理”卡片内的按钮，避免误匹配加号功能菜单里的 .func-item（它们同样带 data-act）
-$$('#selActions button[data-act]').forEach(b => b.onclick = async () => {
-  const text = $('#selText').value;
-  if (!text.trim()) { setStatusEl('#selStatus', '请先输入选中文本', 'err'); return; }
-  setStatusEl('#selStatus', '处理中…');
-  $('#selResult').textContent = '';
-  try {
-    const res = await processSelection({ models: prepareModels() }, text, b.dataset.act, {
-      stream: false,
-      onFallback: (i, cfg, reason) => setStatusEl('#selStatus', `已切换到备用模型 #${i + 1}：${cfg.name}（${reason}）`),
-    });
-    $('#selResult').textContent = res.text;
-    setStatusEl('#selStatus', `完成 · 使用模型：${res.used.name}`, 'ok');
-  } catch (e) {
-    setStatusEl('#selStatus', '错误：' + e.message, 'err');
-  }
-});
-
 // ============================================================
 // 设置视图
 // ============================================================
@@ -1685,17 +1618,6 @@ $('#addBackupModel').onclick = () => { backupModels.push(defaultBackupModel()); 
 
 $('#kbBase').value = kbCfg.baseUrl || '';
 $('#kbBase').addEventListener('change', () => { kbCfg.baseUrl = $('#kbBase').value; persistKbToStorage(kbCfg); });
-
-// 图片上传配置：读取 / 写入（与 kb 同享统一存储层）
-function syncImgUploadUI() {
-  $('#imgUploadUrl').value = imgUploadCfg.url || '';
-  $('#imgUploadAuth').value = imgUploadCfg.auth || '';
-  $('#imgUploadPath').value = imgUploadCfg.path || '';
-}
-syncImgUploadUI();
-$('#imgUploadUrl').addEventListener('change', () => { imgUploadCfg.url = $('#imgUploadUrl').value.trim(); persistImgUploadToStorage(imgUploadCfg); });
-$('#imgUploadAuth').addEventListener('change', () => { imgUploadCfg.auth = $('#imgUploadAuth').value.trim(); persistImgUploadToStorage(imgUploadCfg); });
-$('#imgUploadPath').addEventListener('change', () => { imgUploadCfg.path = $('#imgUploadPath').value.trim(); persistImgUploadToStorage(imgUploadCfg); });
 
 // ============================================================
 // 模型配置复选框联动（视觉全局互斥 / 主模型单选受启用约束）

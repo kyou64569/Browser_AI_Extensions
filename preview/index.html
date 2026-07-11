@@ -101,46 +101,8 @@
         <h2 class="page-title">功能</h2>
 
         <div class="card">
-          <div class="card-head">
-            <h3>网页总结</h3>
-            <button class="mini" id="loadSample">加载示例</button>
-          </div>
-          <label class="field">标题 <input id="sumTitle" placeholder="示例网页" /></label>
-          <label class="field">正文
-            <textarea id="sumText" rows="6" placeholder="粘贴正文，或点“加载示例”"></textarea>
-          </label>
-          <div class="status-bar" id="sumStatus"></div>
-          <div class="actions">
-            <button class="primary" id="runSummarize">总结当前网页</button>
-          </div>
-          <pre class="result" id="sumResult"></pre>
-        </div>
-
-        <div class="card">
-          <div class="card-head"><h3>划词处理</h3></div>
-          <label class="field">选中文本
-            <textarea id="selText" rows="4" placeholder="选中或输入一段文本"></textarea>
-          </label>
-          <div class="status-bar" id="selStatus"></div>
-          <div class="actions" id="selActions">
-            <button data-act="translate">翻译</button>
-            <button data-act="explain">解释</button>
-            <button data-act="ask">追问</button>
-          </div>
-          <pre class="result" id="selResult"></pre>
-        </div>
-
-        <div class="card">
           <h3>本地知识库（可选）</h3>
           <label class="field">服务地址 <input id="kbBase" placeholder="http://localhost:8000" /></label>
-        </div>
-
-        <div class="card">
-          <div class="card-head"><h3>图片上传（粘贴图片用）</h3></div>
-          <p class="card-note">在聊天框粘贴图片时：若填写下方上传地址，则真实上传并插入返回的 URL；留空则降级为内嵌 data URL（无需任何服务）。</p>
-          <label class="field">上传地址 <input id="imgUploadUrl" placeholder="https://your-host/upload （留空则用 data URL）" /></label>
-          <label class="field">鉴权头（可选） <input id="imgUploadAuth" placeholder='如：Bearer xxxx，或留空' /></label>
-          <label class="field">URL 取值路径（可选） <input id="imgUploadPath" placeholder='如：data.url （留空默认取 data.url / url）' /></label>
         </div>
       </div>
     </section>
