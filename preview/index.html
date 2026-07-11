@@ -7,14 +7,19 @@
   <link rel="stylesheet" href="preview.css" />
 </head>
 <body>
-  <!-- 顶部应用栏：左侧功能 / 右侧设置 -->
+  <!-- 顶部应用栏：左侧 会话列表 / 功能 图标 + 标题，右侧设置 -->
   <div class="app-bar">
-    <button class="icon-btn" id="navFeatures" title="功能">
-      <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
-    </button>
-    <div class="app-title">
-      <span class="dot"></span>
-      <span id="barTitle">AI 助手</span>
+    <div class="app-bar-left">
+      <button class="icon-btn" id="navConversations" title="会话列表">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+      </button>
+      <button class="icon-btn" id="navFeatures" title="功能">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
+      </button>
+      <div class="app-title">
+        <span class="dot"></span>
+        <span id="barTitle">AI 助手</span>
+      </div>
     </div>
     <button class="icon-btn" id="navSettings" title="设置">
       <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
@@ -62,6 +67,9 @@
                   <button type="button" class="func-item" role="menuitem" data-act="explain">
                     <span class="fi-ico">💡</span><span class="fi-label">解释</span>
                   </button>
+                  <button type="button" class="func-item" role="menuitem" data-act="automate">
+                    <span class="fi-ico">🤖</span><span class="fi-label">网页操作</span>
+                  </button>
                 </div>
               </div>
               <select id="modelSelect" class="model-select" title="选择模型"></select>
@@ -74,6 +82,17 @@
           </div>
         </div>
       </form>
+    </section>
+
+    <!-- 视图 4：会话列表 -->
+    <section class="view view-conversations" id="view-conversations">
+      <div class="page">
+        <div class="conv-header">
+          <h2 class="page-title">会话列表</h2>
+          <button class="primary" id="newConvBtn">+ 新建会话</button>
+        </div>
+        <div class="conv-list" id="convList"></div>
+      </div>
     </section>
 
     <!-- 视图 2：功能 -->
@@ -114,6 +133,14 @@
         <div class="card">
           <h3>本地知识库（可选）</h3>
           <label class="field">服务地址 <input id="kbBase" placeholder="http://localhost:8000" /></label>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h3>图片上传（粘贴图片用）</h3></div>
+          <p class="card-note">在聊天框粘贴图片时：若填写下方上传地址，则真实上传并插入返回的 URL；留空则降级为内嵌 data URL（无需任何服务）。</p>
+          <label class="field">上传地址 <input id="imgUploadUrl" placeholder="https://your-host/upload （留空则用 data URL）" /></label>
+          <label class="field">鉴权头（可选） <input id="imgUploadAuth" placeholder='如：Bearer xxxx，或留空' /></label>
+          <label class="field">URL 取值路径（可选） <input id="imgUploadPath" placeholder='如：data.url （留空默认取 data.url / url）' /></label>
         </div>
       </div>
     </section>
