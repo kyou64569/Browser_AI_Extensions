@@ -61,6 +61,53 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({ type: 'INFO', message: '请打开侧边栏（右键图标 -> 在边栏中打开本扩展）' });
     return true;
   }
+  if (msg.type === 'GET_PAGE') {
+    // 侧边栏请求“当前网页”正文：向当前标签页取正文后回传。
+    // 优先用内容脚本（EXTRACT_PAGE），不可达时（如脚本未注入）回退到 scripting API 直接抽取，
+    // 确保对用户“正在浏览”的任意网页都能拿到真实正文，而不是退回示例/侧边栏自身内容。
+    (async () => {
+      try {
+        const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+        if (!tab || !tab.id) { sendResponse({ error: '无法获取当前标签页' }); return; }
+
+        let page = null;
+        try {
+          page = await chrome.tabs.sendMessage(tab.id, { type: 'EXTRACT_PAGE' });
+        } catch (_) {
+          page = null; // 内容脚本未注入或不可用，进入下方兜底
+        }
+
+        if (!page || !page.text || !page.text.trim()) {
+          try {
+            const [res] = await chrome.scripting.executeScript({
+              target: { tabId: tab.id },
+              func: () => {
+                const root = document.querySelector('article') || document.querySelector('main') || document.body;
+                if (!root) return { title: document.title, text: '', url: location.href };
+                const clone = root.cloneNode(true);
+                clone.querySelectorAll('script,style,noscript,nav,header,footer,aside').forEach(el => el.remove());
+                const text = (clone.innerText || clone.textContent || '')
+                  .replace(/\s+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+                return { title: document.title, text, url: location.href };
+              },
+            });
+            page = (res && res.result) ? res.result : null;
+          } catch (_) {
+            page = null;
+          }
+        }
+
+        if (!page || !page.text || !page.text.trim()) {
+          sendResponse({ error: '未能从当前网页提取到正文（可能是浏览器内置页或需要刷新页面）' });
+          return;
+        }
+        sendResponse(page);
+      } catch (e) {
+        sendResponse({ error: e?.message || '获取网页失败' });
+      }
+    })();
+    return true; // 异步 sendResponse
+  }
   return false;
 });
 

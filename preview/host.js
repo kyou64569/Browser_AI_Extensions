@@ -44,3 +44,27 @@ toggle.addEventListener('click', () => {
 });
 
 setWidth(sbWidth);
+
+// 侧边栏（index.html，作为 iframe 嵌入）请求当前宿主页正文时，抽取并回传，使其可“总结当前网页”
+window.addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.type !== 'GET_PAGE') return;
+  const page = extractHostPage();
+  // 回传给来源窗口（即侧边栏 iframe），而非 window.parent（父页自身）
+  if (e.source) {
+    e.source.postMessage(
+      { type: 'PAGE_RESULT', _ch: d._ch, title: document.title, text: page, url: location.href },
+      '*'
+    );
+  }
+});
+
+/** 抽取宿主页正文（与 content/extract.js 逻辑对齐） */
+function extractHostPage() {
+  const root = document.querySelector('article') || document.querySelector('main') || document.body;
+  if (!root) return '';
+  const clone = root.cloneNode(true);
+  clone.querySelectorAll('script,style,noscript,nav,header,footer,aside').forEach(el => el.remove());
+  return (clone.innerText || clone.textContent || '')
+    .replace(/\s+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+}

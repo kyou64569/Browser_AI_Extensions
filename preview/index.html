@@ -37,14 +37,33 @@
       <div class="status-bar" id="chatStatus"></div>
 
       <form class="composer" id="composer">
+        <!-- 功能模式高亮标签：激活功能期间显示，发送消息或手动关闭后消失 -->
+        <div class="func-tag" id="funcTag" hidden></div>
         <div class="chat-box">
           <div class="attachments" id="attachments"></div>
           <textarea id="chatInput" rows="2" placeholder="给 AI 助手发消息…  (Enter 发送，Shift+Enter 换行)"></textarea>
           <div class="composer-bar">
             <div class="composer-left">
-              <button type="button" class="icon-btn plus-btn" id="plusBtn" title="上传文件或图片">
-                <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-              </button>
+              <div class="plus-wrap">
+                <button type="button" class="icon-btn plus-btn" id="plusBtn" title="功能" aria-haspopup="true" aria-expanded="false">
+                  <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                </button>
+                <!-- 功能列表菜单 -->
+                <div class="func-menu" id="funcMenu" role="menu" hidden>
+                  <button type="button" class="func-item" role="menuitem" data-act="file">
+                    <span class="fi-ico">📎</span><span class="fi-label">添加文件</span>
+                  </button>
+                  <button type="button" class="func-item" role="menuitem" data-act="summarize">
+                    <span class="fi-ico">📄</span><span class="fi-label">总结网页</span>
+                  </button>
+                  <button type="button" class="func-item" role="menuitem" data-act="translate">
+                    <span class="fi-ico">🌐</span><span class="fi-label">翻译</span>
+                  </button>
+                  <button type="button" class="func-item" role="menuitem" data-act="explain">
+                    <span class="fi-ico">💡</span><span class="fi-label">解释</span>
+                  </button>
+                </div>
+              </div>
               <select id="modelSelect" class="model-select" title="选择模型"></select>
               <select id="thinkingSelect" class="thinking-select" title="思考强度" hidden></select>
               <input type="file" id="fileInput" accept="image/*,text/*,.txt,.md,.json,.csv,.pdf,.js,.ts,.py,.html,.css" multiple hidden />
@@ -73,7 +92,7 @@
           </label>
           <div class="status-bar" id="sumStatus"></div>
           <div class="actions">
-            <button class="primary" id="runSummarize">总结本页</button>
+            <button class="primary" id="runSummarize">总结当前网页</button>
           </div>
           <pre class="result" id="sumResult"></pre>
         </div>
@@ -84,7 +103,7 @@
             <textarea id="selText" rows="4" placeholder="选中或输入一段文本"></textarea>
           </label>
           <div class="status-bar" id="selStatus"></div>
-          <div class="actions">
+          <div class="actions" id="selActions">
             <button data-act="translate">翻译</button>
             <button data-act="explain">解释</button>
             <button data-act="ask">追问</button>

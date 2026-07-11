@@ -3,7 +3,7 @@
 // 三个视图：chat（主） / features / settings，单页切换，无整页刷新。
 
 import { chatStream } from '../features/chat.js';
-import { summarizePage } from '../features/summarize.js';
+import { summarizePage, summarizeStream } from '../features/summarize.js';
 import { processSelection } from '../features/selection.js';
 import { LocalKbConnector } from '../connectors/local-kb.js';
 import { listModels } from '../core/list-models.js';
@@ -40,6 +40,62 @@ function defaultBackupModel() {
   };
 }
 
+// ---------- 配置存储统一层 ----------
+// 真实扩展里，模型 / 知识库配置由选项页（ui/options）写入 chrome.storage.local；
+// 侧边栏此前只读自己的 localStorage，导致“在选项页配置的模型”在侧边栏里看不到，
+// 于是始终回退到默认空 Key 模型 → 走演示分支、显示示例内容。
+// 统一为：优先读 chrome.storage.local（与选项页同源），无则用 localStorage 兜底（独立预览）。
+function hasChromeStorage() {
+  return typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local;
+}
+async function loadModelsFromStorage() {
+  if (hasChromeStorage()) {
+    try {
+      const r = await chrome.storage.local.get('models');
+      if (Array.isArray(r.models) && r.models.length) return r.models;
+    } catch (_) { /* 退回 localStorage */ }
+  }
+  return LS.get('preview.models', [defaultModel()]);
+}
+async function loadKbFromStorage() {
+  if (hasChromeStorage()) {
+    try {
+      const r = await chrome.storage.local.get('kb');
+      if (r.kb) return r.kb;
+    } catch (_) { /* 退回 localStorage */ }
+  }
+  return LS.get('preview.kb', { baseUrl: '' });
+}
+async function persistModelsToStorage(arr) {
+  models = arr;
+  LS.set('preview.models', arr);
+  if (hasChromeStorage()) {
+    try { await chrome.storage.local.set({ models: arr }); } catch (_) {}
+  }
+}
+async function persistKbToStorage(cfg) {
+  kbCfg = cfg;
+  LS.set('preview.kb', cfg);
+  if (hasChromeStorage()) {
+    try { await chrome.storage.local.set({ kb: cfg }); } catch (_) {}
+  }
+}
+/** 启动或存储变更后：从权威源（chrome.storage）同步配置到内存并重渲染 */
+async function syncConfigFromStorage() {
+  const loaded = await loadModelsFromStorage();
+  if (loaded && loaded !== models) {
+    models = loaded;
+    persistModelsToStorage(models);
+    renderModels();
+    renderModelSelect();
+  }
+  const kb = await loadKbFromStorage();
+  if (kb && JSON.stringify(kb) !== JSON.stringify(kbCfg)) {
+    kbCfg = kb;
+    LS.set('preview.kb', kbCfg);
+  }
+}
+
 let models = LS.get('preview.models', [defaultModel()]);
 let backupModels = LS.get('preview.backupModels', []);
 let kbCfg = LS.get('preview.kb', { baseUrl: '' });
@@ -48,6 +104,7 @@ let attachments = [];       // 待发送附件 {name, type, content}
 let chatModelId = models[0]?.id || null;  // 当前聊天所选模型（'__collab__' 表示多模型协作）
 let thinkingStrength = 'off';             // 聊天界面“思考强度”下拉的当前选择
 let streaming = false;
+let activeMode = null;      // 当前激活的功能模式（null | {type:'summarize'|'translate'|'explain'|'file', label?:string}）
 const fetchedModels = {};   // 各配置的已获取模型列表（按 model.id 缓存，不持久化）
 
 // ============================================================
@@ -131,6 +188,10 @@ function renderAttachments() {
   box.querySelectorAll('.x').forEach(b => b.onclick = () => {
     attachments.splice(+b.dataset.idx, 1);
     renderAttachments(); updateSendState();
+    if (activeMode && activeMode.type === 'file') {
+      if (attachments.length) syncFileTag();
+      else clearFuncMode();   // 全部移除后文件标签消失
+    }
   });
 }
 
@@ -146,8 +207,21 @@ function buildContent(text, atts) {
 
 async function send() {
   const text = input.value.trim();
-  if ((!text && attachments.length === 0) || streaming) return;
-  const content = buildContent(text, attachments);
+  // 翻译 / 解释 功能模式：允许“按功能发送”，但必须有正文
+  const funcMode = (activeMode && (activeMode.type === 'translate' || activeMode.type === 'explain'))
+    ? activeMode.type : null;
+  if (streaming) return;
+  if (!funcMode && !text && attachments.length === 0) return;
+  if (funcMode && !text && attachments.length === 0) {
+    setStatus('请先输入要' + (funcMode === 'translate' ? '翻译' : '解释') + '的文字', 'err');
+    return;
+  }
+  // 翻译 / 解释：把用户输入包上指令前缀；其余情况正常拼装（图片走多模态附件）
+  const content = funcMode
+    ? (funcMode === 'translate'
+        ? '请将下面的文本翻译成中文，保留原意与语气：\n\n' + text
+        : '请用通俗语言解释下面的文本，必要时举例子：\n\n' + text)
+    : buildContent(text, attachments);
   // 图片转为多模态附件（data URL），文本文件保留正文
   const imageAttachments = attachments
     .filter(a => a.type.startsWith('image/') && a.dataUrl)
@@ -216,6 +290,9 @@ async function send() {
     setStatus('错误：' + e.message, 'err');
   } finally {
     streaming = false; updateSendState(); scrollBottom();
+    // 发送消息后功能标签消失（翻译 / 解释 / 文件模式在此清除；总结网页为即时执行，
+    // 标签在其执行期间保留，直至用户发送下一条消息或手动关闭）
+    clearFuncMode();
   }
 }
 
@@ -224,8 +301,93 @@ input.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
 });
 
-// 加号：上传文件 / 图片
-$('#plusBtn').onclick = () => $('#fileInput').click();
+// ============================================================
+// 加号：功能入口菜单（添加文件 / 总结网页 / 翻译 / 解释）
+// ============================================================
+const plusWrap = document.querySelector('.plus-wrap');
+const funcMenu = $('#funcMenu');
+
+function openFuncMenu() {
+  funcMenu.hidden = false;
+  plusWrap.classList.add('open');
+  $('#plusBtn').setAttribute('aria-expanded', 'true');
+}
+function closeFuncMenu() {
+  funcMenu.hidden = true;
+  plusWrap.classList.remove('open');
+  $('#plusBtn').setAttribute('aria-expanded', 'false');
+}
+$('#plusBtn').onclick = (e) => {
+  e.stopPropagation();
+  if (funcMenu.hidden) openFuncMenu(); else closeFuncMenu();
+};
+// 点击菜单项：执行对应功能并关闭菜单
+funcMenu.querySelectorAll('.func-item').forEach(b => {
+  b.onclick = (e) => {
+    e.stopPropagation();
+    closeFuncMenu();
+    activateFunc(b.dataset.act);
+  };
+});
+// 点击菜单外部 / 按 Esc 关闭
+document.addEventListener('click', (e) => {
+  if (!funcMenu.hidden && !plusWrap.contains(e.target)) closeFuncMenu();
+});
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !funcMenu.hidden) closeFuncMenu(); });
+
+/** 激活某个功能：设置模式、显示高亮标签、必要时立即执行 */
+function activateFunc(act) {
+  if (act === 'file') {
+    $('#fileInput').click();
+    return;
+  }
+  if (act === 'summarize') {
+    setMode({ type: 'summarize', label: '📄 总结网页' });
+    runSummarizeInChat();          // 总结网页：立即获取当前页并总结
+    return;
+  }
+  if (act === 'translate' || act === 'explain') {
+    setMode({
+      type: act,
+      label: act === 'translate' ? '🌐 翻译' : '💡 解释',
+    });
+    input.placeholder = act === 'translate'
+      ? '输入要翻译的文字，发送后翻译…'
+      : '输入要解释的文字，发送后解释…';
+    input.focus();
+  }
+}
+
+/** 设置功能模式并渲染标签 */
+function setMode(mode) {
+  activeMode = mode;
+  renderFuncTag();
+}
+/** 清除功能模式（发送消息或手动关闭后调用） */
+function clearFuncMode() {
+  activeMode = null;
+  input.placeholder = '给 AI 助手发消息…  (Enter 发送，Shift+Enter 换行)';
+  renderFuncTag();
+}
+/** 渲染聊天框上方的高亮标签 */
+function renderFuncTag() {
+  const box = $('#funcTag');
+  if (!activeMode) { box.hidden = true; box.innerHTML = ''; return; }
+  const label = activeMode.label || activeMode.type;
+  box.hidden = false;
+  box.innerHTML =
+    `<span class="func-tag-pill">${escapeHtml(label)}` +
+    `<button type="button" class="func-tag-x" id="funcTagClose" title="关闭" aria-label="关闭">×</button></span>`;
+  $('#funcTagClose').onclick = () => clearFuncMode();
+}
+/** 文件添加后，若处于 file 模式则刷新标签上的数量 */
+function syncFileTag() {
+  if (activeMode && activeMode.type === 'file') {
+    activeMode.label = `📎 已添加文件 (${attachments.length})`;
+    renderFuncTag();
+  }
+}
+
 $('#fileInput').addEventListener('change', async (e) => {
   for (const file of e.target.files) {
     const isImage = file.type.startsWith('image/');
@@ -239,6 +401,7 @@ $('#fileInput').addEventListener('change', async (e) => {
   }
   e.target.value = '';
   renderAttachments(); updateSendState();
+  if (attachments.length) { setMode({ type: 'file', label: `📎 已添加文件 (${attachments.length})` }); syncFileTag(); }
 });
 
 /** 把图片文件读取为 data URL（供多模态消息使用） */
@@ -249,6 +412,99 @@ function readFileAsDataURL(file) {
     reader.onerror = () => reject(reader.error || new Error('读取图片失败'));
     reader.readAsDataURL(file);
   });
+}
+
+// ============================================================
+// 当前网页正文获取：真实扩展走 background，预览走父页面 postMessage，兜底抽取当前文档
+// ============================================================
+function extractText(doc) {
+  const root = doc.querySelector('article') || doc.querySelector('main') || doc.body;
+  if (!root) return '';
+  const clone = root.cloneNode(true);
+  clone.querySelectorAll('script,style,noscript,nav,header,footer,aside').forEach(el => el.remove());
+  return (clone.innerText || clone.textContent || '')
+    .replace(/\s+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+/** 向宿主页（host.html）请求当前页正文 */
+function requestPageFromParent(timeoutMs = 4000) {
+  return new Promise((resolve, reject) => {
+    if (window.parent === window) { reject(new Error('无父页面')); return; }
+    const ch = '__pg_' + Math.random().toString(36).slice(2);
+    const onMsg = (e) => {
+      if (e.data && e.data.type === 'PAGE_RESULT' && e.data._ch === ch) {
+        window.removeEventListener('message', onMsg);
+        resolve({ title: e.data.title || '', text: e.data.text || '', url: e.data.url || '' });
+      }
+    };
+    window.addEventListener('message', onMsg);
+    window.parent.postMessage({ type: 'GET_PAGE', _ch: ch }, '*');
+    setTimeout(() => { window.removeEventListener('message', onMsg); reject(new Error('等待宿主页响应超时')); }, timeoutMs);
+  });
+}
+
+/** 获取“当前所在网页”的实际正文 */
+async function getActivePage() {
+  // 1) 真实扩展环境：让 background 去向当前标签页内容脚本取正文
+  if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.id) {
+    try {
+      const page = await chrome.runtime.sendMessage({ type: 'GET_PAGE' });
+      if (page && page.text && page.text.trim()) {
+        return { title: page.title || '', text: page.text, url: page.url || '' };
+      }
+    } catch (_) { /* 退回其它方式 */ }
+  }
+  // 2) 预览宿主页（host.html iframe）：向父页面要正文
+  try {
+    const page = await requestPageFromParent();
+    if (page && page.text && page.text.trim()) return page;
+  } catch (_) { /* 退回兜底 */ }
+  // 3) 兜底：直接抽取当前文档（通常是预览页自身）
+  return { title: document.title, text: extractText(document), url: location.href };
+}
+
+/** 在聊天中内联总结当前网页（点击“总结网页”后立即执行） */
+async function runSummarizeInChat() {
+  if (streaming) return;
+  setStatus('正在获取当前网页…');
+  let page;
+  try { page = await getActivePage(); }
+  catch (e) { setStatus('获取网页失败：' + e.message, 'err'); clearFuncMode(); return; }
+  if (!page.text || !page.text.trim()) {
+    setStatus('未能从当前网页提取到正文', 'err'); clearFuncMode(); return;
+  }
+
+  const welcome = $('#welcome');
+  if (welcome) welcome.remove();
+  const label = '总结网页' + (page.title ? `：${page.title}` : '');
+  pushUser(label);
+  const a = newAssistant();
+  streaming = true; sendBtn.disabled = true; setStatus('正在总结…');
+
+  let acc = ''; let usedModel = ''; let started = false;
+  try {
+    for await (const chunk of summarizeStream({ models: prepareModels() }, page, {
+      kb: makeKb(),
+      onFallback: (i, cfg, reason) => setStatus(`已切换到备用模型 #${i + 1}：${cfg.name}（${reason}）`),
+    })) {
+      if (!started) { started = true; a.stopTyping(); setStatus('正在回复…'); }
+      else a.stopTyping();
+      acc += chunk.delta;
+      usedModel = chunk.model;
+      a.setText(acc);
+      scrollBottom();
+    }
+    messages.push({ role: 'user', content: label });
+    messages.push({ role: 'assistant', content: acc });
+    setStatus(`使用模型：${usedModel || '完成'}`, 'ok');
+  } catch (e) {
+    a.stopTyping();
+    a.setText(acc ? acc + '\n\n[中断] ' + e.message : '错误：' + e.message);
+    setStatus('错误：' + e.message, 'err');
+  } finally {
+    streaming = false; updateSendState(); scrollBottom();
+    // 标签在“发送消息或手动关闭”后才消失；总结为即时执行，故保持标签直至用户发送/关闭
+  }
 }
 
 // ============================================================
@@ -270,8 +526,22 @@ $('#loadSample').onclick = () => {
 };
 
 $('#runSummarize').onclick = async () => {
-  const page = { title: $('#sumTitle').value || '示例网页', text: $('#sumText').value };
-  if (!page.text.trim()) { setStatusEl('#sumStatus', '请先输入网页正文', 'err'); return; }
+  setStatusEl('#sumStatus', '正在获取当前网页…');
+  let page;
+  try { page = await getActivePage(); }
+  catch (e) { setStatusEl('#sumStatus', '获取网页失败：' + e.message, 'err'); return; }
+  // 自动获取失败：仅在用户主动在文本框粘贴了内容时才用手动内容，并明确标注来源；
+  // 不再静默回退到“加载示例”预填的硬编码文本，避免出现“预设的示例内容”。
+  if (!page.text || !page.text.trim()) {
+    const manual = $('#sumText').value.trim();
+    if (manual) {
+      page = { title: $('#sumTitle').value.trim() || '手动粘贴内容', text: manual };
+      setStatusEl('#sumStatus', '（未能自动获取当前网页，已使用文本框中手动粘贴的内容）', 'err');
+    } else {
+      setStatusEl('#sumStatus', '未能获取当前网页正文，请在文本框粘贴正文后重试', 'err');
+      return;
+    }
+  }
   setStatusEl('#sumStatus', '正在总结…');
   $('#sumResult').textContent = '';
   try {
@@ -286,7 +556,8 @@ $('#runSummarize').onclick = async () => {
   }
 };
 
-$$('button[data-act]').forEach(b => b.onclick = async () => {
+// 注意：限定到“划词处理”卡片内的按钮，避免误匹配加号功能菜单里的 .func-item（它们同样带 data-act）
+$$('#selActions button[data-act]').forEach(b => b.onclick = async () => {
   const text = $('#selText').value;
   if (!text.trim()) { setStatusEl('#selStatus', '请先输入选中文本', 'err'); return; }
   setStatusEl('#selStatus', '处理中…');
@@ -420,7 +691,7 @@ function renderModels() {
         if (mi) mi.value = '';
         syncAlias(card, models, i, '');
       }
-      LS.set('preview.models', models);
+      persistModelsToStorage(models);
       refreshCheckboxUI();              // 重算各复选框的禁用/选中态
       if (f === 'apiBase' || f === 'apiKey' || f === 'vendor') refreshModelList(models, i, wrap);
       if (f === 'name' || f === 'model' || f === 'vendor' || f === 'enabled' || f === 'isPrimary') renderModelSelect();
@@ -434,7 +705,7 @@ function renderModels() {
       const f = r.dataset.f;
       const v = Math.round(Number(r.value) * 100) / 100;  // 限两位小数，避免浮点精度异常
       models[i][f] = v;
-      LS.set('preview.models', models);
+      persistModelsToStorage(models);
       const vspan = card.querySelector(`.range-val[data-val="${f}"]`);
       if (vspan) vspan.textContent = v;
     });
@@ -456,14 +727,14 @@ function renderModels() {
       const i = +card.dataset.i;
       models[i].model = inp.value;
       syncAlias(card, models, i, inp.value);
-      LS.set('preview.models', models);
+      persistModelsToStorage(models);
     });
   });
 
   wrap.querySelectorAll('[data-del]').forEach(b => b.onclick = () => {
     delete fetchedModels[models[+b.dataset.del]?.id];
     models.splice(+b.dataset.del, 1);
-    LS.set('preview.models', models); renderModels();
+    persistModelsToStorage(models); renderModels();
   });
 
   // 保存/编辑图标：点击保存 → 写入当前配置并折叠收起；点击编辑 → 重新展开
@@ -478,7 +749,7 @@ function renderModels() {
     } else {
       models[i].collapsed = false;
     }
-    LS.set('preview.models', models);
+    persistModelsToStorage(models);
     renderModels();
   });
 
@@ -527,7 +798,7 @@ async function refreshModelList(arr, i, wrap) {
     if (status) { status.textContent = '获取失败（可手动输入模型名）：' + e.message; status.className = 'model-status err'; }
   }
 }
-$('#addModel').onclick = () => { models.push(defaultModel()); LS.set('preview.models', models); renderModels(); };
+$('#addModel').onclick = () => { models.push(defaultModel()); persistModelsToStorage(models); renderModels(); };
 
 // ============================================================
 // 备用模型配置（自动降级）：布局与模型配置一致，但无 temperature/top_p 与 5 个复选框；
@@ -652,7 +923,7 @@ function renderBackupModels() {
 $('#addBackupModel').onclick = () => { backupModels.push(defaultBackupModel()); LS.set('preview.backupModels', backupModels); renderBackupModels(); };
 
 $('#kbBase').value = kbCfg.baseUrl || '';
-$('#kbBase').addEventListener('change', () => { kbCfg.baseUrl = $('#kbBase').value; LS.set('preview.kb', kbCfg); });
+$('#kbBase').addEventListener('change', () => { kbCfg.baseUrl = $('#kbBase').value; persistKbToStorage(kbCfg); });
 
 // ============================================================
 // 模型配置复选框联动（视觉全局互斥 / 主模型单选受启用约束）
@@ -794,3 +1065,19 @@ renderModelSelect();
 showView('chat');
 updateSendState();
 input.focus();
+
+// 配置同步：从 chrome.storage（与选项页同源）加载模型/知识库；
+// 并监听选项页变更，使其保存后侧边栏立即生效，无需刷新。
+if (hasChromeStorage()) {
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== 'local') return;
+    if (changes.models && Array.isArray(changes.models.newValue)) {
+      models = changes.models.newValue;
+      LS.set('preview.models', models);
+      renderModels();
+      renderModelSelect();
+    }
+    if (changes.kb) { kbCfg = changes.kb.newValue || kbCfg; LS.set('preview.kb', kbCfg); }
+  });
+}
+syncConfigFromStorage();
