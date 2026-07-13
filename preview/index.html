@@ -67,6 +67,9 @@
                   <button type="button" class="func-item" role="menuitem" data-act="explain">
                     <span class="fi-ico">💡</span><span class="fi-label">解释</span>
                   </button>
+                  <button type="button" class="func-item" role="menuitem" data-act="ocr">
+                    <span class="fi-ico">🔍</span><span class="fi-label">OCR 识别</span>
+                  </button>
                   <button type="button" class="func-item" role="menuitem" data-act="automate">
                     <span class="fi-ico">🤖</span><span class="fi-label">网页操作</span>
                   </button>
@@ -99,6 +102,22 @@
     <section class="view view-features" id="view-features">
       <div class="page">
         <h2 class="page-title">功能</h2>
+
+        <div class="card">
+          <h3>🌐 网页翻译</h3>
+          <label class="field">翻译模型 <select id="pt-model"></select></label>
+          <label class="field">目标语言 <select id="pt-lang"></select></label>
+          <div class="field row" style="display:flex;gap:6px;align-items:center;margin-top:8px;">
+            <span style="color:#5b6470;font-size:12px;">翻译模式</span>
+            <button type="button" class="pt-mode" id="pt-mode-auto">自动</button>
+            <button type="button" class="pt-mode" id="pt-mode-manual">手动</button>
+          </div>
+          <div style="display:flex;gap:8px;margin-top:10px;">
+            <button type="button" class="primary" id="pt-translate" style="flex:1;">翻译本页</button>
+            <button type="button" id="pt-restore" style="flex:1;">还原</button>
+          </div>
+          <div id="pt-status" style="margin-top:6px;color:#6b7280;font-size:12px;min-height:16px;"></div>
+        </div>
 
         <div class="card">
           <h3>本地知识库（可选）</h3>
@@ -148,6 +167,12 @@
       </div>
     </section>
 
+  </div>
+
+  <!-- 图片预览弹窗：点击消息中的缩略图放大查看原图 -->
+  <div class="img-lightbox" id="imgLightbox" hidden>
+    <button type="button" class="img-lightbox-close" id="imgLightboxClose" title="关闭">×</button>
+    <img class="img-lightbox-img" id="imgLightboxImg" alt="图片预览" />
   </div>
 
   <script type="module" src="preview.js"></script>

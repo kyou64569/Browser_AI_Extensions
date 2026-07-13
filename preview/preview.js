@@ -199,7 +199,7 @@ let attachments = [];       // 待发送附件 {name, type, content}
 let chatModelId = models[0]?.id || null;  // 当前聊天所选模型（'__collab__' 表示多模型协作）
 let thinkingStrength = 'off';             // 聊天界面“思考强度”下拉的当前选择
 let streaming = false;
-let activeMode = null;      // 当前激活的功能模式（null | {type:'summarize'|'translate'|'explain'|'file', label?:string}）
+let activeMode = null;      // 当前激活的功能模式（null | {type:'summarize'|'translate'|'explain'|'ocr'|'file', label?:string}）
 let translateTarget = '';    // 翻译模式下的目标语言（空 = 未选择，翻译不可用）
 
 // 翻译目标语言列表（主流语言，下拉默认“选择语言”）
@@ -359,10 +359,20 @@ function loadConversation(id) {
 function deleteConversation(id) {
   const idx = conversations.findIndex(c => c.id === id);
   if (idx < 0) return;
+  const wasActive = currentConvId === id;
   conversations.splice(idx, 1);
   persistConversationsToStorage();
-  if (currentConvId === id) { currentConvId = null; messages = []; }
-  renderConversationList();
+  if (wasActive) {
+    // 被删除的是当前会话：清空主页面（聊天视图）DOM 并回到欢迎态，
+    // 避免用户删除后返回主页面仍残留已删除会话的内容。
+    currentConvId = null;
+    messages = [];
+    chatScroll.innerHTML = '';
+    showWelcome();
+    updateSendState();
+  }
+  // 会话列表始终基于最新 conversations 重渲染（即便当前不在列表视图，下次进入也已同步）
+  if ($('#view-conversations').classList.contains('is-active')) renderConversationList();
   toast('已删除会话', 'ok');
 }
 
@@ -451,6 +461,8 @@ function pushUser(text, images) {
       im.className = 'bubble-img';
       im.src = src;
       im.loading = 'lazy';
+      // 点击缩略图放大查看原图（原图即 data URL，清晰度不损失）
+      im.onclick = () => openImagePreview(src);
       g.appendChild(im);
     }
     bubble.appendChild(g);
@@ -458,6 +470,24 @@ function pushUser(text, images) {
   chatScroll.appendChild(el);
   scrollBottom();
 }
+
+// 图片预览弹窗：加载并展示原图（缩略图点击放大）
+function openImagePreview(src) {
+  if (!src) return;
+  $('#imgLightboxImg').src = src;
+  $('#imgLightbox').hidden = false;
+}
+function closeImagePreview() {
+  const lb = $('#imgLightbox');
+  lb.hidden = true;
+  $('#imgLightboxImg').src = '';   // 释放原图引用
+}
+$('#imgLightboxClose').onclick = closeImagePreview;
+// 点击遮罩空白处关闭；点击图片本身不关闭（图片已铺满，靠关闭按钮 / Esc）
+$('#imgLightbox').onclick = (e) => { if (e.target.id === 'imgLightbox') closeImagePreview(); };
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !$('#imgLightbox').hidden) closeImagePreview();
+});
 
 function newAssistant() {
   const el = document.createElement('div');
@@ -533,12 +563,14 @@ async function send() {
     return;
   }
 
-  // 翻译 / 解释 功能模式：允许“按功能发送”，但必须有正文
-  const funcMode = (activeMode && (activeMode.type === 'translate' || activeMode.type === 'explain' || activeMode.type === 'summarize'))
+  // 翻译 / 解释 / OCR 功能模式：允许“按功能发送”；OCR 只需图片，其余需正文
+  const funcMode = (activeMode && (activeMode.type === 'translate' || activeMode.type === 'explain' || activeMode.type === 'summarize' || activeMode.type === 'ocr'))
     ? activeMode.type : null;
   if (streaming) return;
   if (!funcMode && !text && attachments.length === 0) return;
   if (funcMode && !text && attachments.length === 0) {
+    // OCR 仅需图片，无需输入文本；其余功能需正文
+    if (funcMode === 'ocr') { setStatus('请先添加要识别的图片', 'err'); return; }
     setStatus('请先输入要' + (funcMode === 'translate' ? '翻译' : funcMode === 'explain' ? '解释' : '总结') + '的内容', 'err');
     return;
   }
@@ -557,17 +589,24 @@ async function send() {
     return;
   }
 
-  // 翻译 / 解释：把用户输入包上指令前缀；其余情况正常拼装（图片走多模态附件）
+  // 翻译 / 解释 / OCR：把用户输入包上指令前缀；其余情况正常拼装（图片走多模态附件）
   const content = funcMode
     ? (funcMode === 'translate'
         // 严格翻译：原封不动翻译为所选目标语言，仅输出译文，不附加任何解释/注释
         ? `请将下面的文本翻译为${translateTarget}，只输出翻译后的内容，不要添加任何解释、注释或额外说明：\n\n` + text
-        : '请用通俗语言解释下面的文本，必要时举例子：\n\n' + text)
+        : funcMode === 'explain'
+          ? '请用通俗语言解释下面的文本，必要时举例子：\n\n' + text
+          // OCR：识别并提取图片中的文字，只输出纯文本（无需用户输入正文）
+          : '请识别并提取图片中的所有文字内容，只输出识别出的纯文本，不要添加任何解释、注释或额外说明。' + (text ? '\n\n补充说明：' + text : ''))
     : buildContent(text, attachments);
   // 图片转为多模态附件（data URL），文本文件保留正文
   const imageAttachments = attachments
     .filter(a => a.type.startsWith('image/') && a.dataUrl)
     .map(a => ({ type: 'image', data: a.dataUrl }));
+  // OCR：只需图片即可（不再限制主模型是否支持视觉）；若已配置视觉模型，由视觉模型识别后回灌主模型整合。
+  if (funcMode === 'ocr' && imageAttachments.length === 0) {
+    setStatus('请先添加要识别的图片', 'err'); return;
+  }
   const userMsg = { role: 'user', content, ...(imageAttachments.length ? { attachments: imageAttachments } : {}) };
 
   input.value = ''; autosize();
@@ -593,7 +632,8 @@ async function send() {
   const ts = (ref && ref.supportsThinking) ? thinkingStrength : undefined;
 
   const a = newAssistant();
-  streaming = true; sendBtn.disabled = true; setStatus('思考中…');
+  streaming = true; sendBtn.disabled = true;
+  setStatus(funcMode === 'ocr' ? '正在识别图片中的文字…' : '思考中…');
 
   let acc = '';
   let started = false;
@@ -610,13 +650,13 @@ async function send() {
         setStatus('未选择主模型', 'err');
         return;
       }
-      if (!started) { started = true; a.stopTyping(); setStatus('正在回复…'); }
+      if (!started) { started = true; a.stopTyping(); setStatus(funcMode === 'ocr' ? '正在返回识别结果…' : '正在回复…'); }
       else a.stopTyping();
       acc += chunk.delta;
       a.setText(acc);
       scrollBottom();
     }
-    messages.push({ role: 'user', content });
+    messages.push(userMsg);                 // 含图片附件，确保会话持久化保留原图数据
     messages.push({ role: 'assistant', content: acc });
     setStatus('');
   } catch (e) {
@@ -642,7 +682,7 @@ input.addEventListener('keydown', (e) => {
 // AI 流式输出中若含 ```toolcall 块，则执行该工具并把结果回灌，
 // 直至 AI 给出最终自然语言回答（或达到迭代上限）。
 // ============================================================
-const MAX_TOOL_ITERS = 8;
+const MAX_TOOL_ITERS = 15;
 
 /** 单次发起 AUTOMATE 请求，带超时保护：无论成功 / 失败 / 超时都会 resolve，绝不悬挂 */
 function sendAutomateOnce(name, args, timeoutMs = 60000) {
@@ -746,9 +786,26 @@ async function runAutomation(userText) {
 
   pushUser(content);
   messages.push({ role: 'user', content });
-  const sysMsg = { role: 'system', content: buildToolSystemPrompt() };
+
+  // A. 发起自动化前，先取“当前网页”快照（标题/网址/首屏正文）注入系统提示，
+  // 让模型开局就知道自己正在操作哪个页面，避免弱模型凭空假设页面结构（如乱点不存在的按钮、擅自新开标签）。
+  let pageCtx = '';
+  try {
+    const page = await getActivePage();
+    if (page && page.url) {
+      const snippet = (page.text || '').replace(/\s+/g, ' ').trim().slice(0, 2000);
+      pageCtx = '\n\n【当前网页上下文（请基于它操作，不要新开/跳转其他页面）】\n' +
+        '标题：' + (page.title || '') + '\n' +
+        '网址：' + page.url + '\n' +
+        '首屏正文摘要：' + (snippet || '（无正文）');
+    }
+  } catch (_) { /* 取不到也不阻断主流程，仅缺少页面上下文 */ }
+
+  const sysMsg = { role: 'system', content: buildToolSystemPrompt() + pageCtx };
   // 后台循环上下文（仅用于把工具返回结果回灌给 AI 续跑），不写入用户可见历史
   const loop = [];
+  // E. 记录最近一次工具执行是否失败：若模型在上一步失败的情况下仍输出 DONE，需纠正其继续
+  let lastToolFailed = false;
 
   // 模型可用性检查（与 send() 一致）
   const mode = chatModelId === '__collab__' ? 'collab' : 'single';
@@ -806,6 +863,8 @@ async function runAutomation(userText) {
         for (const call of calls) {
           setStatus('正在执行操作…');
           const result = await execToolCall(call.name, call.args);
+          // E. 记录本步工具是否失败，供后续 DONE 校验（上一步失败时不允许判任务完成）
+          lastToolFailed = !(result && result.ok);
           // 视觉回灌：工具结果若已含截图则用之；否则当任一模型支持看图时主动截图，
           // 便于模型读取图表 / 图片中的目标数据（解决“数据在图表中读不到”的问题）。
           let shotUrl = (result && result.ok && result.result && result.result.dataUrl) || null;
@@ -856,18 +915,49 @@ async function runAutomation(userText) {
       // 改为作为一次观察回灌并继续循环，引导模型改用规范格式，由 MAX_TOOL_ITERS 兜住任何潜在的死循环。
       const hasToolIntent = /(?:调用|使用|执行)\s*工具|tool_?call|function_?call|toolcall/i.test(acc);
       if (!calls.length && hasToolIntent && iter < MAX_TOOL_ITERS) {
-        loop.push({ role: 'user', content: '[系统提示] 你刚才的回复疑似包含工具调用，但格式未被正确识别（例如中文“调用工具：name”缺少 JSON 参数，或拼写不规范）。请改用规范的 toolcall 代码块重新发起工具调用：\n```toolcall\n{"name":"工具名","args":{}}\n```\n若任务确实已全部完成，请直接给出最终的自然语言回答。' });
+        loop.push({ role: 'user', content: '[系统提示] 你刚才的回复疑似包含工具调用，但格式未被正确识别（例如中文“调用工具：name”缺少 JSON 参数，或拼写不规范）。请改用规范的 toolcall 代码块重新发起工具调用：\n```toolcall\n{"name":"工具名","args":{}}\n```\n若任务确实已全部完成，请直接给出最终的自然语言回答，并在末尾单独一行输出 DONE 标记。' });
         a = null;
         continue;
       }
 
-      // 无工具调用且无疑似意图 → 最终回答
+      // 结束判定：DONE 标记（独占一行）视为任务彻底完成；否则视为“中途汇报/思考”，继续循环。
+      // 这样即便弱模型提前用自然语言总结，也不会被误判为结束（除非它真的输出 DONE）。
+      const doneMark = /^\s*DONE\s*$/m.test(acc);
+      if (!calls.length && !doneMark && iter < MAX_TOOL_ITERS) {
+        loop.push({
+          role: 'user',
+          content: '[系统提示] 你刚才的回复没有包含 DONE 结束标记，系统据此认为任务尚未完成（可能还有步骤未执行）。' +
+            '请继续完成用户的全部要求：若还需操作网页就用 toolcall 块调用工具；若确实已全部完成，' +
+            '请在最终回答的末尾单独一行输出 DONE 标记后再结束。不要仅用自然语言“汇报”就停止。',
+        });
+        a = null;
+        continue;
+      }
+
+      // E. 防作弊：模型输出 DONE，但上一步工具执行其实是失败的（ok:false），不算完成。
+      // 回灌纠正并继续循环，避免模型“跳过失败”直接宣布完成（如 agnes 在新开禁自动化页失败后仍返回 DONE）。
+      if (!calls.length && doneMark && lastToolFailed && iter < MAX_TOOL_ITERS) {
+        loop.push({
+          role: 'user',
+          content: '[系统提示] 你输出了 DONE，但上一步工具调用实际上是失败的（未成功执行）。' +
+            '失败的任务不能视为完成。请检查上一步的错误原因，调整选择器 / 方式重试，或换一条可行路径继续完成任务；' +
+            '只有在某一步工具真正成功（ok:true）且已取得用户所需数据后，才输出 DONE。',
+        });
+        a = null;
+        lastToolFailed = false; // 重置，避免同一失败反复触发（下一轮会重新据实设置）
+        continue;
+      }
+
+      // 无工具调用、且已输出 DONE（或已达上限）→ 任务结束
       messages.push({ role: 'assistant', content: acc });
+      if (iter >= MAX_TOOL_ITERS && !/^\s*DONE\s*$/m.test(acc)) {
+        // 已达轮次上限仍未给出 DONE 标记：明确告知用户任务可能未完整完成，避免被误当结论
+        const note = '\n\n[提示] 已达到最大操作轮次（' + MAX_TOOL_ITERS + '）仍未收到完成标记，任务可能尚未全部完成。可继续补充指令或重新发起。';
+        messages[messages.length - 1].content += note;
+        if (a && a.el) a.setText(messages[messages.length - 1].content);
+      }
       setStatus('');
       break;
-    }
-    if (iter >= MAX_TOOL_ITERS && acc) {
-      messages.push({ role: 'assistant', content: acc });
     }
   } catch (e) {
     if (a) {
@@ -883,7 +973,7 @@ async function runAutomation(userText) {
 }
 
 // ============================================================
-// 加号：功能入口菜单（添加文件 / 总结网页 / 翻译 / 解释 / 网页操作）
+// 加号：功能入口菜单（添加文件 / 总结网页 / 翻译 / 解释 / OCR 识别 / 网页操作）
 // ============================================================
 const plusWrap = document.querySelector('.plus-wrap');
 const funcMenu = $('#funcMenu');
@@ -951,6 +1041,15 @@ function activateFunc(act) {
       ? '输入要翻译的文字，选择目标语言后发送…'
       : '输入要解释的文字，发送后解释…';
     input.focus();
+  }
+  if (act === 'ocr') {
+    setMode({ type: 'ocr', label: '🔍 OCR 识别' });
+    input.value = '';
+    input.placeholder = '添加图片后直接发送即可识别其中文字（无需输入文本）…';
+    autosize();
+    input.focus();
+    updateSendState();
+    return;
   }
 }
 
@@ -1035,7 +1134,10 @@ $('#fileInput').addEventListener('change', async (e) => {
   }
   e.target.value = '';
   renderAttachments(); updateSendState();
-  if (attachments.length) { setMode({ type: 'file', label: `📎 已添加文件 (${attachments.length})` }); syncFileTag(); }
+  // 图片相关功能模式（如 OCR）下添加图片应保持原模式，不要被“文件”模式覆盖
+  if (attachments.length && (!activeMode || activeMode.type !== 'ocr')) {
+    setMode({ type: 'file', label: `📎 已添加文件 (${attachments.length})` }); syncFileTag();
+  }
 });
 
 /** 把图片文件读取为 data URL（供多模态消息使用） */
@@ -1388,7 +1490,7 @@ function renderModels() {
       persistModelsToStorage(models);
       refreshCheckboxUI();              // 重算各复选框的禁用/选中态
       if (f === 'apiBase' || f === 'apiKey' || f === 'vendor') refreshModelList(models, i, wrap);
-      if (f === 'name' || f === 'model' || f === 'vendor' || f === 'enabled' || f === 'isPrimary') renderModelSelect();
+      if (f === 'name' || f === 'model' || f === 'vendor' || f === 'enabled' || f === 'isPrimary' || f === 'supportsVision') renderModelSelect();
     });
   });
   // 滑块（temperature / top_p）：拖动时实时显示数值并同步存储；range 原生约束越界
@@ -1691,9 +1793,12 @@ function renderModelSelect() {
   if (!sel) return;
   // 归一化，防止 LS 中存储异常导致下拉缺失
   if (!Array.isArray(models)) models = [defaultModel()];
-  // 选中项失效时回退到首个模型，保证始终有有效选择
-  if (chatModelId !== '__collab__' && !models.some(m => m.id === chatModelId)) {
-    chatModelId = models[0]?.id || null;
+  // 选中项失效、或当前选中的是“仅后台视觉模型”时，回退到首个非视觉聊天模型，
+  // 保证视觉模型只作后台辅助、不会被当作聊天主模型。
+  if (chatModelId !== '__collab__') {
+    const cur = models.find(m => m.id === chatModelId);
+    const nonVision = models.find(m => !m.supportsVision);
+    if (!cur || cur.supportsVision) chatModelId = (nonVision || models[0])?.id || null;
   }
   // 未配置主模型时，不应停留在“多模型协作”
   if (chatModelId === '__collab__' && !models.some(m => m.isPrimary && m.enabled !== false)) {
@@ -1709,11 +1814,14 @@ function renderModelSelect() {
   const collab = models.some(m => m.isPrimary && m.enabled !== false)
     ? '<option value="__collab__" ' + (chatModelId === '__collab__' ? 'selected' : '') + '>多模型协作</option>'
     : '';
-  const modelOpts = models.map(m => {
-    const label = m.name || m.model || m.vendor || '未命名模型';
-    const disabled = m.enabled === false ? ' （已停用）' : '';
-    return `<option value="${escapeHtml(m.id)}" ${m.id === chatModelId ? 'selected' : ''}>${escapeHtml(label + disabled)}</option>`;
-  }).join('');
+  // 视觉模型仅作为后台辅助识别模型，不出现在聊天框的下拉选择列表中
+  const modelOpts = models
+    .filter(m => !m.supportsVision)
+    .map(m => {
+      const label = m.name || m.model || m.vendor || '未命名模型';
+      const disabled = m.enabled === false ? ' （已停用）' : '';
+      return `<option value="${escapeHtml(m.id)}" ${m.id === chatModelId ? 'selected' : ''}>${escapeHtml(label + disabled)}</option>`;
+    }).join('');
   sel.innerHTML = collab + modelOpts;
   sel.value = chatModelId || '';
   sel.onchange = () => {
@@ -1727,6 +1835,176 @@ function renderModelSelect() {
 }
 function makeKb() {
   return kbCfg.baseUrl ? new LocalKbConnector({ baseUrl: kbCfg.baseUrl }) : null;
+}
+
+// ============================================================
+// 网页翻译（侧边栏控制）
+// ============================================================
+const PAGE_TRANSLATE_LANGS = [
+  '中文（简体）', '中文（繁体）', 'English', '日本語', '한국어',
+  'Français', 'Deutsch', 'Español', 'Русский', 'العربية', 'ภาษาไทย', 'Tiếng Việt',
+];
+
+/** 获取当前窗口的活动标签页 ID（用于与 content script 通信） */
+async function getActiveTabId() {
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    return (tab && tab.id) ? tab.id : null;
+  } catch (_) { return null; }
+}
+
+/** 保存网页翻译偏好 */
+function savePtPrefs(prefs) {
+  chrome.storage.local.set({ translatePrefs: prefs }).catch(() => {});
+}
+
+/** 初始化网页翻译卡片 */
+function initPageTranslate() {
+  const modelSel = $('#pt-model');
+  const langSel = $('#pt-lang');
+  const statusEl = $('#pt-status');
+  if (!modelSel) return;  // 卡片尚未挂载
+
+  // 语言下拉
+  langSel.innerHTML = PAGE_TRANSLATE_LANGS.map(l => `<option value="${l}">${l}</option>`).join('');
+
+  // 模型下拉（禁用/启用过滤同 settings 逻辑，且隐藏辅助视觉模型——与主聊天框保持一致）
+  function popModelSelect() {
+    const enabled = (models || []).filter(m => m.enabled !== false && !m.supportsVision);
+    if (!enabled.length) {
+      modelSel.innerHTML = '<option value="">（请先在设置添加模型）</option>';
+      return;
+    }
+    const primary = enabled.find(m => m.isPrimary) || enabled[0];
+    modelSel.innerHTML = enabled.map(m =>
+      `<option value="${m.id}">${escapeHtml(m.name || m.model || m.vendor)}</option>`
+    ).join('');
+    // 保持上次选中的模型；若已失效或不占位，回退到首个可用模型
+    chrome.storage.local.get('translatePrefs').then(r => {
+      const p = r.translatePrefs || {};
+      if (p.modelId && enabled.some(m => m.id === p.modelId)) modelSel.value = p.modelId;
+      else modelSel.value = primary.id;
+    });
+  }
+  popModelSelect();
+
+  // 加载历史偏好
+  chrome.storage.local.get('translatePrefs').then(r => {
+    const p = r.translatePrefs || {};
+    if (p.targetLang) langSel.value = p.targetLang;
+    if (p.mode) {
+      $('#pt-mode-auto').classList.toggle('active', p.mode === 'auto');
+      $('#pt-mode-manual').classList.toggle('active', p.mode === 'manual');
+    }
+    // 刷新状态
+    updatePtStatus();
+  });
+
+  // 模型下拉随模型变化刷新
+  const origRender = renderModels;
+  renderModels = function () {
+    origRender();
+    popModelSelect();
+  };
+
+  // 模式切换
+  $('#pt-mode-auto').onclick = () => {
+    const p = { mode: 'auto', targetLang: langSel.value, modelId: modelSel.value, active: false, activeHost: null };
+    savePtPrefs(p);
+    $('#pt-mode-auto').classList.add('active');
+    $('#pt-mode-manual').classList.remove('active');
+    updatePtStatus();
+  };
+  $('#pt-mode-manual').onclick = () => {
+    const p = { mode: 'manual', targetLang: langSel.value, modelId: modelSel.value, active: false, activeHost: null };
+    savePtPrefs(p);
+    $('#pt-mode-manual').classList.add('active');
+    $('#pt-mode-auto').classList.remove('active');
+    updatePtStatus();
+  };
+
+  // 语言/模型变更时持久化
+  langSel.onchange = () => {
+    chrome.storage.local.get('translatePrefs').then(r => {
+      const p = r.translatePrefs || {};
+      p.targetLang = langSel.value; p.modelId = modelSel.value;
+      savePtPrefs(p);
+    });
+  };
+  modelSel.onchange = () => {
+    chrome.storage.local.get('translatePrefs').then(r => {
+      const p = r.translatePrefs || {};
+      p.modelId = modelSel.value;
+      savePtPrefs(p);
+    });
+  };
+
+  // 翻译本页
+  $('#pt-translate').onclick = async () => {
+    const modelId = modelSel.value;
+    if (!modelId || !(models || []).some(m => m.id === modelId && m.enabled !== false)) {
+      statusEl.textContent = '请先在设置中添加并启用模型';
+      return;
+    }
+    statusEl.textContent = '正在连接页面 Worker…';
+    const tabId = await getActiveTabId();
+    if (!tabId) { statusEl.textContent = '未找到活动标签页'; return; }
+    try {
+      await chrome.tabs.sendMessage(tabId, { type: 'WEB_TRANSLATE_STATUS' });
+    } catch (_) {
+      statusEl.textContent = '网页翻译 Worker 未就绪，请刷新目标网页后重试';
+      return;
+    }
+    const targetLang = langSel.value;
+    statusEl.textContent = '正在翻译…';
+    try {
+      const resp = await chrome.tabs.sendMessage(tabId, {
+        type: 'WEB_TRANSLATE_EXECUTE',
+        modelId,
+        targetLang,
+      });
+      if (resp && resp.ok) {
+        const detail = resp.translated != null ? `（翻译 ${resp.translated} 段）` : resp.cached != null ? `（全部命中缓存）` : '';
+        statusEl.textContent = `已翻译本页（${targetLang}）${detail}`;
+        // 保存偏好，包括当前激活状态供自动模式使用
+        savePtPrefs({ modelId, targetLang, mode: $('#pt-mode-auto').classList.contains('active') ? 'auto' : 'manual', active: true, activeHost: location.hostname });
+      } else {
+        statusEl.textContent = '翻译失败：' + ((resp && resp.error) || '未知错误');
+      }
+    } catch (e) {
+      statusEl.textContent = '通信失败：' + (e && e.message ? e.message : e);
+    }
+  };
+
+  // 还原
+  $('#pt-restore').onclick = async () => {
+    const tabId = await getActiveTabId();
+    if (!tabId) { statusEl.textContent = '未找到活动标签页'; return; }
+    try {
+      await chrome.tabs.sendMessage(tabId, { type: 'WEB_TRANSLATE_RESTORE' });
+      statusEl.textContent = '已还原原文';
+    } catch (e) {
+      statusEl.textContent = '通信失败：' + (e && e.message ? e.message : e);
+    }
+  };
+
+  // 查询当前页面翻译状态
+  async function updatePtStatus() {
+    const tabId = await getActiveTabId();
+    if (!tabId) { statusEl.textContent = ''; return; }
+    try {
+      const resp = await chrome.tabs.sendMessage(tabId, { type: 'WEB_TRANSLATE_STATUS' });
+      if (resp && resp.active) statusEl.textContent = `已翻译（${resp.count} 组文本）`;
+      else statusEl.textContent = '';
+    } catch (_) { statusEl.textContent = ''; }
+  }
+
+  // 当切换到「功能」视图时刷新状态
+  const origShow = showView;
+  showView = function (name) {
+    origShow(name);
+    if (name === 'features') updatePtStatus();
+  };
 }
 
 // ---------- 主题切换 ----------
@@ -1756,6 +2034,7 @@ initThemeSwitch();
 renderModels();
 renderBackupModels();
 renderModelSelect();
+initPageTranslate();
 showView('chat');
 updateSendState();
 input.focus();
@@ -1772,6 +2051,21 @@ if (hasChromeStorage()) {
       renderModelSelect();
     }
     if (changes.kb) { kbCfg = changes.kb.newValue || kbCfg; LS.set('preview.kb', kbCfg); }
+    if (changes.conversations) {
+      // 会话数据被其他来源修改（如跨实例同步）：以存储为权威源刷新内存与界面，
+      // 确保主页面会话列表准确过滤已删除项，避免缓存/未刷新导致的残留显示。
+      conversations = Array.isArray(changes.conversations.newValue) ? changes.conversations.newValue : [];
+      LS.set('preview.conversations', conversations);
+      if (currentConvId && !conversations.some(c => c.id === currentConvId)) {
+        // 当前会话已被删除：同步清理主页面聊天区
+        currentConvId = null;
+        messages = [];
+        chatScroll.innerHTML = '';
+        showWelcome();
+        updateSendState();
+      }
+      if ($('#view-conversations').classList.contains('is-active')) renderConversationList();
+    }
   });
 }
 syncConfigFromStorage();

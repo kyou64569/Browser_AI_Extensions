@@ -440,7 +440,31 @@ body {
 .bubble-img {
   max-width: 200px; max-height: 200px;
   border-radius: 10px; border: 1px solid var(--line); display: block;
+  cursor: zoom-in; transition: filter .15s;
 }
+.bubble-img:hover { filter: brightness(1.04); }
+
+/* 图片预览弹窗（点击缩略图放大查看原图） */
+.img-lightbox {
+  position: fixed; inset: 0; z-index: 1000;
+  display: flex; align-items: center; justify-content: center;
+  padding: 24px; background: rgba(0, 0, 0, .82);
+  cursor: zoom-out;
+}
+.img-lightbox[hidden] { display: none; }
+.img-lightbox-img {
+  max-width: 100%; max-height: 100%;
+  object-fit: contain; border-radius: 8px;
+  box-shadow: 0 8px 40px rgba(0, 0, 0, .55);
+}
+.img-lightbox-close {
+  position: absolute; top: 14px; right: 16px;
+  width: 36px; height: 36px; border: none; border-radius: 50%;
+  background: rgba(255, 255, 255, .14); color: #fff;
+  font-size: 22px; line-height: 1; cursor: pointer;
+  display: grid; place-items: center; transition: background .15s;
+}
+.img-lightbox-close:hover { background: rgba(255, 255, 255, .28); }
 .send-btn {
   width: 38px; height: 38px; flex: 0 0 auto;
   display: grid; place-items: center;
@@ -515,6 +539,8 @@ button:hover { border-color: var(--accent); }
 button.primary { background: var(--user-bubble); border-color: transparent; color: #fff; }
 button.primary:hover { filter: brightness(1.08); }
 button.mini { padding: 4px 10px; font-size: 12px; }
+.pt-mode { flex:1; padding:6px 0; border:1px solid var(--line); border-radius:6px; background:var(--panel); color:var(--text); cursor:pointer; font-size:13px; }
+.pt-mode.active { background:var(--accent); color:#fff; border-color:var(--accent); }
 
 .result {
   background: var(--panel-2); border: 1px solid var(--line);

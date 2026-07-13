@@ -7,6 +7,8 @@ import { summarizePage } from '../features/summarize.js';
 import { LocalKbConnector } from '../connectors/local-kb.js';
 import { OnlineKbConnector } from '../connectors/online-kb.js';
 import { execTool } from './web-tools.js';
+import { createClient } from '../core/model-client.js';
+import { hasCred, optionsFromModel } from '../shared/utils.js';
 
 /** 获取当前最活跃的标签页 */
 async function getActiveTab() {
@@ -70,6 +72,92 @@ async function runSummarize(port) {
   } catch (e) {
     port?.postMessage({ type: 'ERROR', message: e.message });
   }
+}
+
+// ============================================================
+// 网页翻译：content script 收集页面文本节点后，分批交给所选模型翻译。
+// 每段用 [N]…[/N] 包裹，要求模型仅返回同格式译文，便于稳定解析。
+// ============================================================
+const TRANSLATE_BATCH = 100;
+
+function buildTranslatePrompt(segments, targetLang) {
+  const body = segments.map((s, i) => `[${i}]${s}[/${i}]`).join('\n');
+  return [
+    `Translate the following segments into ${targetLang}.`,
+    'Rules:',
+    `- Each segment is wrapped with [N] and [/N] markers (N = index starting at 0).`,
+    '- Output ONLY the translated segments using the exact same [N]...[/N] format, in order.',
+    '- Do NOT add any explanations, headings, or markdown fences.',
+    '',
+    body,
+  ].join('\n');
+}
+
+function parseTranslateResponse(text, count) {
+  const map = new Array(count).fill(undefined);
+  const re = /\[(\d+)\]([\s\S]*?)\[\/\1\]/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const idx = Number(m[1]);
+    if (idx >= 0 && idx < count && !map[idx]) { // 防止重复覆盖
+      map[idx] = m[2];
+    }
+  }
+  // 验证解析结果
+  const filled = map.filter(v => v !== undefined).length;
+  if (filled < count) {
+    console.warn(`Translation parsing: only ${filled}/${count} segments parsed`);
+  }
+  return map;
+}
+
+async function translateSegments(model, texts, targetLang) {
+  const result = texts.slice();
+  const items = [];
+  texts.forEach((t, i) => { if (t && t.trim()) items.push({ i, t }); });
+  if (!items.length) return result;
+  let client;
+  try { client = createClient(model); } catch (e) { throw new Error('翻译模型配置无效：' + e.message); }
+  if (!client) {
+    throw new Error('无法创建翻译客户端');
+  }
+  const options = { ...optionsFromModel(model) };
+
+  // 分组成批（每批 TRANSLATE_BATCH 段）
+  const batches = [];
+  for (let s = 0; s < items.length; s += TRANSLATE_BATCH) {
+    batches.push(items.slice(s, s + TRANSLATE_BATCH));
+  }
+
+  // 并发发送，最大 3 批同时进行（减小整体等待时间，同时避免触发 API 频率限制）
+  const CONCURRENCY = 3;
+  for (let b = 0; b < batches.length; b += CONCURRENCY) {
+    const chunk = batches.slice(b, b + CONCURRENCY);
+    await Promise.all(chunk.map(async (batch) => {
+      const prompt = buildTranslatePrompt(batch.map(c => c.t), targetLang);
+      let out = '';
+      try {
+        for await (const c of client.chat({ messages: [{ role: 'user', content: prompt }], stream: false, options })) {
+          out += (c && c.delta) || '';
+        }
+      } catch (e) {
+        console.error('Translation batch failed:', e);
+        return; // 整批失败：保留原文，不中断其它批次
+      }
+      const parsed = parseTranslateResponse(out, batch.length);
+      batch.forEach((c, k) => {
+        const tr = parsed[k];
+        result[c.i] = (tr != null && tr.trim() !== '') ? tr.trim() : c.t;
+      });
+      // 单段且解析失败时，退化为整段输出（模型未遵守 [N][/N] 格式）
+      if (batch.length === 1 && (!parsed[0] || !parsed[0].trim())) {
+        const flat = out.trim();
+        if (flat) result[batch[0].i] = flat;
+      }
+    }));
+  }
+
+  return result;
 }
 
 // 侧边栏用长连接 port 接收流式/状态
@@ -166,8 +254,29 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     })();
     return true; // 异步 sendResponse
   }
+  if (msg.type === 'TRANSLATE_PAGE') {
+    // 网页翻译：content script 收集页面文本后，分批交由所选模型翻译。
+    (async () => {
+      try {
+        const { modelId, targetLang, texts } = msg;
+        if (!Array.isArray(texts)) { sendResponse({ ok: false, error: '参数错误：texts 必须是数组' }); return; }
+        const models = await getModels();
+        const model = models.find(m => m.id === modelId)
+          || models.find(m => m.enabled !== false && m.isPrimary)
+          || models.find(m => m.enabled !== false);
+        if (!model) { sendResponse({ ok: false, error: '未找到可用翻译模型，请先在设置添加模型' }); return; }
+        if (!hasCred(model)) { sendResponse({ ok: false, error: '翻译模型缺少有效凭证（API Key）' }); return; }
+        const translations = await translateSegments(model, texts, targetLang || '中文（简体）');
+        sendResponse({ ok: true, translations });
+      } catch (e) {
+        sendResponse({ ok: false, error: (e && e.message) ? e.message : '翻译失败' });
+      }
+    })();
+    return true; // 异步 sendResponse
+  }
   return false;
 });
+
 
 // 点击工具栏图标：直接在浏览器原生侧边栏中打开聊天应用（最可靠，无需内容脚本）
 chrome.sidePanel?.setPanelBehavior?.({ openPanelOnActionClick: true }).catch(() => {});
@@ -177,3 +286,46 @@ chrome.action?.onClicked?.addListener(async (tab) => {
   if (!tab || !tab.id) return;
   try { await chrome.sidePanel.open({ tabId: tab.id }); } catch (_) {}
 });
+
+// 扩展启动 / 更新 / 安装时，主动给所有已打开的“普通网页”标签页注入 content script。
+// 解决：扩展重载后，已打开的标签页不会自动重新注入 content script，
+// 导致侧边栏发起 EXECUTE_TOOL 时 sendMessage 找不到接收端（表现为“content script 无法建立连接”）。
+// 注入失败时静默跳过（受保护页面 / 内部页本就无法注入）。
+async function injectContentScriptsToOpenTabs() {
+  try {
+    const tabs = await chrome.tabs.query({});
+    for (const tab of tabs) {
+      if (!tab || !tab.id || !tab.url) continue;
+      // 仅对 http/https/ file 普通页面注入；跳过浏览器内部页（chrome://、edge://、扩展页等）
+      if (!/^(https?:|file:|^about:blank)/i.test(tab.url)) continue;
+      try {
+        await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          files: ['content/extract.js', 'content/sidebar-inject.js'],
+        });
+      } catch (_) { /* 该页面不可注入，忽略 */ }
+    }
+  } catch (_) { /* 查询失败忽略 */ }
+}
+
+// 安装 / 更新时注入：合并翻译脚本注入和自动化脚本注入
+chrome.runtime.onInstalled?.addListener(async () => {
+  // 1) 注入翻译脚本（用于网页翻译功能）
+  try {
+    const tabs = await chrome.tabs.query({});
+    for (const tab of tabs || []) {
+      if (!tab || !tab.id || !tab.url) continue;
+      // 跳过快照/内置/扩展自身等无法注入的页面
+      if (/^(chrome|chrome-extension|edge|about|moz-extension|devtools):/i.test(tab.url)) continue;
+      try {
+        await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          files: ['content/translate.js', 'content/extract.js', 'content/sidebar-inject.js'],
+        });
+      } catch (_) { /* 部分页面可能拒绝注入，忽略 */ }
+    }
+  } catch (_) {}
+  // 2) 注入自动化脚本（用于网页操作功能）
+  injectContentScriptsToOpenTabs();
+});
+chrome.runtime.onStartup?.addListener(() => { injectContentScriptsToOpenTabs(); });

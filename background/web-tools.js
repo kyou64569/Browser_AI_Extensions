@@ -170,14 +170,67 @@ async function pageTool(tool, args) {
   }
 }
 
-/** 通过 scripting API 在页面内执行 DOM 工具 */
+/**
+ * 通过已注入的 content script 执行 DOM 工具（首选路径）。
+ * 内容脚本对宿主页面有完整 DOM 权限（manifest content_scripts 常驻注入），
+ * 不依赖 activeTab 是否被用户交互激活，因此在侧边栏 / 未先点击扩展图标的
+ * 场景下也能稳定工作，避免 chrome.scripting.executeScript 被以“权限不足”拒绝。
+ * 仅当 content script 不可达（如扩展重载后已打开的标签页未重新注入、或受保护页面）
+ * 时，回退到 scripting 注入。全程带超时，避免 sendMessage 在接收端缺失时无限挂起。
+ */
+const CS_TIMEOUT_MS = 8000;
+
 async function runInPage(tabId, tool, args) {
-  const [res] = await chrome.scripting.executeScript({
-    target: { tabId },
-    func: pageTool,
-    args: [tool, args || {}],
+  // 带超时的 sendMessage（content script 缺失时浏览器可能长时间挂起或不报明确错误）
+  const sendWithTimeout = (timeoutMs) => new Promise((resolve, reject) => {
+    let done = false;
+    const timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      reject(new Error('content script 未在 ' + timeoutMs + 'ms 内响应（可能未注入或页面不支持）'));
+    }, timeoutMs);
+    try {
+      chrome.tabs.sendMessage(tabId, { type: 'EXECUTE_TOOL', tool, args: args || {} }, (resp) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        const err = chrome.runtime.lastError;
+        if (err) return reject(new Error(err.message || '消息端口错误'));
+        resolve(resp);
+      });
+    } catch (e) {
+      if (!done) { done = true; clearTimeout(timer); }
+      reject(e);
+    }
   });
-  return (res && res.result) ? res.result : { ok: false, error: '页面脚本无返回' };
+
+  // 1) 首选：让已注入的 content script 直接执行（EXECUTE_TOOL 消息）
+  try {
+    const resp = await sendWithTimeout(CS_TIMEOUT_MS);
+    if (resp && typeof resp === 'object' && 'ok' in resp) return resp;
+    if (resp && typeof resp === 'object') return resp; // 兼容旧式 {result} 结构
+    return { ok: false, error: '内容脚本无返回' };
+  } catch (csErr) {
+    const reason = (csErr && csErr.message) ? csErr.message : String(csErr);
+    // 2) 兜底：content script 不可达（未注入 / 受保护页面），用 scripting 注入执行
+    try {
+      const [res] = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: pageTool,
+        args: [tool, args || {}],
+      });
+      return (res && res.result && typeof res.result === 'object')
+        ? res.result
+        : { ok: false, error: '页面脚本无返回' };
+    } catch (scriptErr) {
+      // 两条路径都失败：明确指出是“页面注入受限”还是“content script 未注入”，便于排查
+      const sReason = (scriptErr && scriptErr.message) ? scriptErr.message : String(scriptErr);
+      const hint = /Cannot access this page|Missing host permission|chrome:\/\/|edge:\/\/|receiving end/i.test(sReason + reason)
+        ? '（该页面可能受保护或不支持扩展脚本注入，请换一个普通网页再试）'
+        : '（content script 可能未注入，请刷新该标签页或重载扩展后重试）';
+      return { ok: false, error: '无法在页面执行工具：' + reason + '；脚本注入也失败：' + sReason + ' ' + hint };
+    }
+  }
 }
 
 /** 截图当前可视区域 */
