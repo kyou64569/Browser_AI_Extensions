@@ -205,6 +205,21 @@ async function streamTranscribe(port, msg) {
   if (!audio) {
     port.postMessage({ type: 'error', error: 'Whisper 转写失败：无效的音频数据' }); return;
   }
+
+  // 兼容防错：跨进程（MessagePort）传输二进制 Uint8Array 时，可能会在部分浏览器中被序列化为普通 Object（例如 {0: 10, 1: 20...}）。
+  // 若不进行转换，直接 new Blob([audio]) 会在 Blob 中写入 "[object Object]" 文本，导致 Whisper HTTP 400（no audio track found in file）。
+  let binaryData = audio;
+  if (audio && typeof audio === 'object' && !(audio instanceof Blob) && !(audio instanceof ArrayBuffer) && !ArrayBuffer.isView(audio)) {
+    const keys = Object.keys(audio).map(Number).filter(n => !isNaN(n)).sort((a, b) => a - b);
+    if (keys.length > 0) {
+      const u8 = new Uint8Array(keys.length);
+      for (let i = 0; i < keys.length; i++) {
+        u8[i] = audio[keys[i]];
+      }
+      binaryData = u8;
+    }
+  }
+
   const all = await getWhisperModels();
   const list = (Array.isArray(whisperModelIds) && whisperModelIds.length)
     ? all.filter(w => whisperModelIds.includes(w.id) && w.model) : all.filter(w => w.model);
@@ -213,7 +228,7 @@ async function streamTranscribe(port, msg) {
   const isWav = /wav/i.test(mime || '');
   const fileType = isWav ? 'audio/wav' : 'audio/webm';
   const fileName = isWav ? 'audio.wav' : 'audio.webm';
-  const audioBlob = (audio instanceof Blob) ? audio : new Blob([audio], { type: fileType });
+  const audioBlob = (binaryData instanceof Blob) ? binaryData : new Blob([binaryData], { type: fileType });
   const TOTAL_TIMEOUT_MS = 120000;
   const startedAt = Date.now();
   let lastErr;
@@ -287,6 +302,70 @@ async function streamTranscribe(port, msg) {
   port.postMessage({ type: 'error', error: (lastErr && lastErr.message) || '所有 Whisper 模型均失败' });
 }
 
+// ---------- 实时字幕：Offscreen Document 音频捕获（绕过内容脚本 autoplay 限制）----------
+let offscreenCaptionPort = null;   // offscreen 文档连上来的端口
+let activeCaptionTabId = null;     // 当前正在生成字幕的标签页（用于把音频片段转发给它）
+let pendingCaptionStart = null;    // offscreen 尚未连接时的挂起 start
+let creatingOffscreen = false;
+
+// 取标签页音频流 id（在 SW 中调用 chrome.tabCapture.getMediaStreamId，内容脚本无此权限）
+async function getTabStreamId(tabId) {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    const url = (tab && (tab.url || tab.pendingUrl)) || '';
+    if (isChromeInternalPage(url)) return { ok: false, error: CHROME_PAGE_HINT };
+  } catch (_) { /* 取不到 url 也不阻塞，继续走 getMediaStreamId */ }
+  return new Promise((resolve) => {
+    // 关键：必须传 targetTabId 指定“要捕获哪个标签页”（Chrome 116+ 官方写法）。
+    // 旧的 consumerTabId 只控制“谁可消费”，不能指定捕获目标；漏传会导致 offscreen 里
+    // getUserMedia 报 “Error starting tab capture”。
+    chrome.tabCapture.getMediaStreamId({ targetTabId: tabId }, (streamId) => {
+      if (chrome.runtime.lastError) {
+        const errMsg = chrome.runtime.lastError.message || '';
+        if (/not been invoked|activeTab/i.test(errMsg)) {
+          resolve({ ok: false, error: '获取音频流失败：扩展尚未在当前页面被授权（activeTab）。请在目标视频标签页上点击本扩展图标，或右键该页面选择“AI 助手：开启实时字幕”以授权，然后重试。' });
+        } else {
+          resolve({ ok: false, error: '获取音频流失败：' + errMsg });
+        }
+        return;
+      }
+      if (!streamId) { resolve({ ok: false, error: '无法获取标签页音频流（请确认在视频标签页内，且扩展拥有 tabCapture 权限）' }); return; }
+      resolve({ ok: true, streamId });
+    });
+  });
+}
+
+// 关闭可能残留的 offscreen 文档（上一 SW 实例/上次会话留下的孤儿，其仍持有标签页音频捕获，
+// 会导致 getMediaStreamId 报 “Cannot capture a tab with an active stream”，并令标签页持续静音）。
+async function closeLingeringOffscreen() {
+  try {
+    const ctxs = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
+    if (ctxs && ctxs.length) { await chrome.offscreen.closeDocument(); }
+  } catch (_) { /* 无文档或已关闭，忽略 */ }
+}
+
+// 确保 offscreen 文档存在（扩展自有文档，AudioContext 不受视频页 autoplay 限制）。
+// 调用方在调用前应已关闭旧文档（见 LIVE_CAPTION_START_CAPTURE），本函数只负责创建。
+async function ensureOffscreen() {
+  if (offscreenCaptionPort) return; // 已有可用连接，直接复用
+  if (creatingOffscreen) return;
+  creatingOffscreen = true;
+  try {
+    await chrome.offscreen.createDocument({
+      url: 'offscreen/subtitle-offscreen.html',
+      reasons: ['USER_MEDIA'],
+      justification: '捕获标签页音频并恢复声音（绕过内容脚本 autoplay 限制）',
+    });
+  } catch (e) {
+    // 极小概率竞态下文档已存在，忽略——其端口会连上来
+    if (!/already exists/i.test(String((e && e.message) || ''))) {
+      console.warn('[offscreen] createDocument 失败', e);
+    }
+  } finally {
+    creatingOffscreen = false;
+  }
+}
+
 // 侧边栏用长连接 port 接收流式/状态
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name === 'sidepanel') {
@@ -306,6 +385,28 @@ chrome.runtime.onConnect.addListener((port) => {
         catch (e) { port.postMessage({ type: 'error', error: (e && e.message) ? e.message : '流式转写异常' }); }
       }
     });
+  }
+  // 实时字幕 offscreen 文档：接收音频片段并转发给内容脚本做 Whisper 转写
+  if (port.name === 'offscreen-caption') {
+    offscreenCaptionPort = port;
+    port.onMessage.addListener(async (m) => {
+      if (!m) return;
+      if (m.type === 'AUDIO') {
+        if (activeCaptionTabId != null) {
+          try { await chrome.tabs.sendMessage(activeCaptionTabId, { type: 'LIVE_CAPTION_AUDIO', blob: m.blob, mime: m.mime }); } catch (_) {}
+        }
+      } else if (m.type === 'CAPTURE_ERROR') {
+        if (activeCaptionTabId != null) {
+          try { await chrome.tabs.sendMessage(activeCaptionTabId, { type: 'LIVE_CAPTION_CAPTURE_ERROR', error: m.error }); } catch (_) {}
+        }
+      }
+    });
+    port.onDisconnect.addListener(() => { if (offscreenCaptionPort === port) offscreenCaptionPort = null; });
+    // offscreen 刚连上：若此前有挂起的 start，立即下发
+    if (pendingCaptionStart) {
+      port.postMessage({ type: 'START', streamId: pendingCaptionStart.streamId });
+      pendingCaptionStart = null;
+    }
   }
 });
 
@@ -418,56 +519,58 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     })();
     return true; // 异步 sendResponse
   }
-  // 实时字幕：content script 无法调用 chrome.tabCapture，故由后台取标签页音频流 id 后回传。
-  // content script 再凭此 id 调用 getUserMedia({chromeMediaSource:'tab'}) 抓取标签页音频。
-  if (msg.type === 'LIVE_CAPTION_GET_STREAM') {
+  // 注：旧的 LIVE_CAPTION_GET_STREAM（内容脚本自行 getUserMedia 捕获）已废弃——
+  // 捕获与声音恢复统一在 Offscreen 文档完成（见 LIVE_CAPTION_START_CAPTURE / offscreen/）。
+
+  // 实时字幕：内容脚本请求在 offscreen 中启动音频捕获（绕开内容脚本 autoplay 限制）
+  if (msg.type === 'LIVE_CAPTION_START_CAPTURE') {
     (async () => {
       try {
-        const tab = sender && sender.tab;
-        const tabId = tab && tab.id;
+        const tabId = sender && sender.tab && sender.tab.id;
         if (!tabId) { sendResponse({ ok: false, error: '无法确定来源标签页' }); return; }
-        // 1) 拦截浏览器内部页面：这些页面既不会注入 content script，也无法被 tabCapture 捕获
-        const url = (tab.url || tab.pendingUrl || '');
-        if (isChromeInternalPage(url)) {
-          sendResponse({ ok: false, error: CHROME_PAGE_HINT });
-          return;
+        // 关键：若已有捕获（含上一会话留下的孤儿 offscreen），先停掉并关闭旧文档，
+        // 否则 getMediaStreamId 会报 “Cannot capture a tab with an active stream”，且标签页持续静音。
+        if (offscreenCaptionPort) { try { offscreenCaptionPort.postMessage({ type: 'STOP' }); } catch (_) {} }
+        offscreenCaptionPort = null;
+        pendingCaptionStart = null;
+        await closeLingeringOffscreen();
+        // 等待旧捕获的轨道真正释放，避免 getMediaStreamId 立刻报 “active stream”
+        await new Promise((r) => setTimeout(r, 200));
+        const got = await getTabStreamId(tabId);
+        if (!got.ok) { sendResponse({ ok: false, error: got.error }); return; }
+        activeCaptionTabId = tabId;
+        await ensureOffscreen();
+        if (offscreenCaptionPort) {
+          offscreenCaptionPort.postMessage({ type: 'START', streamId: got.streamId });
+        } else {
+          pendingCaptionStart = { streamId: got.streamId }; // offscreen 连接后来下发
         }
-        // 2) getMediaStreamId 需要目标标签页已被授予 activeTab（通过用户手势触发本扩展）。
-        //    若未授权会报 “Extension has not been invoked ... (see activeTab permission)”，需给出明确引导。
-        try {
-          chrome.tabCapture.getMediaStreamId({ consumerTabId: tabId }, (streamId) => {
-            try {
-              if (chrome.runtime.lastError) {
-                const errMsg = chrome.runtime.lastError.message || '';
-                if (/not been invoked|activeTab/i.test(errMsg)) {
-                  sendResponse({
-                    ok: false,
-                    error: '获取音频流失败：扩展尚未在当前页面被授权（activeTab）。请在目标视频标签页上点击本扩展图标，'
-                      + '或右键该页面选择"AI 助手：开启实时字幕"以授权，然后重试。',
-                  });
-                } else {
-                  sendResponse({ ok: false, error: '获取音频流失败：' + errMsg });
-                }
-                return;
-              }
-              if (!streamId) {
-                sendResponse({ ok: false, error: '无法获取标签页音频流（请确认在视频标签页内，且扩展拥有 tabCapture 权限）' });
-                return;
-              }
-              sendResponse({ ok: true, streamId });
-            } catch (e) {
-              sendResponse({ ok: false, error: 'getMediaStreamId 回调异常：' + (e?.message || e) });
-            }
-          });
-        } catch (e) {
-          sendResponse({ ok: false, error: 'getMediaStreamId 调用失败：' + (e?.message || e) });
-          return;
-        }
+        sendResponse({ ok: true });
       } catch (e) {
-        sendResponse({ ok: false, error: (e && e.message) ? e.message : '获取音频流异常' });
+        sendResponse({ ok: false, error: (e && e.message) ? e.message : '启动音频捕获异常' });
       }
     })();
-    return true; // 异步 sendResponse（getMediaStreamId 回调内调用）
+    return true;
+  }
+  // 实时字幕：停止 offscreen 音频捕获
+  if (msg.type === 'LIVE_CAPTION_STOP_CAPTURE') {
+    if (offscreenCaptionPort) { try { offscreenCaptionPort.postMessage({ type: 'STOP' }); } catch (_) {} }
+    pendingCaptionStart = null;
+    // 关闭离屏文档：彻底释放标签页音频捕获，恢复原生声音（捕获会静音原标签页）
+    try { chrome.offscreen.closeDocument().catch(() => {}); } catch (_) {}
+    offscreenCaptionPort = null;
+    activeCaptionTabId = null;
+    sendResponse({ ok: true });
+    return true;
+  }
+  // offscreen 文档就绪信号
+  if (msg.type === 'OFFSCREEN_CAPTION_READY') {
+    if (pendingCaptionStart && offscreenCaptionPort) {
+      offscreenCaptionPort.postMessage({ type: 'START', streamId: pendingCaptionStart.streamId });
+      pendingCaptionStart = null;
+    }
+    sendResponse({ ok: true });
+    return true;
   }
   if (msg.type === 'LIVE_CAPTION_TRANSLATE') {
     (async () => {
@@ -518,6 +621,8 @@ async function injectContentScriptsToOpenTabs() {
 
 // 安装 / 更新时注入：合并翻译脚本注入和自动化脚本注入
 chrome.runtime.onInstalled?.addListener(async () => {
+  // 清理上一版本可能残留的 offscreen 捕获文档（否则会令标签页持续静音）
+  try { await closeLingeringOffscreen(); } catch (_) {}
   try {
     const tabs = await chrome.tabs.query({});
     for (const tab of tabs || []) {
@@ -532,4 +637,7 @@ chrome.runtime.onInstalled?.addListener(async () => {
     }
   } catch (_) {}
 });
-chrome.runtime.onStartup?.addListener(() => { injectContentScriptsToOpenTabs(); });
+chrome.runtime.onStartup?.addListener(async () => {
+  try { await closeLingeringOffscreen(); } catch (_) {}
+  injectContentScriptsToOpenTabs();
+});

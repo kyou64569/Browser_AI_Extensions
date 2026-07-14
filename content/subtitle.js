@@ -1,5 +1,5 @@
 // content/subtitle.js
-// 实时字幕 —— 页面 Worker：监听平台内嵌字幕（优先）或捕获标签页音频经 Whisper 转写，
+// 实时字幕 —— 页面 Worker：监听平台内嵌字幕（优先）或经 Whisper 转写捕获到的语音，
 // 把原文交给后台所选大模型翻译，并在页面上叠加"原文 + 译文"双语字幕层。
 //
 // 与 translate.js 一样，通过 chrome.runtime.onMessage 接收侧边栏指令：
@@ -11,6 +11,14 @@
 //   - 窗口批处理：多条字幕合并成一个请求，砍掉 RTT
 //   - 短语缓存：重复句（片头/客套话）只翻一次
 //   - 非直播预取：原生 <track> 字幕轨可被整片预翻译，播放到时秒显
+//
+// 路线 A（根治“开启字幕后视频无声”）：
+//   标签页音频的“捕获”与“声音恢复（Web Audio）”全部在【Offscreen 文档】中完成，
+//   因为捕获必然静音原标签页，而恢复声音所需的 AudioContext 若建在【视频页内容脚本】里
+//   会被 Chrome 自动播放策略卡成 suspended（手势在侧边栏、不在视频页）。Offscreen 是扩展
+//   自有文档，其 AudioContext 不受此限制，可稳定恢复声音。本脚本只负责：
+//     1) 收到 SW 转发的音频切片（LIVE_CAPTION_AUDIO）→ 送 Whisper 转写 → 渲染；
+//     2) 捕获失败时显示错误（LIVE_CAPTION_CAPTURE_ERROR）。
 
 (function () {
   if (window.self !== window.top) return;       // 仅顶层文档
@@ -30,20 +38,12 @@
   let trackWatch = null;     // 原生 textTracks 监听
   let prefetchTimer = null;
 
-  // Whisper 音频抓取（流式：每片独立录制为完整 webm，直接发给后台转写；Groq 原生支持 webm）
-  let whisperStream = null;       // getUserMedia 得到的标签页音频流
-  let whisperRec = null;          // 当前片 MediaRecorder
-  let whisperSliceTimer = null;   // 当前片停止 / 下一片启动的定时器
-  let whisperAudioEl = null;      // 用于把捕获流回放到扬声器，恢复标签页声音（避免静音）
+  // Whisper 转写（音频捕获在 Offscreen 文档完成；这里只把收到的音频片段送转写 + 渲染）
   let whisperQueue = [];          // 待转写的音频 Blob 队列（顺序处理，避免字幕错乱）
   let whisperBusy = false;        // 当前是否有切片正在流式转写
   let whisperPort = null;         // 当前活跃的 Whisper 连接端口（用于 stop 时断开）
   let whisperErrored = false;     // 转写失败仅提示一次，避免刷屏
-  let whisperUnmuteTimer = null;   // 音频元素取消静音的重试定时器
-  let gestureListeners = [];      // 音频元素手势监听器引用，用于清理
-  const WHISPER_SLICE_MS = 4000;  // 每片时长：4 秒，远小于视频节奏，配合流式接近实时
   const MAX_WHISPER_QUEUE = 10;   // Whisper 队列最大长度，防止内存溢出
-  const WHISPER_MIN_BLOB_SIZE = 1024;  // 静音片段跳过阈值
 
   // 翻译批处理 + 缓存
   let pendingBatch = [];
@@ -76,7 +76,7 @@
     overlay.style.cssText =
       'position:fixed;left:50%;bottom:8%;transform:translateX(-50%);' +
       'max-width:82%;text-align:center;z-index:2147483647;pointer-events:none;' +
-      'font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;' +
+      'font-family:-apple-system,BlinkMacFont,"Segoe UI",Roboto,sans-serif;' +
       'line-height:1.4;transition:opacity .15s;';
     transEl = document.createElement('div');
     transEl.style.cssText =
@@ -233,239 +233,22 @@
     return true;
   }
 
-// ---------- Whisper：捕获标签页音频并流式切片转写 ----------
+  // ---------- Whisper：音频已在 Offscreen 文档捕获并切片 ----------
+  // 本函数只负责“请求后台启动 Offscreen 捕获”。真实捕获 / 声音恢复 / 切片 / 转 WAV 都在
+  // offscreen/subtitle-offscreen.js 里完成；捕获到的音频片段经 SW 以 LIVE_CAPTION_AUDIO
+  // 消息转发到这里，再由 enqueueWhisper 送 Whisper 转写。
   async function setupWhisper() {
-    // 0) 优先使用 video.captureStream() —— 不静音视频，捕获流保证有音频数据
-    const video = document.querySelector('video');
-    if (video && typeof video.captureStream === 'function') {
-      // 确保 video 已加载元数据 + 正在播放（captureStream 只有在音频轨道活跃时才返回它们）
-      if (video.readyState < 1) {
-        // 等待 loadedmetadata
-        try { await new Promise((r, rej) => {
-          const t = setTimeout(() => r(), 3000);
-          video.addEventListener('loadedmetadata', () => { clearTimeout(t); r(); }, { once: true });
-        }); } catch (_) {}
-      }
-      if (video.paused) {
-        try { await video.play(); } catch (_) { /* CORS 或其他策略阻止播放，继续尝试 */ }
-        // 给音频解码一点时间
-        if (video.paused) await new Promise(r => setTimeout(r, 800));
-      }
-      // 重试 captureStream（给 video 足够时间建立音频管线）
-      for (let i = 0; i < 4; i++) {
-        try {
-          const vs = video.captureStream(0);
-          if (vs && vs.getAudioTracks().length) {
-            whisperStream = vs;
-            renderLine('', '🎙 正在识别语音…');
-            startWhisperSlice();
-            return true;
-          }
-        } catch (_) {}
-        if (i < 3) await new Promise(r => setTimeout(r, 500));
-      }
+    const resp = await chrome.runtime.sendMessage({ type: 'LIVE_CAPTION_START_CAPTURE' });
+    if (!resp || !resp.ok) {
+      throw new Error((resp && resp.error) || '无法启动音频捕获（Whisper 模式需要标签页音频权限）');
     }
-    // 1) tabCapture 兜底：向后台请求标签页音频流 id
-    const streamResp = await chrome.runtime.sendMessage({ type: 'LIVE_CAPTION_GET_STREAM' });
-    if (!streamResp || !streamResp.ok || !streamResp.streamId) {
-      throw new Error((streamResp && streamResp.error) || '无法获取标签页音频流');
-    }
-    // 2) 凭 streamId 抓取标签页音频
-    let stream;
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({
-        audio: { mandatory: { chromeMediaSource: 'tab', chromeMediaSourceId: streamResp.streamId } },
-      });
-    } catch (e) {
-      throw new Error('getUserMedia 失败（标签页音频）：' + (e && e.message ? e.message : e));
-    }
-    if (!stream || !stream.getAudioTracks().length) {
-      throw new Error('未获取到标签页音频轨道');
-    }
-    whisperStream = stream;
-    // tabCapture 会断开标签页扬声器输出（静音）。下面用双重路径恢复声音：
-    //   A) <audio> 元素：muted 起播 → 等播放中 firstShoot → 取消静音
-    //   B) Web Audio API：createMediaStreamSource → destination（直连扬声器管道）
-    //      AudioContext 需要用户手势，若 suspended 则挂 gesture listener 等用户点页面后再连接。
-    //   两条路径同时工作、互不干扰。
-    try {
-      whisperAudioEl = document.createElement('audio');
-      whisperAudioEl.muted = true;
-      whisperAudioEl.volume = 1;
-      whisperAudioEl.playsInline = true;
-      whisperAudioEl.style.cssText = 'position:fixed;left:-9999px;top:-9999px;width:1px;height:1px;opacity:0;pointer-events:none;';
-      document.documentElement.appendChild(whisperAudioEl);
-      whisperAudioEl.srcObject = stream;
-      const doUnmute = () => { if (whisperAudioEl) { whisperAudioEl.muted = false; whisperAudioEl.volume = 1; } };
-      // muted play → 等 playing 事件 + 确有数据后 unmute；超时 2s 兜底
-      whisperAudioEl.play().then(() => {
-        const now = Date.now();
-        const check = setInterval(() => {
-          if (!whisperAudioEl || whisperAudioEl.muted === false) { clearInterval(check); return; }
-          if (whisperAudioEl.readyState >= 3 && whisperAudioEl.currentTime > 0 && !whisperAudioEl.paused) {
-            doUnmute(); clearInterval(check);
-          }
-          if (Date.now() - now > 2000) { doUnmute(); clearInterval(check); }
-        }, 150);
-      }).catch(() => {
-        // 极端被拦截：用 gesture 恢复
-        const onGesture = () => {
-          if (!whisperAudioEl) return;
-          whisperAudioEl.muted = false;
-          if (whisperAudioEl.paused) whisperAudioEl.play().catch(() => {});
-        };
-        [{ ev: 'pointerdown' }, { ev: 'keydown' }, { ev: 'touchstart' }].forEach(({ ev }) => {
-          const fn = onGesture;
-          const opts = { once: true, capture: true };
-          gestureListeners.push({ el: document, event: ev, fn, opts });
-          document.addEventListener(ev, fn, opts);
-        });
-      });
-    } catch (_) { whisperAudioEl = null; }
-  let whisperAudioCtx = null;     // 路径 B 的 AudioContext 实例，用于 stop() 时关闭
-  let whisperAudioCtxGestures = []; // 路径 B 手势监听器引用，用于清理
-  let wavDecodeCtx = null;        // 持久 AudioContext，用于 webm→WAV 解码（每片复用，避免重复创建）
-  let wavDecodeCtxPending = false; // 等待 wavDecodeCtx 初始化完成
-  // 路径 B: Web Audio API 直连 destination
-  try {
-    const AC = window.AudioContext || window.webkitAudioContext;
-    if (AC) {
-      const ac = new AC();
-      whisperAudioCtx = ac;
-      if (ac.state === 'running') {
-        const src = ac.createMediaStreamSource(stream);
-        src.connect(ac.destination);
-      } else {
-        // suspended → 等用户手势后 resume + 连接
-        const connectAc = () => {
-          ac.resume().then(() => {
-            try {
-              const src = ac.createMediaStreamSource(stream);
-              src.connect(ac.destination);
-            } catch (_) {}
-          }).catch(() => {});
-        };
-        ['pointerdown', 'keydown', 'touchstart'].forEach(ev => {
-          const opts = { once: true, capture: true };
-          whisperAudioCtxGestures.push({ el: document, event: ev, fn: connectAc, opts });
-          document.addEventListener(ev, connectAc, opts);
-        });
-      }
-    }
-  } catch (_) {}
     renderLine('', '🎙 正在识别语音…');
-    startWhisperSlice();
     return true;
-  }
-
-  // 每片用独立的 MediaRecorder 录制 WHISPER_SLICE_MS 毫秒，得到"带头部、可独立解码"的 webm，
-  // 再转成 WAV（PCM16）发给后台——WAV 是所有 Whisper 端点（含 Groq）可靠解析的格式，
-  // 可彻底避免"Chrome MediaRecorder 产出的 webm/opus 被 Groq 判为无音频轨道"导致的 400。
-  function startWhisperSlice() {
-    if (!active || !whisperStream) return;
-    let rec;
-    try {
-      const opts = (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported
-        && MediaRecorder.isTypeSupported('audio/webm')) ? { mimeType: 'audio/webm' } : undefined;
-      rec = new MediaRecorder(whisperStream, opts);
-    } catch (e) {
-      // Fallback to default if webm fails
-      try {
-        rec = new MediaRecorder(whisperStream);
-      } catch (e2) {
-        showError('MediaRecorder 不支持任何音频格式'); return;
-      }
-    }
-    whisperRec = rec;
-    const chunks = [];
-    rec.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data); };
-    rec.onerror = (e) => { console.warn('[whisper] MediaRecorder error', e); };
-    rec.onstop = async () => {
-      const blob = new Blob(chunks, { type: 'audio/webm' });
-      if (blob.size >= WHISPER_MIN_BLOB_SIZE) {            // 静音片段：跳过，省额度
-        let sendBlob = blob, mime = 'audio/webm';
-        try {
-          const wav = await toWav(blob);  // webm/opus → WAV（可靠解析，避免 400）
-          sendBlob = wav; mime = 'audio/wav';
-        } catch (e) {
-          console.warn('[whisper] webm→wav 失败，回退原始 webm', e);
-        }
-        enqueueWhisper(sendBlob, mime);
-      }
-      if (active) whisperSliceTimer = setTimeout(startWhisperSlice, 0); // 紧接着录下一片
-    };
-    // 防止 stop() 在 entry check 和 rec.start() 之间执行：再次检查 active
-    if (!active || !whisperStream) return;
-    try { rec.start(); } catch (e) { showError('录制失败：' + e.message); return; }
-    whisperSliceTimer = setTimeout(() => { try { rec.stop(); } catch (_) {} }, WHISPER_SLICE_MS);
-  }
-
-  // webm/opus → WAV(PCM16)。关键：
-  // - Web Audio API 规定 decodeAudioData 会 detach 入参 ArrayBuffer，每次 decode 必须用独立副本。
-  // - 复用持久 AudioContext（每片不新建），避免重复初始化阻塞主线程。
-  // - 每段 4s 录制可能含纯静音段；解码后 length=0 则不转 WAV（直接抛出，让上层的目标文件大小
-  //   校验 WHISPER_MIN_BLOB_SIZE=1024 拦截，避免 Groq 收到 Header-Only WAV 报 400）。
-  async function toWav(blob) {
-    const raw = await blob.arrayBuffer();
-    const copy = raw.slice(0); // decodeAudioData 会 detach，每次用独立副本
-    const AC = window.AudioContext || window.webkitAudioContext;
-    const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
-    let audioBuf = null;
-    // 路径 1: 复用持久 AudioContext（首次创建）
-    if (AC) {
-      try {
-        if (!wavDecodeCtx) {
-          wavDecodeCtx = new AC();
-          try { if (wavDecodeCtx.state === 'suspended') await wavDecodeCtx.resume(); } catch (_) {}
-        }
-        audioBuf = await wavDecodeCtx.decodeAudioData(copy);
-      } catch (e) {
-        console.warn('[whisper] 持久 AudioContext decode 失败，尝试 OfflineAudioContext', e);
-      }
-    }
-    // 路径 2: OfflineAudioContext（备用）
-    if (!audioBuf && OAC) {
-      const ctx = new OAC(1, 44100 * 60, 44100);
-      audioBuf = await ctx.decodeAudioData(copy);
-    }
-    if (!audioBuf) throw new Error('无可用的 AudioContext/OfflineAudioContext');
-    if (!audioBuf.length || audioBuf.duration <= 0) {
-      throw new Error('解码后的音频无有效采样（可能是静音段）');
-    }
-    return encodeWav(audioBuf);
-  }
-  function encodeWav(audioBuffer) {
-    const numCh = audioBuffer.numberOfChannels;
-    const sampleRate = audioBuffer.sampleRate;
-    const samples = audioBuffer.length;
-    const blockAlign = numCh * 2;
-    const dataSize = samples * blockAlign;
-    const ab = new ArrayBuffer(44 + dataSize);
-    const view = new DataView(ab);
-    let off = 0;
-    const writeStr = (s) => { for (let i = 0; i < s.length; i++) view.setUint8(off++, s.charCodeAt(i)); };
-    writeStr('RIFF'); view.setUint32(off, 36 + dataSize, true); off += 4;
-    writeStr('WAVE'); writeStr('fmt '); view.setUint32(off, 16, true); off += 4;
-    view.setUint16(off, 1, true); off += 2;            // PCM
-    view.setUint16(off, numCh, true); off += 2;
-    view.setUint32(off, sampleRate, true); off += 4;
-    view.setUint32(off, sampleRate * blockAlign, true); off += 4;
-    view.setUint16(off, blockAlign, true); off += 2;
-    view.setUint16(off, 16, true); off += 2;
-    writeStr('data'); view.setUint32(off, dataSize, true); off += 4;
-    const ch = []; for (let c = 0; c < numCh; c++) ch.push(audioBuffer.getChannelData(c));
-    let pos = 44;
-    for (let i = 0; i < samples; i++) {
-      for (let c = 0; c < numCh; c++) {
-        let s = Math.max(-1, Math.min(1, ch[c][i]));
-        view.setInt16(pos, s < 0 ? s * 0x8000 : s * 0x7FFF, true); pos += 2;
-      }
-    }
-    return new Blob([ab], { type: 'audio/wav' });
   }
 
   // 顺序把队列里的音频片发给后台做流式转写：partial 实时更新字幕，final 触发翻译。
   function enqueueWhisper(blob, mime) {
+    if (!active) return; // 防止 stop() 后还塞入队列
     if (whisperQueue.length >= MAX_WHISPER_QUEUE) {
       console.warn('[whisper] Queue full, dropping oldest slice');
       whisperQueue.shift();
@@ -485,7 +268,15 @@
         renderStreaming(m.text || '');
       } else if (m.type === 'final') {
         whisperErrored = false;
-        showCaption((m.text || '').trim());   // 复用翻译/显示流水线
+        const txt = (m.text || '').trim();
+        if (txt) {
+          showCaption(txt);   // 复用翻译/显示流水线
+        } else {
+          // 该片段无有效语音：清掉仍停留在屏幕上的 partial 残影，避免显示错误的半句字幕
+          currentKey = '';
+          if (origEl) origEl.textContent = '';
+          if (transEl) transEl.textContent = '';
+        }
         whisperBusy = false; whisperPort = null; port.disconnect(); pumpWhisper();
       } else if (m.type === 'error') {
         if (!whisperErrored) { whisperErrored = true; showError('Whisper 转写失败：' + m.error); }
@@ -548,6 +339,19 @@
       sendResponse({ ok: true });
       return true;
     }
+    // Offscreen 文档捕获到的音频片段 → 送 Whisper 转写
+    if (msg.type === 'LIVE_CAPTION_AUDIO') {
+      enqueueWhisper(msg.blob, msg.mime);
+      return;
+    }
+    // Offscreen 捕获失败（如权限不足 / activeTab 未授权）→ 仅提示，不阻塞
+    if (msg.type === 'LIVE_CAPTION_CAPTURE_ERROR') {
+      if (!active) return;
+      showError(msg.error || '音频捕获失败');
+      // 通知后台停止并关闭 offscreen，释放标签页音频、恢复原生声音
+      try { chrome.runtime.sendMessage({ type: 'LIVE_CAPTION_STOP_CAPTURE' }); } catch (_) {}
+      return;
+    }
   });
 
   async function start(msg) {
@@ -597,22 +401,8 @@
     if (captionPoller) { clearInterval(captionPoller); captionPoller = null; }
     if (trackWatch) { try { trackWatch.track.removeEventListener('cuechange', trackWatch.onCue); } catch (_) {} trackWatch = null; }
     if (prefetchTimer) { clearInterval(prefetchTimer); prefetchTimer = null; }
-    if (whisperRec) { try { whisperRec.stop(); } catch (_) {} whisperRec = null; }
-    if (whisperSliceTimer) { clearTimeout(whisperSliceTimer); whisperSliceTimer = null; }
-    if (whisperUnmuteTimer) { clearInterval(whisperUnmuteTimer); whisperUnmuteTimer = null; }
-    if (whisperAudioEl) { try { whisperAudioEl.pause(); whisperAudioEl.srcObject = null; } catch (_) {} whisperAudioEl = null; }
-    if (whisperStream) { whisperStream.getTracks().forEach(t => t.stop()); whisperStream = null; }
-    gestureListeners.forEach(({ el, event, fn, opts }) => {
-      try { el.removeEventListener(event, fn, opts); } catch (_) {}
-    });
-    gestureListeners = [];
-    // 清理路径 B 的 AudioContext 及手势监听器
-    whisperAudioCtxGestures.forEach(({ el, event, fn, opts }) => {
-      try { el.removeEventListener(event, fn, opts); } catch (_) {}
-    });
-    whisperAudioCtxGestures = [];
-    if (whisperAudioCtx) { try { whisperAudioCtx.close(); } catch (_) {} whisperAudioCtx = null; }
-    if (wavDecodeCtx) { try { wavDecodeCtx.close(); } catch (_) {} wavDecodeCtx = null; }
+    // 通知后台停止 offscreen 音频捕获并关闭离屏文档，释放标签页音频、恢复原生声音
+    try { chrome.runtime.sendMessage({ type: 'LIVE_CAPTION_STOP_CAPTURE' }); } catch (_) {}
     whisperQueue = []; whisperBusy = false;
     if (batchTimer) { clearTimeout(batchTimer); batchTimer = null; }
     pendingBatch = []; currentKey = ''; cacheKeys.length = 0;

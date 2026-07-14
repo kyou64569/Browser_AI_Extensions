@@ -3,7 +3,7 @@
   "name": "AI 助手（个人）",
   "version": "0.1.0",
   "description": "个人用 AI 助手扩展：模型适配层 + 备用降级 + 网页总结。",
-  "permissions": ["storage", "activeTab", "sidePanel", "scripting", "tabs", "tabCapture", "contextMenus"],
+  "permissions": ["storage", "activeTab", "sidePanel", "scripting", "tabs", "tabCapture", "contextMenus", "offscreen"],
   "host_permissions": ["<all_urls>"],
   "background": {
     "service_worker": "background/service-worker.js",
