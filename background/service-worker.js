@@ -2,13 +2,39 @@
 // MV3 service worker：模块装配中枢。持有 router / fallback / kb 连接器。
 // 通过消息与 side panel / popup / content script 通信。
 
-import { getModels, getKbConfig } from '../shared/storage.js';
+import { getModels, getKbConfig, getWhisperModels } from '../shared/storage.js';
 import { summarizePage } from '../features/summarize.js';
 import { LocalKbConnector } from '../connectors/local-kb.js';
 import { OnlineKbConnector } from '../connectors/online-kb.js';
 import { execTool } from './web-tools.js';
 import { createClient } from '../core/model-client.js';
 import { hasCred, optionsFromModel } from '../shared/utils.js';
+
+/** Chrome 内部页面（无法注入 content script，也无法被 tabCapture 捕获音频） */
+const CHROME_PAGE_HINT =
+  '当前页面为浏览器内部页面（chrome://、edge:// 等），无法捕获音频。请在普通视频网页（如 bilibili、YouTube）上打开本扩展并开启字幕。';
+function isChromeInternalPage(url) {
+  if (!url) return false;
+  return /^(chrome|chrome-extension|chrome-search|edge|about|file|devtools|view-source):/i.test(url);
+}
+
+/** 右键普通网页：授予该标签页 activeTab 权限（用户手势触发），并打开侧边栏供点“开启字幕” */
+chrome.runtime.onInstalled.addListener(() => {
+  chrome.contextMenus.remove('ai-open-live-caption', () => {
+    if (chrome.runtime.lastError) { /* 首次安装时菜单不存在，忽略 */ }
+    chrome.contextMenus.create({
+      id: 'ai-open-live-caption',
+      title: 'AI 助手：开启实时字幕',
+      contexts: ['page'],
+      documentUrlPatterns: ['http://*/*', 'https://*/*'],
+    }, () => { if (chrome.runtime.lastError) console.warn('[contextMenu]', chrome.runtime.lastError); });
+  });
+});
+chrome.contextMenus.onClicked.addListener(async (info, tab) => {
+  if (info.menuItemId !== 'ai-open-live-caption' || !tab || !tab.id) return;
+  // 右键点击普通网页本身即授予该标签页 activeTab；再打开侧边栏即可正常捕获。
+  try { await chrome.sidePanel.open({ tabId: tab.id }); } catch (_) {}
+});
 
 /** 获取当前最活跃的标签页 */
 async function getActiveTab() {
@@ -160,16 +186,141 @@ async function translateSegments(model, texts, targetLang) {
   return result;
 }
 
+/** 源语言中文标签 → Whisper ISO 语言码（空 = 自动检测） */
+const WHISPER_LANG = {
+  '自动识别': '', '英语': 'en', '日语': 'ja', '韩语': 'ko', '法语': 'fr', '德语': 'de',
+  '西班牙语': 'es', '俄语': 'ru', '葡萄牙语': 'pt', '意大利语': 'it', '泰语': 'th', '越南语': 'vi',
+};
+
+/**
+ * 流式转写（Groq/OpenAI 兼容）：每片音频经 port 发送，后台回传 partial/final。
+ * 内容脚本把 webm/opus 转成 WAV（PCM16）后再发来，WAV 可被 Groq 等端点可靠解析，
+ * 避免“Chrome MediaRecorder 的 webm 被判为无音频轨道”导致的 HTTP 400；
+ * 兼容不支持 stream 的端点（返回普通 JSON 时直接 final）。
+ */
+async function streamTranscribe(port, msg) {
+  const { whisperModelIds, audio, language, mime } = msg;
+  // 内容脚本发来的是 Blob（或少数情况下的 ArrayBuffer）。跨进程传输后类型可能变化，
+  // 这里只做 null 检查和 Blob/ArrayBuffer 的通用容量判断，避免误判。
+  if (!audio) {
+    port.postMessage({ type: 'error', error: 'Whisper 转写失败：无效的音频数据' }); return;
+  }
+  const all = await getWhisperModels();
+  const list = (Array.isArray(whisperModelIds) && whisperModelIds.length)
+    ? all.filter(w => whisperModelIds.includes(w.id) && w.model) : all.filter(w => w.model);
+  if (!list.length) { port.postMessage({ type: 'error', error: '未配置可用的 Whisper 模型' }); return; }
+  const lang = WHISPER_LANG[language] || '';
+  const isWav = /wav/i.test(mime || '');
+  const fileType = isWav ? 'audio/wav' : 'audio/webm';
+  const fileName = isWav ? 'audio.wav' : 'audio.webm';
+  const audioBlob = (audio instanceof Blob) ? audio : new Blob([audio], { type: fileType });
+  const TOTAL_TIMEOUT_MS = 120000;
+  const startedAt = Date.now();
+  let lastErr;
+  for (const wm of list) {
+    if (Date.now() - startedAt > TOTAL_TIMEOUT_MS) {
+      port.postMessage({ type: 'error', error: 'Whisper 转写超时（超过 2 分钟）' });
+      return;
+    }
+    const ctrl = new AbortController();
+    const to = setTimeout(() => ctrl.abort(), wm.timeoutMs || 60000);
+    try {
+      const fd = new FormData();
+      fd.append('file', audioBlob, fileName);
+      fd.append('model', wm.model || 'whisper-large-v3');
+      if (lang) fd.append('language', lang);
+      const res = await fetch(`${String(wm.apiBase || '').replace(/\/$/, '')}/audio/transcriptions`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${wm.apiKey || ''}` },
+        body: fd, signal: ctrl.signal,
+      });
+      if (!res.ok) {
+        let detail = '';
+        try { detail = (await res.text()).slice(0, 400); } catch (_) {}
+        throw new Error('Whisper HTTP ' + res.status + (detail ? '：' + detail : ''));
+      }
+      const ct = (res.headers && typeof res.headers.get === 'function' && res.headers.get('content-type')) || '';
+      if (!/text\/event-stream/i.test(ct)) {
+        const json = await res.json().catch(() => ({}));
+        port.postMessage({ type: 'final', text: (json.text || '').trim() });
+        return;
+      }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '', full = '';
+      const MAX_SSE_BUFFER = 1024 * 1024; // 1MB
+      const MAX_FULL_TEXT = 20000; // 20KB transcript cap
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let idx;
+        while ((idx = buf.indexOf('\n\n')) >= 0) {
+          if (buf.length > MAX_SSE_BUFFER) throw new Error('SSE buffer overflow');
+          const ev = buf.slice(0, idx); buf = buf.slice(idx + 2);
+          const dataLine = ev.split('\n').find(l => l.startsWith('data:'));
+          if (!dataLine) continue;
+          const data = dataLine.slice(5).trim();
+          if (!data || data === '[DONE]') continue;
+          let json; try { json = JSON.parse(data); } catch (_) { continue; }
+          if (json.type === 'transcript.text') {
+            port.postMessage({ type: 'partial', text: json.text || '' });
+          } else if (json.type === 'transcript.delta') {
+            full += json.delta || '';
+            if (full.length > MAX_FULL_TEXT) full = full.slice(-MAX_FULL_TEXT);
+            port.postMessage({ type: 'partial', text: full });
+          } else if (json.type === 'transcript.done') {
+            full = json.text || full;
+          } else if (json.type === 'error') {
+            throw new Error((json.error && json.error.message) ? json.error.message : '转写错误');
+          }
+        }
+      }
+      port.postMessage({ type: 'final', text: full.trim() }); return;
+    } catch (e) {
+      lastErr = e;
+      console.warn(`[whisper] 流式模型 ${wm.name || wm.id} 失败：${e.message}`);
+    } finally {
+      clearTimeout(to);
+    }
+  }
+  port.postMessage({ type: 'error', error: (lastErr && lastErr.message) || '所有 Whisper 模型均失败' });
+}
+
 // 侧边栏用长连接 port 接收流式/状态
 chrome.runtime.onConnect.addListener((port) => {
-  if (port.name !== 'sidepanel') return;
-  port.onMessage.addListener(async (msg) => {
-    if (msg.type === 'PING') return; // 侧边栏保活心跳，无需处理
-    if (msg.type === 'SUMMARIZE') {
-      await runSummarize(port);
-    }
-  });
+  if (port.name === 'sidepanel') {
+    port.onMessage.addListener(async (msg) => {
+      if (msg.type === 'PING') return; // 侧边栏保活心跳，无需处理
+      if (msg.type === 'SUMMARIZE') {
+        await runSummarize(port);
+      }
+    });
+    return;
+  }
+  // Whisper 流式转写：content script 每片音频经此 port 发送，后台流式回传 partial/final
+  if (port.name === 'whisper-stream') {
+    port.onMessage.addListener(async (msg) => {
+      if (msg.type === 'slice') {
+        try { await streamTranscribe(port, msg); }
+        catch (e) { port.postMessage({ type: 'error', error: (e && e.message) ? e.message : '流式转写异常' }); }
+      }
+    });
+  }
 });
+
+// 网页翻译/字幕翻译：统一处理文本翻译请求（去重 model 选择 + credential 检查）
+async function handleTranslateBatch(modelId, targetLang, items, errLabel) {
+  if (!Array.isArray(items)) return { ok: false, error: `参数错误：${items === 'texts' ? 'texts' : 'lines'} 必须是数组` };
+  const models = await getModels();
+  const model = models.find(m => m.id === modelId)
+    || models.find(m => m.enabled !== false && m.isPrimary)
+    || models.find(m => m.enabled !== false);
+  if (!model) return { ok: false, error: '未找到可用翻译模型，请先在设置添加模型' };
+  if (!hasCred(model)) return { ok: false, error: '翻译模型缺少有效凭证（API Key）' };
+  const translations = await translateSegments(model, items, targetLang || '中文（简体）');
+  return { ok: true, translations };
+}
 
 // content script / popup 的简单请求
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -255,24 +406,81 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true; // 异步 sendResponse
   }
   if (msg.type === 'TRANSLATE_PAGE') {
-    // 网页翻译：content script 收集页面文本后，分批交由所选模型翻译。
     (async () => {
       try {
         const { modelId, targetLang, texts } = msg;
         if (!Array.isArray(texts)) { sendResponse({ ok: false, error: '参数错误：texts 必须是数组' }); return; }
-        const models = await getModels();
-        const model = models.find(m => m.id === modelId)
-          || models.find(m => m.enabled !== false && m.isPrimary)
-          || models.find(m => m.enabled !== false);
-        if (!model) { sendResponse({ ok: false, error: '未找到可用翻译模型，请先在设置添加模型' }); return; }
-        if (!hasCred(model)) { sendResponse({ ok: false, error: '翻译模型缺少有效凭证（API Key）' }); return; }
-        const translations = await translateSegments(model, texts, targetLang || '中文（简体）');
-        sendResponse({ ok: true, translations });
+        const result = await handleTranslateBatch(modelId, targetLang, texts);
+        sendResponse(result);
       } catch (e) {
         sendResponse({ ok: false, error: (e && e.message) ? e.message : '翻译失败' });
       }
     })();
     return true; // 异步 sendResponse
+  }
+  // 实时字幕：content script 无法调用 chrome.tabCapture，故由后台取标签页音频流 id 后回传。
+  // content script 再凭此 id 调用 getUserMedia({chromeMediaSource:'tab'}) 抓取标签页音频。
+  if (msg.type === 'LIVE_CAPTION_GET_STREAM') {
+    (async () => {
+      try {
+        const tab = sender && sender.tab;
+        const tabId = tab && tab.id;
+        if (!tabId) { sendResponse({ ok: false, error: '无法确定来源标签页' }); return; }
+        // 1) 拦截浏览器内部页面：这些页面既不会注入 content script，也无法被 tabCapture 捕获
+        const url = (tab.url || tab.pendingUrl || '');
+        if (isChromeInternalPage(url)) {
+          sendResponse({ ok: false, error: CHROME_PAGE_HINT });
+          return;
+        }
+        // 2) getMediaStreamId 需要目标标签页已被授予 activeTab（通过用户手势触发本扩展）。
+        //    若未授权会报 “Extension has not been invoked ... (see activeTab permission)”，需给出明确引导。
+        try {
+          chrome.tabCapture.getMediaStreamId({ consumerTabId: tabId }, (streamId) => {
+            try {
+              if (chrome.runtime.lastError) {
+                const errMsg = chrome.runtime.lastError.message || '';
+                if (/not been invoked|activeTab/i.test(errMsg)) {
+                  sendResponse({
+                    ok: false,
+                    error: '获取音频流失败：扩展尚未在当前页面被授权（activeTab）。请在目标视频标签页上点击本扩展图标，'
+                      + '或右键该页面选择"AI 助手：开启实时字幕"以授权，然后重试。',
+                  });
+                } else {
+                  sendResponse({ ok: false, error: '获取音频流失败：' + errMsg });
+                }
+                return;
+              }
+              if (!streamId) {
+                sendResponse({ ok: false, error: '无法获取标签页音频流（请确认在视频标签页内，且扩展拥有 tabCapture 权限）' });
+                return;
+              }
+              sendResponse({ ok: true, streamId });
+            } catch (e) {
+              sendResponse({ ok: false, error: 'getMediaStreamId 回调异常：' + (e?.message || e) });
+            }
+          });
+        } catch (e) {
+          sendResponse({ ok: false, error: 'getMediaStreamId 调用失败：' + (e?.message || e) });
+          return;
+        }
+      } catch (e) {
+        sendResponse({ ok: false, error: (e && e.message) ? e.message : '获取音频流异常' });
+      }
+    })();
+    return true; // 异步 sendResponse（getMediaStreamId 回调内调用）
+  }
+  if (msg.type === 'LIVE_CAPTION_TRANSLATE') {
+    (async () => {
+      try {
+        const { modelId, targetLang, lines } = msg;
+        if (!Array.isArray(lines)) { sendResponse({ ok: false, error: '参数错误：lines 必须是数组' }); return; }
+        const result = await handleTranslateBatch(modelId, targetLang, lines);
+        sendResponse(result);
+      } catch (e) {
+        sendResponse({ ok: false, error: (e && e.message) ? e.message : '字幕翻译失败' });
+      }
+    })();
+    return true;
   }
   return false;
 });
@@ -297,11 +505,11 @@ async function injectContentScriptsToOpenTabs() {
     for (const tab of tabs) {
       if (!tab || !tab.id || !tab.url) continue;
       // 仅对 http/https/ file 普通页面注入；跳过浏览器内部页（chrome://、edge://、扩展页等）
-      if (!/^(https?:|file:|^about:blank)/i.test(tab.url)) continue;
+      if (!/^(https?:|file:|about:blank)/i.test(tab.url)) continue;
       try {
         await chrome.scripting.executeScript({
           target: { tabId: tab.id },
-          files: ['content/extract.js', 'content/sidebar-inject.js'],
+          files: ['content/extract.js', 'content/sidebar-inject.js', 'content/subtitle.js'],
         });
       } catch (_) { /* 该页面不可注入，忽略 */ }
     }
@@ -310,22 +518,18 @@ async function injectContentScriptsToOpenTabs() {
 
 // 安装 / 更新时注入：合并翻译脚本注入和自动化脚本注入
 chrome.runtime.onInstalled?.addListener(async () => {
-  // 1) 注入翻译脚本（用于网页翻译功能）
   try {
     const tabs = await chrome.tabs.query({});
     for (const tab of tabs || []) {
       if (!tab || !tab.id || !tab.url) continue;
-      // 跳过快照/内置/扩展自身等无法注入的页面
-      if (/^(chrome|chrome-extension|edge|about|moz-extension|devtools):/i.test(tab.url)) continue;
+      if (!/^(https?:|file:|about:blank)/i.test(tab.url)) continue;
       try {
         await chrome.scripting.executeScript({
           target: { tabId: tab.id },
-          files: ['content/translate.js', 'content/extract.js', 'content/sidebar-inject.js'],
+          files: ['content/translate.js', 'content/extract.js', 'content/sidebar-inject.js', 'content/subtitle.js'],
         });
       } catch (_) { /* 部分页面可能拒绝注入，忽略 */ }
     }
   } catch (_) {}
-  // 2) 注入自动化脚本（用于网页操作功能）
-  injectContentScriptsToOpenTabs();
 });
 chrome.runtime.onStartup?.addListener(() => { injectContentScriptsToOpenTabs(); });

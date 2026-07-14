@@ -516,7 +516,7 @@ body {
 .card-note { margin: 0 0 10px; font-size: 11.5px; color: var(--muted); line-height: 1.5; }
 
 .field { display: block; font-size: 12px; color: var(--muted); margin: 10px 0; }
-.field input, .field textarea,
+.field input, .field textarea, .field select,
 .model-card input, .model-card select {
   display: block; width: 100%;
   margin-top: 5px; padding: 8px 10px;
@@ -524,9 +524,16 @@ body {
   border: 1px solid var(--line); border-radius: 9px;
   font: inherit; font-size: 13px; outline: none;
 }
-.field input:focus, .field textarea:focus,
+.field input:focus, .field textarea:focus, .field select:focus,
 .model-card input:focus, .model-card select:focus { border-color: var(--accent); }
 textarea { resize: vertical; }
+
+/* 实时字幕卡片：Whisper 模型多选列表 */
+.check-list { margin-top: 6px; display: flex; flex-direction: column; gap: 5px; max-height: 168px; overflow: auto; }
+.check-list label { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text); cursor: pointer; }
+.check-list label input { width: auto; margin: 0; }
+.check-list .empty { color: var(--muted); font-size: 12px; padding: 4px 0; }
+.check-list.disabled { opacity: .5; pointer-events: none; }
 
 .actions { display: flex; gap: 8px; margin: 10px 0 6px; flex-wrap: wrap; }
 
@@ -579,6 +586,10 @@ button.mini { padding: 4px 10px; font-size: 12px; }
 .model-status.loading { color: var(--accent); }
 .model-status.ok { color: var(--ok); }
 .model-status.err { color: var(--err); }
+
+/* Whisper 模型下拉（原生 select，避免 datalist 选中后锁定）+ 手动输入回退 */
+.model-select { width: 100%; }
+.model-manual { width: 100%; margin-top: 6px; }
 .mc-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 10px; }
 .mc-grid .full { grid-column: 1 / -1; }
 .mc-grid label { font-size: 11px; color: var(--muted); }

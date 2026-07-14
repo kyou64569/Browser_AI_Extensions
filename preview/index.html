@@ -120,6 +120,38 @@
         </div>
 
         <div class="card">
+          <h3>🎬 实时字幕</h3>
+          <p class="card-note">观看外语视频时实时显示原文字幕与译文。优先读取平台内嵌字幕；无字幕的视频可选用 Whisper 语音识别。</p>
+          <label class="field">翻译模型 <select id="cc-model"></select></label>
+          <label class="field">目标语言 <select id="cc-lang"></select></label>
+          <label class="field">源语言 <select id="cc-source"></select></label>
+          <label class="field">字幕来源
+            <select id="cc-source-mode">
+              <option value="auto">自动（优先平台字幕）</option>
+              <option value="platform">仅平台字幕</option>
+              <option value="whisper">Whisper 语音识别</option>
+            </select>
+          </label>
+          <div class="field">Whisper 模型（可多选）
+            <div id="cc-whisper-list" class="check-list"></div>
+          </div>
+          <p class="card-note" id="cc-whisper-hint">在“设置 → Whisper 模型配置”中添加模型后，可在此勾选用于语音转写。</p>
+          <label class="switch-row" style="margin-top:10px;">
+            <span>预处理已缓存内容（非直播）</span>
+            <input type="checkbox" class="switch" id="cc-prefetch" />
+          </label>
+          <label class="switch-row" style="margin-top:8px;">
+            <span>双语对照（同时显示原文）</span>
+            <input type="checkbox" class="switch" id="cc-bilingual" checked />
+          </label>
+          <div style="display:flex;gap:8px;margin-top:12px;">
+            <button type="button" class="primary" id="cc-start" style="flex:1;">开启字幕</button>
+            <button type="button" id="cc-stop" style="flex:1;">关闭</button>
+          </div>
+          <div id="cc-status" style="margin-top:6px;color:#6b7280;font-size:12px;min-height:16px;"></div>
+        </div>
+
+        <div class="card">
           <h3>本地知识库（可选）</h3>
           <label class="field">服务地址 <input id="kbBase" placeholder="http://localhost:8000" /></label>
         </div>
@@ -159,6 +191,15 @@
           </div>
           <p class="card-note">当前聊天模型调用失败时，按列表优先级依次尝试以下备用模型；温度 / TopP 等参数沿用失败的原模型。</p>
           <div id="backupModelList" class="model-list"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h3>Whisper 模型配置（字幕语音识别）</h3>
+            <button class="mini" id="addWhisperModel">+ 添加 Whisper 模型</button>
+          </div>
+          <p class="card-note">用于“实时字幕”功能中<strong>无平台字幕</strong>的视频语音转写。可配置多个（如两个免费额度模型），开启字幕时按顺序负载均衡、单个超额或失败时自动切换下一个。</p>
+          <div id="whisperModelList" class="model-list"></div>
         </div>
 
         <div class="card tip">

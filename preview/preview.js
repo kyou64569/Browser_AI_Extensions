@@ -167,6 +167,22 @@ async function persistConversationsToStorage() {
     try { await chrome.storage.local.set({ conversations }); } catch (_) {}
   }
 }
+async function loadWhisperFromStorage() {
+  if (hasChromeStorage()) {
+    try {
+      const r = await chrome.storage.local.get('whisperModels');
+      if (Array.isArray(r.whisperModels) && r.whisperModels.length) return r.whisperModels;
+    } catch (_) { /* 退回 localStorage */ }
+  }
+  return LS.get('preview.whisperModels', []);
+}
+async function persistWhisperToStorage(arr) {
+  whisperModels = arr;
+  LS.set('preview.whisperModels', arr);
+  if (hasChromeStorage()) {
+    try { await chrome.storage.local.set({ whisperModels: arr }); } catch (_) {}
+  }
+}
 /** 启动或存储变更后：从权威源（chrome.storage）同步配置到内存并重渲染 */
 async function syncConfigFromStorage() {
   const loaded = await loadModelsFromStorage();
@@ -175,6 +191,12 @@ async function syncConfigFromStorage() {
     persistModelsToStorage(models);
     renderModels();
     renderModelSelect();
+  }
+  const wm = await loadWhisperFromStorage();
+  if (wm && wm !== whisperModels) {
+    whisperModels = wm;
+    LS.set('preview.whisperModels', wm);
+    renderWhisperModels();
   }
   const kb = await loadKbFromStorage();
   if (kb && JSON.stringify(kb) !== JSON.stringify(kbCfg)) {
@@ -193,6 +215,8 @@ let backupModels = LS.get('preview.backupModels', []);
 let kbCfg = LS.get('preview.kb', { baseUrl: '' });
 let imgUploadCfg = LS.get('preview.imgUpload', { url: '', auth: '', path: '' });
 let conversations = LS.get('preview.conversations', []); // 历史会话列表
+let whisperModels = LS.get('preview.whisperModels', []);  // Whisper 语音识别模型配置 []
+let ccWhisperRefresh = null;  // 实时字幕卡中 Whisper 复选列表的刷新钩子（initLiveCaption 内赋值）
 let currentConvId = null;                          // 当前会话 id（null = 尚未归入某个会话）
 let messages = [];          // 聊天历史 {role, content}
 let attachments = [];       // 待发送附件 {name, type, content}
@@ -1718,6 +1742,203 @@ function renderBackupModels() {
 }
 $('#addBackupModel').onclick = () => { backupModels.push(defaultBackupModel()); LS.set('preview.backupModels', backupModels); renderBackupModels(); };
 
+// ============================================================
+// Whisper 模型配置（实时字幕的语音转写源，可配置多个做负载均衡/降级）
+// 简化卡片：仅需 别名 / API Base / API Key / 模型名 / 超时。
+// ============================================================
+function defaultWhisperModel() {
+  return {
+    id: 'w' + Date.now().toString(36),
+    name: 'Whisper',
+    apiBase: 'https://api.openai.com/v1',
+    apiKey: '',
+    model: 'whisper-1',
+    timeoutMs: 60000,
+  };
+}
+
+/**
+ * 构建 Whisper 模型下拉选项：已获取的 Whisper 模型 + 当前自定义值 + “手动输入”项。
+ * 用原生 <select>，任何选择操作后均保持可交互，避免 datalist 选中后状态锁定的问题。
+ * @param {object} m 单个 Whisper 模型配置
+ */
+function whisperModelOptions(m) {
+  const list = fetchedModels[m.id] || [];
+  const sel = m.model || '';
+  const inList = list.includes(sel);
+  let opts = '';
+  if (sel && !inList) {
+    // 已保存但不在候选列表中的自定义模型：保留为可选项，避免被清空
+    opts += `<option value="${escapeHtml(sel)}" selected>${escapeHtml(sel)}（当前自定义）</option>`;
+  }
+  opts += list.map(id => `<option value="${escapeHtml(id)}" ${id === sel ? 'selected' : ''}>${escapeHtml(id)}</option>`).join('');
+  opts += `<option value="__manual__">（手动输入自定义模型）</option>`;
+  return opts;
+}
+
+function renderWhisperModels() {
+  const wrap = $('#whisperModelList');
+  if (!wrap) return;
+  if (!whisperModels.length) {
+    wrap.innerHTML = '<div class="empty" style="color:#6b7280;font-size:12px;padding:6px 0;">尚未添加 Whisper 模型。点击右上角“+ 添加 Whisper 模型”。</div>';
+  } else {
+    wrap.innerHTML = whisperModels.map((m, i) => {
+      return `
+      <div class="model-card${m.collapsed ? ' collapsed' : ''}" data-i="${i}">
+        <div class="mc-head">
+          <input data-f="name" class="mc-alias" value="${escapeHtml(m.name || '')}"
+                 placeholder="模型别名（选填）"${m.collapsed ? ' readonly' : ''} />
+          <button class="icon-btn mc-save" data-save="${i}"
+                  title="${m.collapsed ? '展开编辑' : '保存并收起'}">
+            ${m.collapsed ? ICON_EDIT : ICON_SAVE}
+          </button>
+          <button class="icon-btn del" data-del="${i}" title="删除">${ICON_TRASH}</button>
+        </div>
+        <div class="mc-grid">
+          <label class="full">API Base
+            <input data-f="apiBase" value="${escapeHtml(m.apiBase || '')}" placeholder="https://api.openai.com/v1" />
+          </label>
+          <label class="full">API Key
+            <input data-f="apiKey" type="password" value="${escapeHtml(m.apiKey || '')}" placeholder="sk-…（Whisper 接口密钥）" />
+          </label>
+          <label class="full">模型
+            <select data-f="model" class="model-select">${whisperModelOptions(m)}</select>
+            <input data-f="model-manual" class="model-manual" type="text"
+                   value="${escapeHtml(m.model || '')}"
+                   placeholder="手动输入模型名（如 whisper-large-v3）"
+                   style="display:${(fetchedModels[m.id] || []).includes(m.model) || !m.model ? 'none' : ''}" />
+            <span class="model-status"></span>
+          </label>
+          <label>超时 ms <input data-f="timeoutMs" type="number" value="${m.timeoutMs || 60000}" /></label>
+        </div>
+      </div>`;
+    }).join('');
+
+    wrap.querySelectorAll('[data-f]').forEach(inp => {
+      inp.addEventListener('change', () => {
+        const card = inp.closest('.model-card');
+        const i = +card.dataset.i;
+        const f = inp.dataset.f;
+        const val = inp.value;
+        if (f === 'model') {
+          // 原生 <select>：选中“（手动输入自定义模型）”则切换为手动输入框；否则直接采用选中值
+          if (val === '__manual__') {
+            const mi = card.querySelector('input[data-f="model-manual"]');
+            whisperModels[i].model = mi ? (mi.value || '') : '';
+            if (mi) { mi.value = whisperModels[i].model || ''; mi.style.display = ''; mi.focus(); }
+          } else {
+            whisperModels[i].model = val;
+            const mi = card.querySelector('input[data-f="model-manual"]');
+            if (mi) mi.style.display = 'none';
+            syncAlias(card, whisperModels, i, val); // 选中模型后自动同步到“模型别名”
+          }
+        } else if (f === 'model-manual') {
+          // 手动输入：实时写入并回写别名
+          whisperModels[i].model = val;
+          syncAlias(card, whisperModels, i, val);
+        } else {
+          whisperModels[i][f] = (f === 'timeoutMs') ? Number(val) : val;
+          if (f === 'name') whisperModels[i].nameEdited = !!String(val).trim();
+        }
+        persistWhisperToStorage(whisperModels);
+        if (ccWhisperRefresh) ccWhisperRefresh();
+        if (f === 'apiBase' || f === 'apiKey') refreshWhisperModelList(whisperModels, i, wrap);
+      });
+    });
+    wrap.querySelectorAll('[data-del]').forEach(b => b.onclick = () => {
+      delete fetchedModels[whisperModels[+b.dataset.del]?.id];
+      whisperModels.splice(+b.dataset.del, 1);
+      persistWhisperToStorage(whisperModels);
+      renderWhisperModels();
+      if (ccWhisperRefresh) ccWhisperRefresh();
+    });
+    wrap.querySelectorAll('[data-save]').forEach(b => b.onclick = () => {
+      const i = +b.dataset.save;
+      const card = b.closest('.model-card');
+      if (!whisperModels[i].collapsed) {
+        const alias = card.querySelector('input[data-f="name"]');
+        if (alias) { whisperModels[i].name = alias.value; whisperModels[i].nameEdited = !!alias.value.trim(); }
+        whisperModels[i].collapsed = true;
+      } else {
+        whisperModels[i].collapsed = false;
+      }
+      persistWhisperToStorage(whisperModels);
+      renderWhisperModels();
+      if (ccWhisperRefresh) ccWhisperRefresh();
+    });
+
+    // 已填好 API Base / Key 的卡片，加载时即自动拉取 Whisper 模型列表
+    whisperModels.forEach((m, i) => {
+      if ((m.apiBase || '').trim() && (m.apiKey || '').trim()) refreshWhisperModelList(whisperModels, i, wrap);
+    });
+  }
+  if (ccWhisperRefresh) ccWhisperRefresh();   // 实时字幕卡复选列表随配置同步
+}
+
+/**
+ * 自动获取并填充某 Whisper 卡片的模型候选列表（仅保留 whisper 相关模型，供下拉选择）。
+ * 走 OpenAI 兼容接口 GET {base}/models；未筛出 whisper 模型时回退展示全部，避免无选项可选。
+ * 用户从下拉选定模型后，由 [data-f] 的 change 处理调用 syncAlias 把模型名同步进“模型别名”。
+ * @param {Array} arr whisperModels
+ * @param {number} i 模型在 arr 中的下标
+ * @param {HTMLElement} wrap 卡片容器
+ */
+// Whisper 模型列表缓存（避免每次渲染都重复请求 API）
+const whisperModelCache = new Map(); // m.id -> { list, timestamp }
+const WHISPER_CACHE_TTL = 30000;    // 30 秒缓存有效期
+
+async function refreshWhisperModelList(arr, i, wrap) {
+  const m = arr[i];
+  if (!m) return;
+  const card = wrap.querySelector(`.model-card[data-i="${i}"]`);
+  if (!card) return;
+  const sel = card.querySelector('select[data-f="model"]');
+  const manual = card.querySelector('input[data-f="model-manual"]');
+  const status = card.querySelector('.model-status');
+  const base = (m.apiBase || '').trim();
+  const key = (m.apiKey || '').trim();
+
+  if (!base || !key) {
+    delete fetchedModels[m.id];
+    if (sel) sel.innerHTML = whisperModelOptions(m);
+    if (manual) manual.style.display = 'none';
+    if (status) { status.textContent = '填写 API Base / Key 后自动获取 Whisper 模型'; status.className = 'model-status'; }
+    return;
+  }
+
+  // 缓存命中：直接复用已获取的模型列表
+  const cached = whisperModelCache.get(m.id);
+  if (cached && Date.now() - cached.timestamp < WHISPER_CACHE_TTL) {
+    if (sel) sel.innerHTML = whisperModelOptions(m);
+    if (manual) manual.style.display = cached.list.includes(m.model) ? 'none' : '';
+    if (status) { status.textContent = `缓存：${cached.list.filter(id => /whisper/i.test(id)).length} 个 Whisper 模型`; status.className = 'model-status ok'; }
+    return;
+  }
+
+  if (status) { status.textContent = '正在获取 Whisper 模型列表…'; status.className = 'model-status loading'; }
+  try {
+    const all = await listModels({ apiBase: base, apiKey: key, timeoutMs: m.timeoutMs });
+    const list = all.filter(id => /whisper/i.test(id));
+    const finalList = list.length ? list : all;
+    fetchedModels[m.id] = finalList;
+    whisperModelCache.set(m.id, { list: finalList, timestamp: Date.now() });
+    if (sel) sel.innerHTML = whisperModelOptions(m);
+    if (manual) manual.style.display = finalList.includes(m.model) ? 'none' : '';
+    if (status) {
+      if (list.length) status.textContent = `已获取 ${list.length} 个 Whisper 模型，可下拉选择`;
+      else status.textContent = `未筛出 Whisper 模型，已展示全部 ${all.length} 个，请手动确认`;
+      status.className = 'model-status ok';
+    }
+  } catch (e) {
+    delete fetchedModels[m.id];
+    whisperModelCache.delete(m.id);
+    if (sel) sel.innerHTML = whisperModelOptions(m);
+    if (manual) manual.style.display = 'none';
+    if (status) { status.textContent = '获取失败（可手动输入模型名）：' + e.message; status.className = 'model-status err'; }
+  }
+}
+$('#addWhisperModel').onclick = () => { whisperModels.push(defaultWhisperModel()); persistWhisperToStorage(whisperModels); renderWhisperModels(); if (ccWhisperRefresh) ccWhisperRefresh(); };
+
 $('#kbBase').value = kbCfg.baseUrl || '';
 $('#kbBase').addEventListener('change', () => { kbCfg.baseUrl = $('#kbBase').value; persistKbToStorage(kbCfg); });
 
@@ -2007,6 +2228,185 @@ function initPageTranslate() {
   };
 }
 
+// ============================================================
+// 实时字幕（功能页卡片）
+// 说明：优先读取平台内嵌字幕，无字幕视频可回退 Whisper 语音识别；
+// 非直播视频可对“已缓存但未观看”的片段做预翻译，掩盖自定义模型的延迟。
+// 本次仅接入 UI 与偏好持久化，字幕采集/翻译引擎由 content 脚本后续实现。
+// ============================================================
+const CC_SOURCE_LANGS = [
+  '自动识别', '英语', '日语', '韩语', '法语', '德语', '西班牙语',
+  '俄语', '葡萄牙语', '意大利语', '泰语', '越南语',
+];
+
+function initLiveCaption() {
+  const modelSel = $('#cc-model');
+  const langSel = $('#cc-lang');
+  const srcSel = $('#cc-source');
+  const srcModeSel = $('#cc-source-mode');
+  const whisperListEl = $('#cc-whisper-list');
+  const whisperHintEl = $('#cc-whisper-hint');
+  const prefetchCb = $('#cc-prefetch');
+  const bilingualCb = $('#cc-bilingual');
+  const statusEl = $('#cc-status');
+  if (!modelSel) return;  // 卡片尚未挂载
+
+  // 目标语言（复用网页翻译的语言集）/ 源语言
+  langSel.innerHTML = PAGE_TRANSLATE_LANGS.map(l => `<option value="${l}">${l}</option>`).join('');
+  srcSel.innerHTML = CC_SOURCE_LANGS.map(l => `<option value="${l}">${l}</option>`).join('');
+
+  // 模型下拉：与网页翻译一致，仅列出已启用且非视觉模型
+  function popModelSelect() {
+    const enabled = (models || []).filter(m => m.enabled !== false && !m.supportsVision);
+    if (!enabled.length) {
+      modelSel.innerHTML = '<option value="">（请先在设置添加模型）</option>';
+      return;
+    }
+    const primary = enabled.find(m => m.isPrimary) || enabled[0];
+    modelSel.innerHTML = enabled.map(m =>
+      `<option value="${m.id}">${escapeHtml(m.name || m.model || m.vendor)}</option>`
+    ).join('');
+    const p = LS.get('preview.captionPrefs', {});
+    if (p.modelId && enabled.some(m => m.id === p.modelId)) modelSel.value = p.modelId;
+    else modelSel.value = primary.id;
+  }
+  popModelSelect();
+
+  // ---- Whisper 模型多选列表（从已配置的 Whisper 模型里勾选）----
+  // 选中状态存入 captionPrefs.whisperModelIds；若未选则回退为“全部已配置模型”。
+  function populateWhisperList() {
+    if (!whisperListEl) return;
+    const p = LS.get('preview.captionPrefs', {});
+    const selected = Array.isArray(p.whisperModelIds) ? p.whisperModelIds : [];
+    if (!whisperModels.length) {
+      whisperListEl.innerHTML = '<span class="empty">尚未配置 Whisper 模型（去“设置 → Whisper 模型配置”添加）</span>';
+      return;
+    }
+    whisperListEl.innerHTML = whisperModels.map(m => {
+      const checked = selected.includes(m.id) ? 'checked' : '';
+      const label = escapeHtml(m.name || m.model || 'Whisper');
+      return `<label><input type="checkbox" data-wid="${escapeHtml(m.id)}" ${checked}/> ${label}</label>`;
+    }).join('');
+    whisperListEl.querySelectorAll('input[data-wid]').forEach(cb => {
+      cb.addEventListener('change', savePrefs);
+    });
+  }
+  ccWhisperRefresh = populateWhisperList;   // 供设置页增删 Whisper 模型时同步刷新
+  populateWhisperList();
+
+  // 载入历史偏好
+  const p0 = LS.get('preview.captionPrefs', {});
+  if (p0.targetLang) langSel.value = p0.targetLang;
+  if (p0.sourceLang) srcSel.value = p0.sourceLang;
+  if (p0.sourceMode) srcModeSel.value = p0.sourceMode;
+  prefetchCb.checked = p0.prefetch !== false;
+  bilingualCb.checked = p0.bilingual !== false;
+
+  function savePrefs() {
+    const selectedW = whisperListEl
+      ? Array.from(whisperListEl.querySelectorAll('input[data-wid]:checked')).map(cb => cb.dataset.wid)
+      : [];
+    LS.set('preview.captionPrefs', {
+      modelId: modelSel.value,
+      targetLang: langSel.value,
+      sourceLang: srcSel.value,
+      sourceMode: srcModeSel.value,
+      whisperModelIds: selectedW,
+      prefetch: prefetchCb.checked,
+      bilingual: bilingualCb.checked,
+    });
+    if (hasChromeStorage()) {
+      try { chrome.storage.local.set({ captionPrefs: LS.get('preview.captionPrefs', {}) }); } catch (_) {}
+    }
+  }
+  [modelSel, langSel, srcSel, srcModeSel, prefetchCb, bilingualCb]
+    .forEach(el => el.addEventListener('change', savePrefs));
+
+  // 模型列表随配置变化刷新（叠加到已被网页翻译包装过的 renderModels）
+  const origRender = renderModels;
+  renderModels = function () {
+    origRender();
+    popModelSelect();
+  };
+
+  // Whisper 多选列表仅在需要语音识别时才有意义：切换来源时给出提示
+  function reflectSourceMode() {
+    const mode = srcModeSel.value;
+    const needWhisper = mode !== 'platform';
+    if (whisperListEl) {
+      whisperListEl.classList.toggle('disabled', !needWhisper);
+      whisperListEl.style.display = needWhisper ? '' : 'none';
+    }
+    if (whisperHintEl) {
+      whisperHintEl.textContent = needWhisper
+        ? '勾选用作语音转写的 Whisper 模型；未勾选则使用“设置”中配置的全部 Whisper 模型（按顺序负载均衡）。'
+        : '当前为“仅平台字幕”模式，无需 Whisper 语音识别。';
+    }
+  }
+  srcModeSel.addEventListener('change', reflectSourceMode);
+  reflectSourceMode();
+
+  $('#cc-start').onclick = async () => {
+    const modelId = modelSel.value;
+    if (!modelId || !(models || []).some(m => m.id === modelId && m.enabled !== false)) {
+      statusEl.textContent = '请先在设置中添加并启用模型';
+      return;
+    }
+    savePrefs();
+    // 收集已勾选的 Whisper 模型 id（空 = 使用全部已配置模型）
+    const whisperModelIds = whisperListEl
+      ? Array.from(whisperListEl.querySelectorAll('input[data-wid]:checked')).map(cb => cb.dataset.wid)
+      : [];
+    const sourceMode = srcModeSel.value;
+    if (sourceMode !== 'platform' && !whisperModels.length) {
+      statusEl.textContent = '未配置 Whisper 模型：请先在“设置 → Whisper 模型配置”添加，或改用“仅平台字幕”';
+      return;
+    }
+    const tabId = await getActiveTabId();
+    if (!tabId) { statusEl.textContent = '未找到活动标签页'; return; }
+    // 拦截浏览器内部页面（chrome://、edge:// 等无法捕获音频），避免无意义请求与报错
+    try {
+      const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+      const t = tabs && tabs[0];
+      const u = (t && (t.url || t.pendingUrl)) || '';
+      if (/^(chrome|chrome-extension|chrome-search|edge|about|file|devtools|view-source):/i.test(u)) {
+        statusEl.textContent = '当前页面为浏览器内部页面，无法捕获音频，请在普通视频网页（如 bilibili、YouTube）上重试';
+        return;
+      }
+    } catch (_) { /* 查询失败则继续，交给后台进一步校验 */ }
+    try {
+      const resp = await chrome.tabs.sendMessage(tabId, {
+        type: 'LIVE_CAPTION_START',
+        modelId,
+        targetLang: langSel.value,
+        sourceLang: srcSel.value,
+        sourceMode,
+        whisperModelIds,
+        prefetch: prefetchCb.checked,
+        bilingual: bilingualCb.checked,
+      });
+      if (resp && resp.ok) {
+        statusEl.textContent = `已开启实时字幕（${langSel.value}）`;
+      } else {
+        statusEl.textContent = '开启失败：' + ((resp && resp.error) || '字幕 Worker 未就绪，请刷新目标视频页后重试');
+      }
+    } catch (_) {
+      statusEl.textContent = '字幕 Worker 未就绪，请刷新目标视频页后重试';
+    }
+  };
+
+  $('#cc-stop').onclick = async () => {
+    const tabId = await getActiveTabId();
+    if (!tabId) { statusEl.textContent = '未找到活动标签页'; return; }
+    try {
+      await chrome.tabs.sendMessage(tabId, { type: 'LIVE_CAPTION_STOP' });
+      statusEl.textContent = '已关闭实时字幕';
+    } catch (e) {
+      statusEl.textContent = '通信失败：' + (e && e.message ? e.message : e);
+    }
+  };
+}
+
 // ---------- 主题切换 ----------
 const THEME_KEY = 'preview.theme';
 function applyTheme(theme) {
@@ -2033,8 +2433,10 @@ $('#thinkingSelect').onchange = () => { thinkingStrength = $('#thinkingSelect').
 initThemeSwitch();
 renderModels();
 renderBackupModels();
+renderWhisperModels();
 renderModelSelect();
 initPageTranslate();
+initLiveCaption();
 showView('chat');
 updateSendState();
 input.focus();
@@ -2049,6 +2451,11 @@ if (hasChromeStorage()) {
       LS.set('preview.models', models);
       renderModels();
       renderModelSelect();
+    }
+    if (changes.whisperModels && Array.isArray(changes.whisperModels.newValue)) {
+      whisperModels = changes.whisperModels.newValue;
+      LS.set('preview.whisperModels', whisperModels);
+      renderWhisperModels();
     }
     if (changes.kb) { kbCfg = changes.kb.newValue || kbCfg; LS.set('preview.kb', kbCfg); }
     if (changes.conversations) {

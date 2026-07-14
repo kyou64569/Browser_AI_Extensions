@@ -3,6 +3,7 @@
 
 const KEYS = {
   MODELS: 'models',        // ModelConfig[]
+  WHISPER: 'whisperModels',// Whisper 语音识别模型配置 []
   KB: 'kb',                // { type:'local'|'online', cfg }
   SETTINGS: 'settings',    // 杂项
 };
@@ -19,6 +20,15 @@ export async function saveModels(models) {
 export async function getKbConfig() {
   const r = await chrome.storage.local.get(KEYS.KB);
   return r[KEYS.KB] || { type: 'local', cfg: { baseUrl: '' } };
+}
+
+/**
+ * 读取 Whisper 模型配置（用于实时字幕的语音转写）。
+ * @returns {Promise<Array>}
+ */
+export async function getWhisperModels() {
+  const r = await chrome.storage.local.get(KEYS.WHISPER);
+  return r[KEYS.WHISPER] || [];
 }
 
 export async function saveKbConfig(cfg) {
