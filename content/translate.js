@@ -139,17 +139,31 @@
     return { ok: true, total: groups.length, translated: count };
   }
 
+  // 还原原文。
+  // 关键修复（还原失效）：原先只持有“翻译时抓取的节点引用”，页面重渲染后旧节点脱离文档，
+  // 对其赋值页面无变化 → 看似“已还原”实则无效。现改为【重新遍历当前 DOM + 按下标对齐】，
+  // 优先用仍连在文档的旧节点，否则退化为同序的当前节点，兼容重渲染。
   function doRestore() {
-    if (originalSnapshot) {
-      originalSnapshot.groups.forEach(g => {
-        g.nodes.forEach((n, i) => {
-          if (g.originals[i] == null) return;
-          // 使用组的 setTrans 写入原始值（兼容 text-node / value / placeholder / aria-label）
-          (g.setTrans || ((node, val) => { node.nodeValue = val; }))(n, g.originals[i]);
-        });
+    if (!originalSnapshot) { active = false; return 0; }
+    const snap = originalSnapshot.groups;
+    // 重新收集当前页面文本组。collectTextGroups 用固定顺序的 TreeWalker，
+    // 重渲染（节点对象被替换但结构未变）后按相同下标仍能对齐到原组。
+    const current = collectTextGroups(document.body);
+    let restored = 0;
+    snap.forEach((g, k) => {
+      const cur = current[k];
+      g.nodes.forEach((n, i) => {
+        if (g.originals[i] == null) return;
+        // 优先用翻译时保存的节点（仍连文档的话）；否则退化为同序当前节点（重渲染兜底）
+        const tnode = (n.isConnected) ? n : (cur && cur.nodes[i]) || null;
+        if (!tnode) return;
+        (g.setTrans || ((node, val) => { node.nodeValue = val; }))(tnode, g.originals[i]);
       });
-    }
+      restored++;
+    });
     active = false;
+    originalSnapshot = null;
+    return restored;
   }
 
   // ---------- 消息监听 ----------
@@ -166,8 +180,7 @@
       return true;
     }
     if (msg.type === 'WEB_TRANSLATE_RESTORE') {
-      doRestore();
-      sendResponse({ ok: true });
+      sendResponse({ ok: true, restored: doRestore() });
       return true;
     }
   });
@@ -204,8 +217,10 @@
   const titleEl = document.querySelector('title');
   if (titleEl) {
     let lastTitle = titleEl.textContent;
+    // 仅“自动模式”下才因标题变化触发重翻：标题动态变化（通知角标等）不是导航，
+    // 手动模式下绝不可因此清空 originalSnapshot，否则还原会失效（见 doRestore 修复）。
     new MutationObserver(() => {
-      if (titleEl.textContent !== lastTitle) { lastTitle = titleEl.textContent; onUrlChange(); }
+      if (titleEl.textContent !== lastTitle) { lastTitle = titleEl.textContent; if (mode === 'auto') onUrlChange(); }
     }).observe(titleEl, { childList: true, characterData: true, subtree: true });
   }
 

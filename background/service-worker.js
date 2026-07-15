@@ -104,9 +104,74 @@ async function runSummarize(port) {
 // 网页翻译：content script 收集页面文本节点后，分批交给所选模型翻译。
 // 每段用 [N]…[/N] 包裹，要求模型仅返回同格式译文，便于稳定解析。
 // ============================================================
-const TRANSLATE_BATCH = 100;
+// 每批段数：从 100 降到 40。原因（见网页翻译“只翻一半/漏地方”问题）：
+// ① 弱/便宜模型在大批次里会“中间丢失”段落（lost-in-the-middle）；
+// ② 100 段塞一条 prompt 的输出易超厂商默认 max_tokens 被截断 → 字面“翻一半”。
+// 40 是兼顾“弱模型可靠性”与“免费额度调用次数（如 Gemini 免费仅 15 RPM）”的折中。
+const TRANSLATE_BATCH = 40;
 // 翻译是确定性任务，temperature 不读取模型配置，强制调低以减少漏翻/幻觉式复制原文。
 const TRANSLATE_TEMPERATURE = 0.1;
+// 输出 token 上限（按每批输入长度动态估算并夹在 [MIN,MAX] 内）。
+// 关键修复：翻译原先完全不传 max_tokens，弱模型落到厂商默认值（常很小）→ 长批次输出被截断，
+// 正则只解析出前若干段 → 其余保留原文 = “翻译一半”。动态给足上限即可根治。
+// 注意：这只是一个“上限”，模型不会故意生成到上限，因此不会拖慢、也不会触发推理。
+const MIN_TRANS_TOKENS = 2048;
+const MAX_TRANS_TOKENS = 8192;
+const TRANS_TOKENS_PER_CHAR = 0.8; // 输入字符→输出 token 的粗略系数（中文约 1.5 字符/token）
+
+// ---------- 429（限流）退避重试：第二道防线 ----------
+// 主防线是把调用频率降到配额内（Whisper=offscreen VAD 一句一片；翻译=每句一次）。
+// 但突发峰值仍可能偶发 429，这里统一做“退避重试”，避免偶发限流直接丢句。
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function isRateLimit(e) {
+  const s = (e && e.message) ? e.message : String(e || '');
+  return /\b429\b|rate.?limit|too many requests|quota/i.test(s);
+}
+// TPM（tokens per minute）限流：错误文本含 TPM / tokens per minute 等关键字。
+// 与 RPM 不同，TPM 是 60 秒滚动窗口——需等旧 token 从窗口“滑出”才能腾出额度，
+// 原短退避（0.8~2.4s）毫无作用 → 立刻再次 429 → 放弃整批（漏翻）。这里改为长退避。
+function isTokenRateLimit(e) {
+  const s = (e && e.message) ? e.message : String(e || '');
+  return /\bTPM\b|tokens per minute|tokens\/min|token limit|token rate/i.test(s);
+}
+// 尽力从错误文本解析服务端给的 retry-after（秒）。部分厂商会塞进 body/header，
+// 但 HttpError 当前不携带响应头，故此处的解析仅为“锦上添花”，失败则回退到固定长退避。
+function parseRetryAfterSec(e) {
+  const s = (e && e.message) ? e.message : '';
+  const m = s.match(/retry-after[:\s]+(\d+)/i) || s.match(/try again in\s+(\d+)\s*s/i) || s.match(/reset in\s+(\d+)\s*s/i);
+  return m ? Number(m[1]) : null;
+}
+// 收集 client.chat 的流式输出为整段文本；遇 429 退避重试（最多 3 轮）。
+async function chatAllWithRetry(client, params) {
+  const MAX_ROUNDS = 3;
+  let lastErr;
+  for (let round = 0; round < MAX_ROUNDS; round++) {
+    try {
+      let out = '';
+      for await (const c of client.chat(params)) out += (c && c.delta) || '';
+      return out;
+    } catch (e) {
+      lastErr = e;
+      if (round < MAX_ROUNDS - 1 && isRateLimit(e)) {
+        const explicit = parseRetryAfterSec(e);
+        if (isTokenRateLimit(e)) {
+          // TPM：等滚动窗口释放额度。优先用服务端 retry-after，否则退避 ~25s（接近一个窗口周期）。
+          const wait = (explicit != null ? explicit : 25) * 1000;
+          console.warn(`[429 TPM] 退避 ${Math.round(wait / 1000)}s 后重试（第 ${round + 1}/${MAX_ROUNDS - 1} 轮）`);
+          await sleep(wait);
+        } else {
+          // 其它限流（RPM 等）：原指数退避，叠加服务端 retry-after（若有）。
+          const base = 800 * (round + 1);
+          const wait = explicit != null ? explicit * 1000 : base;
+          await sleep(wait);
+        }
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw lastErr;
+}
 
 // 强约束放进 system，比只放 user 更能约束中小模型，从根源降低“照抄原文不翻译”的概率。
 const TRANSLATE_SYSTEM_PROMPT = [
@@ -118,6 +183,7 @@ const TRANSLATE_SYSTEM_PROMPT = [
   '3. Each segment is wrapped with [N] and [/N] markers (N = index starting at 0). Output ONLY the translated segments using the exact same [N]...[/N] format, in order.',
   '4. Do NOT add any explanations, headings, numbering, or markdown fences. Output nothing except the [N]...[/N] segments.',
   '5. Do not think step by step. Output the translated segments directly.',
+  '6. Preserve verbatim (translate ONLY the surrounding natural-language text, never these): URLs (https://...), file paths, code snippets, programming identifiers, version numbers, brand/model/product names such as "Gemini-3.1-flash-lite", and ALL standalone numeric values with their units — e.g. "30", "1K", "500MB", "2.5s", "1920x1080", "¥1,200", "75%". These are data/parameters, not prose; keep them EXACTLY as in the source.',
 ].join('\n');
 
 function buildTranslatePrompt(segments, targetLang) {
@@ -135,8 +201,22 @@ function parseTranslateResponse(text, count) {
       map[idx] = m[2];
     }
   }
-  // 验证解析结果
   const filled = map.filter(v => v !== undefined).length;
+  // 行序兜底：弱模型常完全不遵守 [N][/N] 标记 → 正则一个都匹配不到，整批报废。
+  // 此时若输出行数与段数大致相当，按行顺序对齐回填，至少把整批救回来（宁可偶尔错位，也不整批丢失）。
+  // 仅当 marker 几乎完全缺失（filled===0）时启用，避免干扰正常遵守格式的强模型。
+  if (filled === 0 && count > 1) {
+    const lines = (text || '').split(/\r?\n/).map(l => l.trim());
+    const real = [];
+    for (const l of lines) {
+      const cleaned = l.replace(/^\[\d+\]\s*/, '').replace(/\[\/\d+\]\s*$/, '').trim(); // 去掉残留的 [N] 残片
+      if (cleaned) real.push(cleaned);
+    }
+    if (real.length >= Math.ceil(count * 0.8) && real.length <= Math.ceil(count * 1.5)) {
+      for (let i = 0; i < count && i < real.length; i++) map[i] = real[i];
+      return map;
+    }
+  }
   if (filled < count) {
     console.warn(`Translation parsing: only ${filled}/${count} segments parsed`);
   }
@@ -154,7 +234,12 @@ async function translateSegments(model, texts, targetLang) {
     throw new Error('无法创建翻译客户端');
   }
   // 翻译专用参数：temperature 强制调低（不读取模型配置），其余采样参数沿用配置。
-  const options = { ...optionsFromModel(model), temperature: TRANSLATE_TEMPERATURE };
+  // 注意：故意不读模型配置的 maxTokens —— 弱模型若未配置会落到厂商默认的小值，已用动态估算替代。
+  const baseOptions = { ...optionsFromModel(model), temperature: TRANSLATE_TEMPERATURE };
+  // 翻译是确定性任务，强制关闭“思考/推理”：推理模型（如 gpt-oss 经 OpenRouter）的 CoT 推理 token
+  // 同样计入 TPM，会瞬间吃光低配额模型额度（如仅 8000 TPM）→ 大量 429。翻译不需要推理；
+  // 关闭后既省 token 又避免限流，且不影响正常翻译速度（adapter 仅在 thinkingStrength && !== 'off' 时发 reasoning_effort）。
+  delete baseOptions.thinkingStrength;
 
   // 分组成批（每批 TRANSLATE_BATCH 段）
   const batches = [];
@@ -162,20 +247,22 @@ async function translateSegments(model, texts, targetLang) {
     batches.push(items.slice(s, s + TRANSLATE_BATCH));
   }
 
-  // 并发发送，最大 3 批同时进行（减小整体等待时间，同时避免触发 API 频率限制）
-  const CONCURRENCY = 3;
+  // 并发发送，最大 2 批同时进行（减小整体等待时间，同时避免触发免费额度频率限制，如 Gemini 15 RPM）。
+  const CONCURRENCY = 2;
   for (let b = 0; b < batches.length; b += CONCURRENCY) {
     const chunk = batches.slice(b, b + CONCURRENCY);
     await Promise.all(chunk.map(async (batch) => {
       const prompt = buildTranslatePrompt(batch.map(c => c.t), targetLang);
+      // 按本批输入长度动态估算输出上限，防止被截断（根治“翻一半”）。下限保证哪怕很短的批也有余量。
+      const inChars = batch.reduce((s, c) => s + (c.t ? c.t.length : 0), 0);
+      const maxTokens = Math.min(MAX_TRANS_TOKENS, Math.max(MIN_TRANS_TOKENS, Math.ceil(inChars * TRANS_TOKENS_PER_CHAR)));
+      const options = { ...baseOptions, maxTokens };
       let out = '';
       try {
-        for await (const c of client.chat({ messages: [{ role: 'system', content: TRANSLATE_SYSTEM_PROMPT }, { role: 'user', content: prompt }], stream: false, options })) {
-          out += (c && c.delta) || '';
-        }
+        out = await chatAllWithRetry(client, { messages: [{ role: 'system', content: TRANSLATE_SYSTEM_PROMPT }, { role: 'user', content: prompt }], stream: false, options });
       } catch (e) {
         console.error('Translation batch failed:', e);
-        return; // 整批失败：保留原文，不中断其它批次
+        return; // 整批失败（含 429 重试后仍失败）：保留原文，不中断其它批次
       }
       const parsed = parseTranslateResponse(out, batch.length);
       batch.forEach((c, k) => {
@@ -193,10 +280,92 @@ async function translateSegments(model, texts, targetLang) {
   return result;
 }
 
+// ============================================================
+// 实时字幕整理（refine）：把一句话的 ASR 碎片合并成通顺原文并翻译，
+// 用于替换内容脚本里“逐词堆砌 + 零散翻译”的草稿。返回 { original, translation }。
+// ============================================================
+// refine 提示词按源语种动态生成：明确“所有碎片都应属源语种”，
+// 并指示模型把误识成其他语种（如日语语音被识别成韩语/俄语）的碎片纠正回源语种。
+function buildRefineSystem(srcEn) {
+  return [
+    'You are a real-time subtitle post-editor and translator.',
+    'You receive raw speech-recognition (ASR) fragments of ONE spoken utterance, in order.',
+    'They may contain duplicated words, wrong word breaks, or minor recognition errors.',
+    `The speaker is speaking ${srcEn}. ALL fragments should be in that language.`,
+    `If any fragment was mis-recognized in a WRONG language (e.g., Korean/Russian text when the source is Japanese), convert it back to ${srcEn} before merging — never leave foreign-language text in the cleaned sentence.`,
+    'Do the following:',
+    '1. Merge and clean the fragments into ONE fluent, correctly punctuated sentence in the ORIGINAL spoken language. Only fix obvious ASR artifacts; NEVER invent content that was not spoken.',
+    '2. Translate that cleaned sentence into the target language faithfully and naturally.',
+    'Output STRICTLY in ONE of these formats and nothing else (no explanations, no markdown fences, no thinking):',
+    'Format A:',
+    '<o>cleaned original sentence</o>',
+    '<t>translation</t>',
+    'Format B (if tags are hard to produce):',
+    '原文：cleaned original sentence',
+    '译文：translation',
+  ].join('\n');
+}
+
+async function refineCaption(model, fragments, targetLang, sourceLang) {
+  let client;
+  try { client = createClient(model); } catch (e) { throw new Error('翻译模型配置无效：' + e.message); }
+  if (!client) throw new Error('无法创建翻译客户端');
+  // 与翻译一致：强制低 temperature，抑制幻觉式改写/编造。
+  const options = { ...optionsFromModel(model), temperature: TRANSLATE_TEMPERATURE };
+  const raw = fragments.filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+  const srcLabel = (sourceLang && String(sourceLang).trim()) || '';
+  const srcEn = LANG_EN[srcLabel] || srcLabel || "the user's spoken language";
+  const prompt = `Target language: ${targetLang}\nSource (spoken) language: ${srcEn} (${srcLabel || 'auto'})\n\nASR fragments:\n${raw}`;
+  const out = await chatAllWithRetry(client, {
+    messages: [{ role: 'system', content: buildRefineSystem(srcEn) }, { role: 'user', content: prompt }],
+    stream: false, options,
+  });
+  return parseRefine(out, raw);
+}
+
+// 容错解析 refine 输出：兼容 <o>/<t> 标签、原文：/译文：、以及“两行”兜底。
+// 解析不出译文时 translation 留空（内容脚本回退显示原文），绝不放原语言文本冒充译文。
+function parseRefine(out, raw) {
+  let s = (out || '').trim();
+  // 去掉可能的 markdown 代码围栏
+  s = s.replace(/^```[\s\S]*?\n?/i, '').replace(/```\s*$/i, '').trim();
+  const om = s.match(/<o>([\s\S]*?)<\/o>/i);
+  const tm = s.match(/<t>([\s\S]*?)<\/t>/i);
+  let original = om && om[1].trim() ? om[1].trim() : '';
+  let translation = tm && tm[1].trim() ? tm[1].trim() : '';
+  if (!original || !translation) {
+    const o2 = s.match(/原文[:：]\s*([\s\S]*?)(?=\s*译文[:：])/i);
+    const t2 = s.match(/译文[:：]\s*([\s\S]*)$/i);
+    if (!original && o2 && o2[1].trim()) original = o2[1].trim();
+    if (!translation && t2 && t2[1].trim()) translation = t2[1].trim();
+  }
+  // 有 <o> 但漏写 <t>：把 </o> 之后的内容（去掉可能夹带的 <t> 标签）当作译文。
+  if (original && !translation && om) {
+    const after = s.slice(om.index + om[0].length).replace(/^<\/?t>/i, '').trim();
+    if (after) translation = after;
+  }
+  // 两行兜底：original 已有时，把“与原文不同的那行”当作译文；否则取首行作原文、次行作译文。
+  const lines = s.split(/\n+/).map(l => l.trim()).filter(Boolean);
+  if (!translation && lines.length >= 2) {
+    const cand = lines.find(l => l !== original);
+    if (cand) translation = cand;
+  }
+  if (!original && lines.length >= 2) original = lines[0];
+  if (!original) original = raw;   // 完全解析失败：保留原始识别文本，至少能显示
+  return { original, translation };
+}
+
 /** 源语言中文标签 → Whisper ISO 语言码（空 = 自动检测） */
 const WHISPER_LANG = {
   '自动识别': '', '英语': 'en', '日语': 'ja', '韩语': 'ko', '法语': 'fr', '德语': 'de',
   '西班牙语': 'es', '俄语': 'ru', '葡萄牙语': 'pt', '意大利语': 'it', '泰语': 'th', '越南语': 'vi',
+};
+
+// 源语言中文标签 → 英文（用于 refine 提示词，让模型能理解并纠正误识语种）
+const LANG_EN = {
+  '日语': 'Japanese', '英语': 'English', '韩语': 'Korean', '法语': 'French', '德语': 'German',
+  '西班牙语': 'Spanish', '俄语': 'Russian', '葡萄牙语': 'Portuguese', '意大利语': 'Italian',
+  '泰语': 'Thai', '越南语': 'Vietnamese', '中文（简体）': 'Chinese', '中文（繁体）': 'Chinese',
 };
 
 /**
@@ -209,6 +378,44 @@ const WHISPER_LANG = {
 // 跨模型轮询计数器：每片从不同的模型起步，把请求均匀分摊到多个 Whisper 模型，
 // 避免全部压在单一模型上触发 429 限流（仍保留片内故障转移兜底）。
 let whisperRR = 0;
+
+// Whisper 在静音 / 纯背景音 / 音乐片段上的常见“幻觉”固定语（多语种）。
+// 这些短语在无实质语音时被模型凭空吐出（如日语视频里出现“ご視聴ありがとうございました”、
+// 中文“感谢观看”等）。归一化后（去空白/标点、转小写）用于整片匹配剔除。
+const HALLUCINATION_NORM = [
+  // 日语
+  'ご視聴ありがとうございました', 'ご視聴ありがとうございます', 'ご清聴ありがとうございました',
+  '最後までご視聴いただきありがとうございます', 'チャンネル登録お願いします',
+  'チャンネル登録高評価よろしくお願いします', 'おやすみなさい',
+  // 中文
+  '感谢观看', '谢谢观看', '谢谢大家观看', '感謝觀看', '謝謝觀看', '請不吝點贊訂閱轉發打賞',
+  '请不吝点赞订阅转发打赏支持明镜与点点栏目', '请点赞订阅', '字幕由amaraorg社区提供',
+  '明镜与点点栏目', '字幕志愿者', '下集见', '未完待续',
+  // 英语
+  'thankyouforwatching', 'thanksforwatching', 'pleasesubscribe',
+  'subscribetomychannel', 'seeyounexttime', 'thanksforwatchingdontforgettosubscribe',
+];
+
+// 归一化：去除空白与常见标点、转小写（保留中日文字符）。
+function normalizeCaption(text) {
+  return (text || '').toLowerCase()
+    .replace(/[\s。、，,\.!！?？…・~〜「」『』"'“”‘’()（）\-—:：;；]/g, '');
+}
+
+// 若整片转写内容“基本只是”一条幻觉固定语，则判为幻觉并剔除（返回空串）。
+// 只在整片高度匹配时剔除，避免误伤正常语音中偶含这些词。
+function stripHallucination(text) {
+  const t = (text || '').trim();
+  if (!t) return '';
+  const norm = normalizeCaption(t);
+  if (!norm) return '';
+  for (const p of HALLUCINATION_NORM) {
+    if (norm === p) return '';
+    // 整片长度与短语相当（片段几乎只有这句话）→ 视为幻觉
+    if (norm.length <= p.length + 4 && norm.includes(p)) return '';
+  }
+  return t;
+}
 
 async function streamTranscribe(port, msg) {
   const { whisperModelIds, audio, language, mime } = msg;
@@ -249,7 +456,10 @@ async function streamTranscribe(port, msg) {
   const TOTAL_TIMEOUT_MS = 120000;
   const startedAt = Date.now();
   let lastErr;
-  for (const wm of list) {
+  const MAX_ROUNDS = 3;
+  for (let round = 0; round < MAX_ROUNDS; round++) {
+   let sawRate = false;
+   for (const wm of list) {
     if (Date.now() - startedAt > TOTAL_TIMEOUT_MS) {
       port.postMessage({ type: 'error', error: 'Whisper 转写超时（超过 2 分钟）' });
       return;
@@ -274,7 +484,7 @@ async function streamTranscribe(port, msg) {
       const ct = (res.headers && typeof res.headers.get === 'function' && res.headers.get('content-type')) || '';
       if (!/text\/event-stream/i.test(ct)) {
         const json = await res.json().catch(() => ({}));
-        port.postMessage({ type: 'final', text: (json.text || '').trim() });
+        port.postMessage({ type: 'final', text: stripHallucination((json.text || '').trim()) });
         return;
       }
       const reader = res.body.getReader();
@@ -308,13 +518,18 @@ async function streamTranscribe(port, msg) {
           }
         }
       }
-      port.postMessage({ type: 'final', text: full.trim() }); return;
+      port.postMessage({ type: 'final', text: stripHallucination(full.trim()) }); return;
     } catch (e) {
       lastErr = e;
+      if (isRateLimit(e)) sawRate = true;
       console.warn(`[whisper] 流式模型 ${wm.name || wm.id} 失败：${e.message}`);
     } finally {
       clearTimeout(to);
     }
+   }
+   // 一轮内所有模型都失败：仅当遇到 429 限流时才退避重试（其它错误重试无益，直接放弃）
+   if (!sawRate) break;
+   if (round < MAX_ROUNDS - 1) await sleep(700 * (round + 1));
   }
   port.postMessage({ type: 'error', error: (lastErr && lastErr.message) || '所有 Whisper 模型均失败' });
 }
@@ -412,6 +627,11 @@ chrome.runtime.onConnect.addListener((port) => {
         // 音频已在 offscreen 编码为 base64 字符串，sendMessage（JSON 序列化）可可靠传输。
         if (activeCaptionTabId != null) {
           try { await chrome.tabs.sendMessage(activeCaptionTabId, { type: 'LIVE_CAPTION_AUDIO', audioB64: m.audioB64, mime: m.mime }); } catch (_) {}
+        }
+      } else if (m.type === 'AUDIO_SILENCE') {
+        // 静音窗口标记：转发给内容脚本用于音频时间轴判句（不携带音频，极轻量）
+        if (activeCaptionTabId != null) {
+          try { await chrome.tabs.sendMessage(activeCaptionTabId, { type: 'LIVE_CAPTION_SILENCE' }); } catch (_) {}
         }
       } else if (m.type === 'CAPTURE_ERROR') {
         if (activeCaptionTabId != null) {
@@ -599,6 +819,29 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse(result);
       } catch (e) {
         sendResponse({ ok: false, error: (e && e.message) ? e.message : '字幕翻译失败' });
+      }
+    })();
+    return true;
+  }
+  // 实时字幕：把一句话的 ASR 碎片整段整理 + 翻译，替换草稿区的零散词组
+  if (msg.type === 'LIVE_CAPTION_REFINE') {
+    (async () => {
+      try {
+        const { modelId, targetLang, fragments, sourceLang } = msg;
+        if (!Array.isArray(fragments) || !fragments.length) {
+          sendResponse({ ok: false, error: '参数错误：fragments 必须是非空数组' });
+          return;
+        }
+        const models = await getModels();
+        const model = models.find(m => m.id === modelId)
+          || models.find(m => m.enabled !== false && m.isPrimary)
+          || models.find(m => m.enabled !== false);
+        if (!model) { sendResponse({ ok: false, error: '未找到可用翻译模型，请先在设置添加模型' }); return; }
+        if (!hasCred(model)) { sendResponse({ ok: false, error: '翻译模型缺少有效凭证（API Key）' }); return; }
+        const r = await refineCaption(model, fragments, targetLang || '中文（简体）', sourceLang);
+        sendResponse({ ok: true, original: r.original, translation: r.translation });
+      } catch (e) {
+        sendResponse({ ok: false, error: (e && e.message) ? e.message : '字幕整理失败' });
       }
     })();
     return true;

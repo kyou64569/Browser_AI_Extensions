@@ -2202,8 +2202,8 @@ function initPageTranslate() {
     const tabId = await getActiveTabId();
     if (!tabId) { statusEl.textContent = '未找到活动标签页'; return; }
     try {
-      await chrome.tabs.sendMessage(tabId, { type: 'WEB_TRANSLATE_RESTORE' });
-      statusEl.textContent = '已还原原文';
+      const r = await chrome.tabs.sendMessage(tabId, { type: 'WEB_TRANSLATE_RESTORE' });
+      statusEl.textContent = '已还原原文' + (r && r.restored ? `（${r.restored} 组）` : '');
     } catch (e) {
       statusEl.textContent = '通信失败：' + (e && e.message ? e.message : e);
     }

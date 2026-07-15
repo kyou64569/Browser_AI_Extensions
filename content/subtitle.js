@@ -28,8 +28,7 @@
   let active = false;
   let cfg = null;            // 当前配置（来自 LIVE_CAPTION_START）
   let overlay = null;
-  let origEl = null, transEl = null;
-  let currentKey = '';       // 当前正在显示的字幕原文（去重用）
+  let boxHeader = null, historyEl = null, draftEl = null;
 
   // 平台字幕抓取
   let captionObserver = null;
@@ -51,18 +50,33 @@
   let whisperErrored = false;     // 转写失败仅提示一次，避免刷屏
   const MAX_WHISPER_QUEUE = 10;   // Whisper 队列最大长度，防止内存溢出
 
-  // 翻译批处理 + 缓存
-  let pendingBatch = [];
-  let batchTimer = null;
+  // 翻译结果缓存（重复句只整理翻译一次，如片头/客套话）
   const translationCache = new Map();
   const cacheKeys = [];            // FIFO 缓存键队列
   const MAX_CACHE = 600;
-  const BATCH_MS = 280;
-  const PREFETCH_AHEAD_LIMIT = 12; // 预取时一次最多翻译的 cue 数
-  let translateTokenCount = 0;     // 速率限制令牌
-  let translateTokenTimestamps = []; // 每个令牌的过期时间戳
-  const TRANSLATE_RATE_MAX = 4;    // 每 TRANSLATE_RATE_WINDOW 最多允许的翻译批次
-  const TRANSLATE_RATE_WINDOW = 3000; // 3s 滑动窗口
+
+  // 累积字幕 + 成句整理（refine）——核心：碎词先入草稿，成句后交 AI 整段整理+翻译
+  let committedDraft = '';          // 当前句已识别定稿的原始文本（草稿区展示）
+  let livePartial = '';             // whisper 流式 partial（未定稿，仅预览）
+  let liveTrans = '';               // 当前草稿的实时译文（实时翻译；成句后由 refine 结果替换）
+  let liveTransRaw = '';            // 上一次实时翻译对应的原文，避免重复请求
+  let liveTransTimer = null;        // 实时翻译防抖计时器
+  let liveTransSeq = 0;             // 实时翻译请求序号：防止旧的短请求后返回覆盖新译文（消除闪回）
+  const LIVE_TRANS_DEBOUNCE = 600; // 实时翻译防抖间隔（ms）
+  const LIVE_TRANS_MIN_CHARS = 2;  // 低于此长度不翻译，避免碎词空翻
+  // 判句策略（根治“首句超长、后续切碎”与 429）：
+  // Whisper 分片已在 offscreen 侧用 VAD（静音驱动）切成“一句一片”——每片 final 就是一整句，
+  // 无需 content 侧再做静音累积/宽限判句。这样 Whisper 调用降到句频、稳在配额内，
+  // 也不会再出现“首句吞积压 / 429 被误判静音后乱切”。
+  // 以下变量仅供【平台字幕】路径（YouTube DOM / <track>）使用（它们是整行累积、需停顿收尾）。
+  let sentenceTimer = null;         // 平台字幕停顿计时器（Whisper 路径不用）
+  const SENTENCE_GAP_MS = 2500;
+  const SENTENCE_MAX_CHARS = 200;   // 单句最大长度，超过强制收尾（平台字幕兜底）
+  let refineQueue = [];             // 待整理的句子快照（按序处理，避免串句）
+  let refineRunning = false;        // refine 泵是否在运行（防重入）
+  const historyLines = [];          // 已定稿字幕：{ original, translation }
+  const HISTORY_MAX_LINES = 12;     // 历史最大行数，超过则清空开始下一轮
+  const HISTORY_MAX_CHARS = 1200;   // 历史最大字符数，超过则清空
 
   // ---------- 缓存 ----------
   function setCache(k, v) {
@@ -75,98 +89,291 @@
   }
   function cacheGet(k) { return translationCache.has(k) ? translationCache.get(k) : null; }
 
-  // ---------- 字幕覆盖层 ----------
+  // ---------- 字幕盒子（常驻 + 可拖拽 + 历史区 + 草稿区）----------
   function ensureOverlay() {
     if (overlay) return;
     overlay = document.createElement('div');
     overlay.style.cssText =
       'position:fixed;left:50%;bottom:8%;transform:translateX(-50%);' +
-      'max-width:82%;text-align:center;z-index:2147483647;pointer-events:none;' +
-      'font-family:-apple-system,BlinkMacFont,"Segoe UI",Roboto,sans-serif;' +
-      'line-height:1.4;transition:opacity .15s;';
-    transEl = document.createElement('div');
-    transEl.style.cssText =
-      'display:inline-block;margin:2px auto;padding:4px 12px;border-radius:10px;' +
-      'background:rgba(0,0,0,.62);color:#fff;font-size:22px;font-weight:600;' +
-      'text-shadow:0 1px 2px rgba(0,0,0,.6);backdrop-filter:blur(2px);';
-    transEl.textContent = '';
-    origEl = document.createElement('div');
-    origEl.style.cssText =
-      'display:inline-block;margin:2px auto;padding:2px 10px;border-radius:8px;' +
-      'background:rgba(0,0,0,.38);color:rgba(255,255,255,.82);font-size:14px;';
-    origEl.textContent = '';
-    overlay.appendChild(origEl);
-    overlay.appendChild(transEl);
+      'width:72%;max-width:920px;z-index:2147483647;' +
+      'display:flex;flex-direction:column;overflow:hidden;border-radius:12px;' +
+      'background:rgba(0,0,0,.55);box-shadow:0 6px 24px rgba(0,0,0,.4);' +
+      'backdrop-filter:blur(3px);' +
+      'font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;';
+
+    // 顶部拖拽条（唯一可交互区域，避免遮挡播放器控件）
+    boxHeader = document.createElement('div');
+    boxHeader.style.cssText =
+      'pointer-events:auto;cursor:move;user-select:none;' +
+      'display:flex;align-items:center;justify-content:space-between;' +
+      'padding:4px 10px;background:rgba(255,255,255,.10);color:rgba(255,255,255,.75);font-size:12px;';
+    const title = document.createElement('span');
+    title.textContent = '实时字幕 · 拖动可移动';
+    const closeBtn = document.createElement('span');
+    closeBtn.textContent = '✕';
+    closeBtn.style.cssText = 'cursor:pointer;padding:0 4px;font-size:13px;';
+    closeBtn.addEventListener('click', () => {
+      try { chrome.runtime.sendMessage({ type: 'LIVE_CAPTION_STOP_CAPTURE' }); } catch (_) {}
+      stop();
+    });
+    boxHeader.appendChild(title);
+    boxHeader.appendChild(closeBtn);
+
+    // 正文：历史区（可滚动）+ 草稿区
+    const body = document.createElement('div');
+    body.style.cssText = 'pointer-events:none;padding:8px 14px;max-height:30vh;overflow-y:auto;';
+    historyEl = document.createElement('div');
+    historyEl.style.cssText = 'display:flex;flex-direction:column;gap:6px;';
+    draftEl = document.createElement('div');
+    draftEl.style.cssText =
+      'margin-top:6px;color:rgba(255,255,255,.55);font-size:15px;font-style:italic;' +
+      'min-height:1em;white-space:pre-wrap;word-break:break-word;';
+    body.appendChild(historyEl);
+    body.appendChild(draftEl);
+
+    overlay.appendChild(boxHeader);
+    overlay.appendChild(body);
     document.documentElement.appendChild(overlay);
+
+    restoreBoxPosition();
+    enableDrag();
   }
-  function renderLine(original, translation) {
-    if (cfg && !cfg.bilingual) {
-      origEl.style.display = 'none';
-      transEl.textContent = translation || original;  // 无译文时回退原文
-    } else {
-      origEl.style.display = '';
-      origEl.textContent = original || '';
-      transEl.textContent = translation || '';
+
+  // 拖拽：仅 header 触发；拖动时固定 left/top，移除居中 transform。
+  function enableDrag() {
+    let dragging = false, sx = 0, sy = 0, ox = 0, oy = 0;
+    const onMove = (e) => {
+      if (!dragging) return;
+      overlay.style.left = (ox + (e.clientX - sx)) + 'px';
+      overlay.style.top = (oy + (e.clientY - sy)) + 'px';
+      overlay.style.bottom = 'auto';
+      overlay.style.transform = 'none';
+    };
+    const onUp = () => {
+      if (!dragging) return;
+      dragging = false;
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+      saveBoxPosition();
+    };
+    boxHeader.addEventListener('mousedown', (e) => {
+      dragging = true;
+      const r = overlay.getBoundingClientRect();
+      ox = r.left; oy = r.top; sx = e.clientX; sy = e.clientY;
+      overlay.style.left = r.left + 'px';
+      overlay.style.top = r.top + 'px';
+      overlay.style.bottom = 'auto';
+      overlay.style.transform = 'none';
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup', onUp);
+      e.preventDefault();
+    });
+  }
+  function saveBoxPosition() {
+    try {
+      const r = overlay.getBoundingClientRect();
+      sessionStorage.setItem('__aiSubtitleBoxPos', JSON.stringify({ left: r.left, top: r.top }));
+    } catch (_) {}
+  }
+  function restoreBoxPosition() {
+    try {
+      const raw = sessionStorage.getItem('__aiSubtitleBoxPos');
+      if (!raw) return;
+      const p = JSON.parse(raw);
+      if (p && typeof p.left === 'number' && typeof p.top === 'number') {
+        overlay.style.left = p.left + 'px';
+        overlay.style.top = p.top + 'px';
+        overlay.style.bottom = 'auto';
+        overlay.style.transform = 'none';
+      }
+    } catch (_) {}
+  }
+
+  // 渲染历史区：逐行「译文（大）+ 原文（小，双语时）」
+  function renderHistory() {
+    if (!historyEl) return;
+    historyEl.innerHTML = '';
+    for (const line of historyLines) {
+      const row = document.createElement('div');
+      const tr = document.createElement('div');
+      tr.textContent = line.translation || line.original || '';
+      tr.style.cssText =
+        'color:#fff;font-size:20px;font-weight:600;line-height:1.35;text-shadow:0 1px 2px rgba(0,0,0,.6);';
+      row.appendChild(tr);
+      if (cfg && cfg.bilingual && line.original && line.translation) {
+        const og = document.createElement('div');
+        og.textContent = line.original;
+        og.style.cssText = 'color:rgba(255,255,255,.7);font-size:13px;line-height:1.3;';
+        row.appendChild(og);
+      }
+      historyEl.appendChild(row);
     }
+    const body = historyEl.parentNode;
+    if (body) body.scrollTop = body.scrollHeight; // 始终滚到最新
   }
-  // 错误提示：保持覆盖层挂载可见，让用户知道为何没有字幕
+
+  // 渲染草稿区：当前句还未定稿的原始识别文本（碎词 + 流式 partial）+ 实时译文
+  function renderDraft() {
+    if (!draftEl) return;
+    const raw = (committedDraft + (livePartial ? ' ' + livePartial : '')).trim();
+    if (!raw && !liveTrans) { draftEl.textContent = ''; return; }
+    let s = '✍ ' + (raw || '…');
+    if (liveTrans) s += '\n→ ' + liveTrans;
+    draftEl.textContent = s;
+  }
+
+  // 错误提示：保持盒子挂载可见，让用户知道为何没有字幕
   function showError(text) {
     ensureOverlay();
-    if (origEl) origEl.style.display = 'none';
-    if (transEl) transEl.textContent = '⚠ ' + text;
+    if (draftEl) draftEl.textContent = '⚠ ' + text;
   }
 
-  // ---------- 翻译流水线 ----------
-  function showCaption(text) {
+  // ---------- 累积 → 成句 → 整理翻译 流水线 ----------
+  // 平台字幕：每次收到的是当前整行（累积增长）→ 直接替换草稿。
+  function feedPlatformLine(text) {
     if (!active || !text) return;
-    if (text === currentKey) return;            // 同句去重
-    currentKey = text;
-    const cached = cacheGet(text);
-    renderLine(text, cached || '');
-    if (!cached) requestTranslate(text);
+    livePartial = '';
+    if (text === committedDraft) return;
+    committedDraft = text;
+    renderDraft();
+    scheduleLiveTranslate();      // 平台字幕同样先实时翻译
+    scheduleSentenceBoundary();
+    maybeForceBoundary();
   }
 
-  function requestTranslate(text) {
-    if (pendingBatch.includes(text)) return;
-    pendingBatch.push(text);
-    if (batchTimer) return;
-    batchTimer = setTimeout(flushTranslate, BATCH_MS);
+  // Whisper（VAD 分片）：每片 final 已是完整一句 → 直接整理成一行历史。
+  // 整理（refine）里会顺带翻译，因此翻译调用频率 = 句频，稳在配额内（不再做高频实时翻译）。
+  function feedWhisperFinal(seq, text) {
+    if (!active) return;
+    const clean = (text || '').trim();
+    livePartial = '';
+    renderDraft();
+    if (!clean) return;
+    refineQueue.push({ raw: clean, carried: '' });  // 整段整理 + 翻译，一句一行
+    pumpRefine();
   }
 
-  async function flushTranslate() {
-    batchTimer = null;
-    const batch = pendingBatch; pendingBatch = [];
-    if (!batch.length) return;
-    const uncached = batch.filter(t => !cacheGet(t));
-    if (!uncached.length) return;
-    // 速率限制：滑动窗口内超过上限则等待最老的令牌过期后再重试
-    const now = Date.now();
-    translateTokenTimestamps = translateTokenTimestamps.filter(t => now - t < TRANSLATE_RATE_WINDOW);
-    if (translateTokenTimestamps.length >= TRANSLATE_RATE_MAX) {
-      pendingBatch = uncached;
-      const oldest = translateTokenTimestamps[0];
-      const waitMs = TRANSLATE_RATE_WINDOW - (now - oldest) + 50; // 等最老令牌过期 + 50ms
-      batchTimer = setTimeout(flushTranslate, Math.min(waitMs, 5000));
-      return;
-    }
-    translateTokenTimestamps.push(now);
+  // Whisper：流式 partial 仅作草稿区“正在识别”预览，不翻译（翻译只在成句 refine 时做一次，省配额）。
+  function feedLivePartial(text) {
+    if (!active) return;
+    livePartial = text || '';
+    renderDraft();
+  }
+
+  // 实时翻译（防抖）：把当前草稿即时翻成译文显示在草稿区，体感“字幕级”实时性；
+  // 成句后的 refine 会用更干净、更连贯的整句译文替换它。
+  function scheduleLiveTranslate() {
+    if (!active) return;
+    if (liveTransTimer) clearTimeout(liveTransTimer);
+    liveTransTimer = setTimeout(doLiveTranslate, LIVE_TRANS_DEBOUNCE);
+  }
+  async function doLiveTranslate() {
+    liveTransTimer = null;
+    const cur = (committedDraft + (livePartial ? ' ' + livePartial : '')).trim();
+    if (cur.length < LIVE_TRANS_MIN_CHARS || cur === liveTransRaw) { renderDraft(); return; }
+    liveTransRaw = cur;
+    const reqId = ++liveTransSeq;   // 本次请求序号
     try {
       const resp = await chrome.runtime.sendMessage({
         type: 'LIVE_CAPTION_TRANSLATE',
         modelId: cfg.modelId,
         targetLang: cfg.targetLang,
-        lines: uncached,
+        lines: [cur],
       });
+      // 已被更新的请求取代（旧的短请求后返回）→ 丢弃，避免译文闪回/回退
+      if (reqId !== liveTransSeq) return;
       if (resp && resp.ok && Array.isArray(resp.translations)) {
-        uncached.forEach((line, i) => {
-          const t = resp.translations[i];
-          if (t && t.trim()) {
-            setCache(line, t.trim());
-            if (line === currentKey) renderLine(line, t.trim());
-          }
-        });
+        const t = (resp.translations[0] || '').trim();
+        // 仅接受“真正译文”：非空且不等于原文（后台解析失败会回退原文，须拒绝这种回声）
+        if (t && t !== cur) liveTrans = t;
+        // 否则保留上一次的有效译文，不降级为原文
       }
-    } catch (_) { /* 单批失败不影响字幕显示 */ }
+    } catch (_) { /* 实时翻译失败不阻塞，保留上次译文；成句 refine 会兜底 */ }
+    if (reqId === liveTransSeq) renderDraft();
+  }
+
+  // 平台字幕：每行已是完整句，句末标点或超长 → 立即收尾（Whisper 模式不调用此函数）。
+  function maybeForceBoundary() {
+    if (committedDraft.length >= SENTENCE_MAX_CHARS || /[。！？.!?]\s*$/.test(committedDraft)) {
+      finalizeSentence();
+    }
+  }
+
+  // 每来新内容就重置停顿计时器：一段时间没新词 → 判为一句话说完。
+  function scheduleSentenceBoundary() {
+    if (sentenceTimer) clearTimeout(sentenceTimer);
+    sentenceTimer = setTimeout(finalizeSentence, SENTENCE_GAP_MS);
+  }
+
+  // 句子边界（平台字幕路径）：把当前草稿快照丢进 refine 队列，清空草稿开始下一句。
+  function finalizeSentence() {
+    if (sentenceTimer) { clearTimeout(sentenceTimer); sentenceTimer = null; }
+    const snapshot = committedDraft.trim();
+    // 携带草稿区已显示的实时译文；但若它其实等于原文（异常回声）则不携带，避免历史行显示未翻译状态
+    const carried = (liveTrans && liveTrans !== snapshot) ? liveTrans : '';
+    committedDraft = '';
+    livePartial = '';
+    liveTrans = ''; liveTransRaw = '';
+    if (liveTransTimer) { clearTimeout(liveTransTimer); liveTransTimer = null; }
+    renderDraft();
+    if (!snapshot) return;
+    refineQueue.push({ raw: snapshot, carried });
+    pumpRefine();
+  }
+
+  // 追加一行历史；满了则清空开始下一轮（保留最新这行，保证观感连续）。
+  function appendHistory(line) {
+    historyLines.push(line);
+    const chars = historyLines.reduce((n, l) => n + (l.translation || l.original || '').length, 0);
+    if (historyLines.length > HISTORY_MAX_LINES || chars > HISTORY_MAX_CHARS) {
+      const keep = historyLines[historyLines.length - 1];
+      historyLines.length = 0;
+      historyLines.push(keep);
+    }
+    renderHistory();
+  }
+
+  // refine 泵：串行处理，保证历史顺序与说话顺序一致。
+  function pumpRefine() {
+    if (refineRunning) return;
+    refineRunning = true;
+    (async () => {
+      while (refineQueue.length && active) {
+        const item = refineQueue.shift();
+        const raw = typeof item === 'string' ? item : (item.raw || '');
+        const carried = typeof item === 'string' ? '' : (item.carried || '');
+        const lineRef = (item && typeof item === 'object' && item.lineRef) || null;
+        // 携带草稿区已显示的实时译文：成句瞬间历史行即有译文（白粗体），refine 回包后再覆盖为更干净的版本。
+        const placeholder = lineRef || { original: raw, translation: carried };
+        if (!lineRef) appendHistory(placeholder);
+        const cached = cacheGet(raw);
+        if (cached) {
+          placeholder.original = cached.original || raw;
+          if (cached.translation && cached.translation.trim()) placeholder.translation = cached.translation.trim();
+          renderHistory();
+          continue;
+        }
+        try {
+          const resp = await chrome.runtime.sendMessage({
+            type: 'LIVE_CAPTION_REFINE',
+            modelId: cfg.modelId,
+            targetLang: cfg.targetLang,
+            sourceLang: cfg.sourceLang,
+            fragments: [raw],
+          });
+          if (resp && resp.ok) {
+            placeholder.original = (resp.original && resp.original.trim()) || raw;
+            const t = (resp.translation && resp.translation.trim()) || '';
+            if (t) placeholder.translation = t;   // 仅当 refine 给出非空译文才覆盖（保留携带的实时译文）
+            setCache(raw, { original: placeholder.original, translation: placeholder.translation });
+          }
+        } catch (_) { /* 整理失败：保留草稿区携带的实时译文，不阻塞后续 */ }
+        renderHistory();
+        // 每次循环后检查 active 状态，避免用户停止后继续处理队列
+        if (!active) break;
+      }
+      refineRunning = false;
+    })();
   }
 
   // ---------- 平台字幕：YouTube DOM 监听 ----------
@@ -180,7 +387,7 @@
     captionObserver = new MutationObserver(() => {
       const segs = captionWindow.querySelectorAll('.ytp-caption-segment');
       const text = Array.from(segs).map(s => s.textContent).join(' ').trim();
-      if (text) showCaption(text);
+      if (text) feedPlatformLine(text);
     });
     captionObserver.observe(captionWindow, { childList: true, subtree: true, characterData: true });
     // 字幕容器可能在用户开关 CC 后被重建：轮询找回
@@ -193,7 +400,7 @@
           captionObserver = new MutationObserver(() => {
             const segs = captionWindow.querySelectorAll('.ytp-caption-segment');
             const text = Array.from(segs).map(s => s.textContent).join(' ').trim();
-            if (text) showCaption(text);
+            if (text) feedPlatformLine(text);
           });
           captionObserver.observe(captionWindow, { childList: true, subtree: true, characterData: true });
         }
@@ -213,29 +420,12 @@
       const active2 = track.activeCues;
       if (active2 && active2.length) {
         const text = Array.from(active2).map(c => c.text).join('\n').replace(/<[^>]+>/g, '').trim();
-        if (text) showCaption(text);
+        if (text) feedPlatformLine(text);
       }
     };
     track.mode = 'hidden';
     track.addEventListener('cuechange', onCue);
     trackWatch = { track, onCue };
-
-    // 预取：把"已缓存但未观看"的后续 cue 提前翻译（非直播提速关键）
-    if (cfg.prefetch) {
-      prefetchTimer = setInterval(() => {
-        if (!active || !track || !track.cues || track.cues.length === 0) return;
-        const t = video.currentTime;
-        const ahead = [];
-        for (let i = 0; i < track.cues.length; i++) {
-          const c = track.cues[i];
-          if (c.startTime >= t && c.startTime <= t + 40) {
-            const txt = (c.text || '').replace(/<[^>]+>/g, '').trim();
-            if (txt && !cacheGet(txt)) ahead.push(txt);
-          }
-        }
-        ahead.slice(0, PREFETCH_AHEAD_LIMIT).forEach(requestTranslate);
-      }, 3000);
-    }
     return true;
   }
 
@@ -248,7 +438,7 @@
     if (!resp || !resp.ok) {
       throw new Error((resp && resp.error) || '无法启动音频捕获（Whisper 模式需要标签页音频权限）');
     }
-    renderLine('', '🎙 正在识别语音…');
+    if (draftEl) draftEl.textContent = '🎙 正在识别语音…';
     return true;
   }
 
@@ -299,6 +489,9 @@
     pumpWhisper();
   }
 
+  // 兼容旧消息：VAD 分片后 offscreen 不再发静音标记（判句已在音频源头完成）。保留空实现避免报错。
+  function enqueueWhisperSilence() { /* no-op */ }
+
   // 并发泵流：同时最多开 WHISPER_CONCURRENCY 个 whisper-stream 端口，
   // 各片重叠发送，避免单片延迟在队列里累积（方案 B）。
   function pumpWhisper() {
@@ -331,8 +524,10 @@
     port.onMessage.addListener((m) => {
       if (!active) { finish(); return; }
       if (m.type === 'partial') {
-        whisperLive.set(seq, m.text || '');
-        renderLiveForSeq();
+        const txt = m.text || '';
+        whisperLive.set(seq, txt);
+        // partial 仅作草稿区预览（灰色斜体），不定稿；final 后并入 committedDraft 累积成句。
+        if (seq === whisperNextShow) feedLivePartial(txt);
       } else if (m.type === 'final') {
         whisperErrored = false;
         whisperDone.set(seq, (m.text || '').trim());
@@ -385,37 +580,24 @@
   // 按序号顺序冲刷已完成的转写结果，保证字幕不乱序。
   function flushInOrder() {
     while (whisperDone.has(whisperNextShow)) {
-      const txt = whisperDone.get(whisperNextShow);
-      whisperDone.delete(whisperNextShow);
+      const seq = whisperNextShow;
+      const txt = whisperDone.get(seq);
+      whisperDone.delete(seq);
       whisperNextShow++;
       if (txt) {
-        showCaption(txt);   // 复用翻译/显示流水线
+        feedWhisperFinal(seq, txt);   // 每片=一句：直接整理成一行历史
       } else {
-        // 该片段无有效语音：清掉仍停留在屏幕上的 partial 残影，避免显示错误的半句字幕
-        currentKey = '';
-        if (origEl) origEl.textContent = '';
-        if (transEl) transEl.textContent = '';
+        // 该片无有效语音（幻觉短语 / 纯背景音被后台过滤成空）→ 忽略，仅清预览
+        livePartial = '';
+        renderDraft();
       }
     }
     renderLiveForSeq();
   }
 
-  // 流式显示：只展示“下一个待显示序号”那片的 partial，避免并发片的残影互相覆盖。
+  // 流式显示：只展示“下一个待显示序号”那片的 partial 到草稿区。
   function renderLiveForSeq() {
-    renderStreaming(whisperLive.get(whisperNextShow) || '');
-  }
-  // 流式 partial：原文逐字刷新（双语模式显示原文 + "…"占位译文；单语模式直接显示）
-  function renderStreaming(text) {
-    if (!active) return; // 防止 stop() 后回调访问已销毁的 DOM
-    ensureOverlay();
-    if (cfg && !cfg.bilingual) {
-      origEl.style.display = 'none';
-      transEl.textContent = text || '…';
-    } else {
-      origEl.style.display = '';
-      origEl.textContent = text || '…';
-      transEl.textContent = '…';
-    }
+    feedLivePartial(whisperLive.get(whisperNextShow) || '');
   }
 
   // ---------- 启动 / 停止 ----------
@@ -442,6 +624,11 @@
     // Offscreen 文档捕获到的音频片段（base64 字符串）→ 送 Whisper 转写
     if (msg.type === 'LIVE_CAPTION_AUDIO') {
       enqueueWhisper(msg.audioB64, msg.mime);
+      return;
+    }
+    // Offscreen 检测到的静音窗口 → 音频时间轴判句
+    if (msg.type === 'LIVE_CAPTION_SILENCE') {
+      enqueueWhisperSilence();
       return;
     }
     // Offscreen 捕获失败（如权限不足 / activeTab 未授权）→ 仅提示，不阻塞
@@ -507,9 +694,15 @@
     whisperQueue = []; whisperActive = 0; whisperRunning = false;
     whisperSeq = 0; whisperNextShow = 0;
     whisperDone.clear(); whisperLive.clear();
-    if (batchTimer) { clearTimeout(batchTimer); batchTimer = null; }
-    pendingBatch = []; currentKey = ''; cacheKeys.length = 0;
+    // 累积/整理相关状态清理
+    liveTransSeq = 0;
+    if (sentenceTimer) { clearTimeout(sentenceTimer); sentenceTimer = null; }
+    refineQueue = []; refineRunning = false;
+    committedDraft = ''; livePartial = '';
+    liveTrans = ''; liveTransRaw = '';
+    if (liveTransTimer) { clearTimeout(liveTransTimer); liveTransTimer = null; }
+    historyLines.length = 0; cacheKeys.length = 0; translationCache.clear();
     if (overlay && overlay.parentNode) overlay.parentNode.removeChild(overlay);
-    overlay = null; origEl = null; transEl = null; captionWindow = null;
+    overlay = null; boxHeader = null; historyEl = null; draftEl = null; captionWindow = null;
   }
 })();

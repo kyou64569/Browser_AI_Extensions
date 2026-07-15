@@ -11,16 +11,34 @@
 //
 // 注意：Offscreen 文档只能使用 chrome.runtime API，故音频片段经 chrome.runtime 端口回传 SW。
 
-const WHISPER_SLICE_MS = 2000;      // 每片（发送窗口）时长：连续捕获，按此周期切窗编码发送
-const WHISPER_PCM_SILENCE = 0.001;  // 窗口峰值低于此值视为静音，跳过发送省额度
+// ============================================================
+// VAD（静音驱动）分片：不再“固定每秒切一片”，而是累积音频直到检测到句末停顿才发一片。
+// 目的（根治）：把 Whisper 调用频率从 ~60 次/分钟（每秒一片）降到“句频”（~10~30 次/分钟），
+// 稳定落在“20 次/模型 × 2 模型 = 40 次/分钟”的配额内，从根源消除 429 与其引发的
+// “首句超长（吞积压）+ 后续切碎（429 被误判静音）”。副作用：一片=一句，判句在音频源头天然完成。
+const STEP_MS = 100;                 // VAD 评估步长：每 100ms 评估一次能量
+const VAD_PEAK = 0.01;               // 步内峰值≥此值视为“有声”，否则视为静音（正常语音峰值通常 >0.05）
+const SILENCE_HANG_MS = 700;         // 语音段后连续静音达此值 → 判为一句结束，切片发送
+const MIN_SPEECH_MS = 300;           // 段内有声时长不足此值 → 丢弃（避免把咔哒声/极短噪声当一句）
+const MAX_SEGMENT_MS = 8000;         // 单段最长：连续说话不停顿时强制切片，兜住极长句
+const TARGET_RATE = 16000;          // Whisper 原生采样率：降采样减少约 60% 数据量（48kHz→16kHz）
 
 let capStream = null;     // 捕获到的标签页音频流
 let capAudioCtx = null;   // Web Audio 上下文（恢复被静音的标签页声音 + 抓取 PCM）
 let capPcmNode = null;    // ScriptProcessorNode（持续抓取 PCM）
-let capPcmBuf = [];       // 当前窗口内累积的 Float32 帧（滑动窗口缓冲）
-let capPcmLen = 0;        // 当前窗口已累积样本数
-let capSliceTimer = null; // 切窗发送定时器（方案 C：setInterval）
+let capPcmBuf = [];       // 当前 STEP 内累积的 Float32 帧（由 onaudioprocess 填充，evaluate 每 STEP_MS 取走）
+let capPcmLen = 0;        // 当前 STEP 已累积样本数
+let capSliceTimer = null; // VAD 评估定时器（每 STEP_MS 触发 evaluate）
 let capActive = false;
+
+// VAD 语音段状态（累积“当前这一句”的 PCM，静音停顿到阈值即成句发送）
+let segFrames = [];       // 当前语音段累积的 Float32 帧
+let segSamples = 0;       // 当前语音段累积样本数
+let segVoiceMs = 0;       // 段内“有声”累计时长
+let segTotalMs = 0;       // 段总时长（含句中停顿）
+let inSpeech = false;     // 是否处于语音段中
+let silenceMs = 0;        // 段内当前连续静音时长
+let lastStep = null;      // 上一 STEP 的 PCM（preroll：语音起始前一步，避免吃掉句首辅音）
 
 let swPort = null;        // 与 SW 的端口
 
@@ -86,11 +104,16 @@ function startSlice() {
     capPcmNode = node;
     capPcmBuf = [];
     capPcmLen = 0;
+    // 降采样到 TARGET_RATE（16kHz）：Whisper 原生只需 16kHz，减少约 60% 数据量
+    // 降低编码耗时、跨进程传输耗时和 API 上传耗时（48kHz→16kHz 数据缩减约 3 倍）
+    const decimate = Math.max(1, Math.floor(capAudioCtx.sampleRate / TARGET_RATE));
     node.onaudioprocess = (ev) => {
       if (!capActive) return;
       const ch = ev.inputBuffer.getChannelData(0);
-      capPcmBuf.push(new Float32Array(ch)); // 复制，避免被复用
-      capPcmLen += ch.length;
+      const decimated = new Float32Array(Math.ceil(ch.length / decimate));
+      for (let i = 0, j = 0; i < ch.length; i += decimate, j++) decimated[j] = ch[i];
+      capPcmBuf.push(decimated);
+      capPcmLen += decimated.length;
     };
     const silent = capAudioCtx.createGain();
     silent.gain.value = 0;
@@ -102,31 +125,83 @@ function startSlice() {
     console.warn('[offscreen] PCM 捕获初始化失败', e);
     return;
   }
-  capSliceTimer = setInterval(sendWindow, WHISPER_SLICE_MS);
+  // 重置 VAD 段状态并按 STEP_MS 周期评估
+  segFrames = []; segSamples = 0; segVoiceMs = 0; segTotalMs = 0;
+  inSpeech = false; silenceMs = 0; lastStep = null;
+  capSliceTimer = setInterval(evaluateStep, STEP_MS);
 }
 
-// 把当前窗口内累积的 PCM 帧编码成 WAV 发送给 SW（内容脚本 → Whisper 转写）
-async function sendWindow() {
+// VAD 评估：每 STEP_MS 取走本步累积的 PCM，算峰值，交由状态机判定“有声/静音”。
+// 编码/发送仅在“一句结束”时触发一次（flushSegment），大幅降低 Whisper 调用频率。
+function evaluateStep() {
   if (!capActive || !capAudioCtx) return;
   const frames = capPcmBuf;
-  capPcmBuf = []; // 立即开新窗口，避免与正在进行的编码重叠累积
+  capPcmBuf = [];              // 立即开新步，避免与本步处理重叠累积
   const total = capPcmLen;
   capPcmLen = 0;
-  if (!frames.length || !total) return;
+  if (!total || !frames.length) { handleStep(null, 0, 0); return; } // 无采样：按静音步推进计时
   const data = new Float32Array(total);
   let off = 0;
   for (const f of frames) { data.set(f, off); off += f.length; }
-  // 静音窗口：峰值过低则跳过，省额度
   let peak = 0;
-  for (let i = 0; i < data.length; i += 257) { const a = Math.abs(data[i]); if (a > peak) peak = a; }
-  if (peak < WHISPER_PCM_SILENCE) return;
-  // 直接编码 WAV（无需 webm 解码，彻底规避 decode 错误）
+  for (let i = 0; i < data.length; i += 33) { const a = Math.abs(data[i]); if (a > peak) peak = a; }
+  handleStep(data, total, peak);
+}
+
+// VAD 状态机：累积“当前一句”的 PCM；句末静音达阈值或超长 → 成句发送。
+function handleStep(data, total, peak) {
+  const voiced = !!data && peak >= VAD_PEAK;
+  if (voiced) {
+    if (!inSpeech) {
+      // 语音段开始：清段状态；把上一步（preroll）纳入，避免吃掉句首辅音
+      inSpeech = true;
+      segFrames = []; segSamples = 0; segVoiceMs = 0; segTotalMs = 0;
+      if (lastStep && lastStep.total) {
+        segFrames.push(lastStep.data); segSamples += lastStep.total; segTotalMs += STEP_MS;
+      }
+    }
+    segFrames.push(data); segSamples += total;
+    segVoiceMs += STEP_MS; segTotalMs += STEP_MS;
+    silenceMs = 0;
+  } else if (inSpeech) {
+    // 句中/句末静音：也纳入段（保留自然停顿），静音累计达阈值即成句
+    if (data) { segFrames.push(data); segSamples += total; }
+    segTotalMs += STEP_MS;
+    silenceMs += STEP_MS;
+    if (silenceMs >= SILENCE_HANG_MS) { flushSegment(); }
+  }
+  // 长时间不停顿：强制切片兜底，避免单句超过配额可处理的时长
+  if (inSpeech && segTotalMs >= MAX_SEGMENT_MS) { flushSegment(); }
+  lastStep = data ? { data, total } : null;
+}
+
+// 成句：把整段语音 PCM 拼好后编码发送（一句一片）。段太短则丢弃。
+function flushSegment() {
+  const frames = segFrames, samples = segSamples, voiceMs = segVoiceMs;
+  inSpeech = false; silenceMs = 0;
+  segFrames = []; segSamples = 0; segVoiceMs = 0; segTotalMs = 0;
+  if (!samples || voiceMs < MIN_SPEECH_MS) return; // 有效语音不足：丢弃，不占用配额
+  const data = new Float32Array(samples);
+  let off = 0;
+  for (const f of frames) { data.set(f, off); off += f.length; }
+  encodeAndSendAsync(data, samples);
+}
+
+// 异步编码 + 发送：先释放主线程，避免阻塞 audio context
+async function encodeAndSendAsync(data, total) {
+  // 释放主线程：确保 audio context 的 onaudioprocess（50ms 周期）不被编码阻塞
+  await new Promise(r => setTimeout(r, 0));
+  if (!capActive || !capAudioCtx) return;
   try {
-    const ab = capAudioCtx.createBuffer(1, total, capAudioCtx.sampleRate);
+    // 用 TARGET_RATE（16kHz）创建 AudioBuffer，WAV 头将写 16kHz（数据已降采样）
+    const ab = capAudioCtx.createBuffer(1, total, TARGET_RATE);
     ab.copyToChannel(data, 0);
     const wav = encodeWav(ab);
-    if (swPort) {
+    if (swPort && capActive) {
       const buf = await wav.arrayBuffer();
+      // 再次释放主线程，避免 base64 编码阻塞采集
+      await new Promise(r => setTimeout(r, 0));
+      if (!capActive || !swPort) return;
       const b64 = bufToBase64(buf);
       // 音频编码为 base64 字符串再发送：跨进程消息对二进制（Blob/ArrayBuffer）不可靠，
       // base64 是普通字符串，可 100% 可靠传输，内容脚本再解码回字节。
@@ -142,6 +217,8 @@ function stopCapture() {
   if (capSliceTimer) { clearInterval(capSliceTimer); capSliceTimer = null; }
   if (capPcmNode) { try { capPcmNode.disconnect(); } catch (_) {} capPcmNode = null; }
   capPcmBuf = []; capPcmLen = 0;
+  segFrames = []; segSamples = 0; segVoiceMs = 0; segTotalMs = 0;
+  inSpeech = false; silenceMs = 0; lastStep = null;
   if (capAudioCtx) { try { capAudioCtx.close(); } catch (_) {} capAudioCtx = null; }
   if (capStream) { capStream.getTracks().forEach(t => t.stop()); capStream = null; }
 }
