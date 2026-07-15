@@ -105,18 +105,24 @@ async function runSummarize(port) {
 // 每段用 [N]…[/N] 包裹，要求模型仅返回同格式译文，便于稳定解析。
 // ============================================================
 const TRANSLATE_BATCH = 100;
+// 翻译是确定性任务，temperature 不读取模型配置，强制调低以减少漏翻/幻觉式复制原文。
+const TRANSLATE_TEMPERATURE = 0.1;
+
+// 强约束放进 system，比只放 user 更能约束中小模型，从根源降低“照抄原文不翻译”的概率。
+const TRANSLATE_SYSTEM_PROMPT = [
+  'You are a professional real-time subtitle translator.',
+  'Your ONLY job is to translate every input segment into the target language.',
+  'Strict rules you MUST follow:',
+  '1. Translate ALL segments. Never skip, omit, or leave a segment untranslated.',
+  '2. NEVER copy a segment unchanged. If a segment is already in the target language or needs no change, still wrap it in its markers — but you must never output the original foreign text as your translation.',
+  '3. Each segment is wrapped with [N] and [/N] markers (N = index starting at 0). Output ONLY the translated segments using the exact same [N]...[/N] format, in order.',
+  '4. Do NOT add any explanations, headings, numbering, or markdown fences. Output nothing except the [N]...[/N] segments.',
+  '5. Do not think step by step. Output the translated segments directly.',
+].join('\n');
 
 function buildTranslatePrompt(segments, targetLang) {
   const body = segments.map((s, i) => `[${i}]${s}[/${i}]`).join('\n');
-  return [
-    `Translate the following segments into ${targetLang}.`,
-    'Rules:',
-    `- Each segment is wrapped with [N] and [/N] markers (N = index starting at 0).`,
-    '- Output ONLY the translated segments using the exact same [N]...[/N] format, in order.',
-    '- Do NOT add any explanations, headings, or markdown fences.',
-    '',
-    body,
-  ].join('\n');
+  return `Translate the following segments into ${targetLang}.\n\n${body}`;
 }
 
 function parseTranslateResponse(text, count) {
@@ -147,7 +153,8 @@ async function translateSegments(model, texts, targetLang) {
   if (!client) {
     throw new Error('无法创建翻译客户端');
   }
-  const options = { ...optionsFromModel(model) };
+  // 翻译专用参数：temperature 强制调低（不读取模型配置），其余采样参数沿用配置。
+  const options = { ...optionsFromModel(model), temperature: TRANSLATE_TEMPERATURE };
 
   // 分组成批（每批 TRANSLATE_BATCH 段）
   const batches = [];
@@ -163,7 +170,7 @@ async function translateSegments(model, texts, targetLang) {
       const prompt = buildTranslatePrompt(batch.map(c => c.t), targetLang);
       let out = '';
       try {
-        for await (const c of client.chat({ messages: [{ role: 'user', content: prompt }], stream: false, options })) {
+        for await (const c of client.chat({ messages: [{ role: 'system', content: TRANSLATE_SYSTEM_PROMPT }, { role: 'user', content: prompt }], stream: false, options })) {
           out += (c && c.delta) || '';
         }
       } catch (e) {
@@ -198,6 +205,11 @@ const WHISPER_LANG = {
  * 避免“Chrome MediaRecorder 的 webm 被判为无音频轨道”导致的 HTTP 400；
  * 兼容不支持 stream 的端点（返回普通 JSON 时直接 final）。
  */
+
+// 跨模型轮询计数器：每片从不同的模型起步，把请求均匀分摊到多个 Whisper 模型，
+// 避免全部压在单一模型上触发 429 限流（仍保留片内故障转移兜底）。
+let whisperRR = 0;
+
 async function streamTranscribe(port, msg) {
   const { whisperModelIds, audio, language, mime } = msg;
   // 内容脚本发来的是 Blob（或少数情况下的 ArrayBuffer）。跨进程传输后类型可能变化，
@@ -221,9 +233,14 @@ async function streamTranscribe(port, msg) {
   }
 
   const all = await getWhisperModels();
-  const list = (Array.isArray(whisperModelIds) && whisperModelIds.length)
+  const matched = (Array.isArray(whisperModelIds) && whisperModelIds.length)
     ? all.filter(w => whisperModelIds.includes(w.id) && w.model) : all.filter(w => w.model);
-  if (!list.length) { port.postMessage({ type: 'error', error: '未配置可用的 Whisper 模型' }); return; }
+  if (!matched.length) { port.postMessage({ type: 'error', error: '未配置可用的 Whisper 模型' }); return; }
+  // 轮询负载均衡：本片从 ((whisperRR++) % N) 这个模型起步，把请求分摊到各模型；
+  // 列表仍按“起步模型在前、其余在后”的顺序遍历，故某模型 429/失败时自动故障转移到下一个。
+  const startIdx = whisperRR % matched.length;
+  whisperRR = (whisperRR + 1) % matched.length;
+  const list = matched.map((_, i) => matched[(startIdx + i) % matched.length]);
   const lang = WHISPER_LANG[language] || '';
   const isWav = /wav/i.test(mime || '');
   const fileType = isWav ? 'audio/wav' : 'audio/webm';
@@ -392,8 +409,9 @@ chrome.runtime.onConnect.addListener((port) => {
     port.onMessage.addListener(async (m) => {
       if (!m) return;
       if (m.type === 'AUDIO') {
+        // 音频已在 offscreen 编码为 base64 字符串，sendMessage（JSON 序列化）可可靠传输。
         if (activeCaptionTabId != null) {
-          try { await chrome.tabs.sendMessage(activeCaptionTabId, { type: 'LIVE_CAPTION_AUDIO', blob: m.blob, mime: m.mime }); } catch (_) {}
+          try { await chrome.tabs.sendMessage(activeCaptionTabId, { type: 'LIVE_CAPTION_AUDIO', audioB64: m.audioB64, mime: m.mime }); } catch (_) {}
         }
       } else if (m.type === 'CAPTURE_ERROR') {
         if (activeCaptionTabId != null) {

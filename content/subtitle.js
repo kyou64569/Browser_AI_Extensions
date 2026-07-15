@@ -39,9 +39,15 @@
   let prefetchTimer = null;
 
   // Whisper 转写（音频捕获在 Offscreen 文档完成；这里只把收到的音频片段送转写 + 渲染）
-  let whisperQueue = [];          // 待转写的音频 Blob 队列（顺序处理，避免字幕错乱）
-  let whisperBusy = false;        // 当前是否有切片正在流式转写
-  let whisperPort = null;         // 当前活跃的 Whisper 连接端口（用于 stop 时断开）
+  let whisperQueue = [];          // 待转写的音频 Blob 队列（带序号，按序显示避免字幕错乱）
+  let whisperSeq = 0;             // 下一个待发片的序号
+  let whisperNextShow = 0;        // 下一个应按序显示的序号
+  let whisperActive = 0;          // 当前正在转写的端口数（并发上限控制）
+  let whisperRunning = false;     // pump 循环是否在跑（防重入）
+  const WHISPER_CONCURRENCY = 2; // 同时进行的 Whisper 流式端口数（方案 B：重叠发送消积压）
+  const whisperPorts = new Set(); // 当前活跃端口集合（stop 时统一断开）
+  const whisperDone = new Map();  // seq -> final 文本（已转写完成，等待按序冲刷）
+  const whisperLive = new Map();  // seq -> 当前 partial 文本（用于流式显示）
   let whisperErrored = false;     // 转写失败仅提示一次，避免刷屏
   const MAX_WHISPER_QUEUE = 10;   // Whisper 队列最大长度，防止内存溢出
 
@@ -246,41 +252,97 @@
     return true;
   }
 
-  // 顺序把队列里的音频片发给后台做流式转写：partial 实时更新字幕，final 触发翻译。
-  function enqueueWhisper(blob, mime) {
+  // base64 字符串 → Uint8Array（跨进程音频的统一载体，字符串传输 100% 可靠）
+  function base64ToBytes(b64) {
+    const binary = atob(b64);
+    const len = binary.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  }
+
+  // 把跨进程传来的音频数据统一成“可被 Blob 包裹的二进制”。
+  // 主路径：offscreen 已把音频编码为 base64 字符串（字符串在 sendMessage / 端口里都可靠）。
+  // 同时保留对 ArrayBuffer / Uint8Array / Blob / 普通数字键对象的兼容兜底。
+  function toBytes(audio) {
+    if (audio == null) return null;
+    if (typeof audio === 'string') {
+      try { return base64ToBytes(audio); } catch (_) { return null; }
+    }
+    // ArrayBuffer：直接 instanceof 或按 byteLength + constructor 名称判断，
+    // 规避跨 realm（扩展世界 ↔ 内容脚本隔离世界）instanceof 失效的情形。
+    const isArrayBufferLike = audio instanceof ArrayBuffer
+      || (typeof audio.byteLength === 'number' && !ArrayBuffer.isView(audio)
+          && audio.constructor && /ArrayBuffer/.test(audio.constructor.name));
+    if (isArrayBufferLike) return new Uint8Array(audio);
+    if (ArrayBuffer.isView(audio)) return new Uint8Array(audio.buffer, audio.byteOffset, audio.byteLength);
+    if (audio instanceof Blob) return audio;
+    if (typeof audio === 'object') {
+      const keys = Object.keys(audio).map(Number).filter(n => !isNaN(n)).sort((a, b) => a - b);
+      if (keys.length) {
+        const u8 = new Uint8Array(keys.length);
+        for (let i = 0; i < keys.length; i++) u8[i] = audio[keys[i]];
+        return u8;
+      }
+    }
+    return null;
+  }
+
+  // 把捕获到的音频片送入队列，分配序号后尝试泵流（方案 B：并发泵流）。
+  function enqueueWhisper(audio, mime) {
     if (!active) return; // 防止 stop() 后还塞入队列
     if (whisperQueue.length >= MAX_WHISPER_QUEUE) {
       console.warn('[whisper] Queue full, dropping oldest slice');
       whisperQueue.shift();
     }
-    whisperQueue.push({ blob, mime });
+    whisperQueue.push({ seq: whisperSeq++, audio, mime });
     pumpWhisper();
   }
-  async function pumpWhisper() {
-    if (whisperBusy || !whisperQueue.length) return;
-    whisperBusy = true;
-    const item = whisperQueue.shift();
+
+  // 并发泵流：同时最多开 WHISPER_CONCURRENCY 个 whisper-stream 端口，
+  // 各片重叠发送，避免单片延迟在队列里累积（方案 B）。
+  function pumpWhisper() {
+    if (whisperRunning) return; // 防重入
+    whisperRunning = true;
+    while (whisperQueue.length && whisperActive < WHISPER_CONCURRENCY) {
+      const item = whisperQueue.shift();
+      whisperActive++;
+      runOneWhisper(item).finally(() => {
+        whisperActive--;
+        pumpWhisper();
+      });
+    }
+    whisperRunning = false;
+  }
+
+  // 单端口转写一片：partial 暂存，final/error 标记完成，统一由 flushInOrder 按序冲刷。
+  async function runOneWhisper(item) {
+    const seq = item.seq;
     const port = chrome.runtime.connect({ name: 'whisper-stream' });
-    whisperPort = port;
+    whisperPorts.add(port);
+    let finished = false;
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      whisperPorts.delete(port);
+      whisperLive.delete(seq);
+      try { port.disconnect(); } catch (_) {}
+    };
     port.onMessage.addListener((m) => {
-      if (!active) { port.disconnect(); whisperPort = null; whisperBusy = false; return; }
+      if (!active) { finish(); return; }
       if (m.type === 'partial') {
-        renderStreaming(m.text || '');
+        whisperLive.set(seq, m.text || '');
+        renderLiveForSeq();
       } else if (m.type === 'final') {
         whisperErrored = false;
-        const txt = (m.text || '').trim();
-        if (txt) {
-          showCaption(txt);   // 复用翻译/显示流水线
-        } else {
-          // 该片段无有效语音：清掉仍停留在屏幕上的 partial 残影，避免显示错误的半句字幕
-          currentKey = '';
-          if (origEl) origEl.textContent = '';
-          if (transEl) transEl.textContent = '';
-        }
-        whisperBusy = false; whisperPort = null; port.disconnect(); pumpWhisper();
+        whisperDone.set(seq, (m.text || '').trim());
+        finish();
+        flushInOrder();
       } else if (m.type === 'error') {
         if (!whisperErrored) { whisperErrored = true; showError('Whisper 转写失败：' + m.error); }
-        whisperBusy = false; whisperPort = null; port.disconnect(); pumpWhisper();
+        whisperDone.set(seq, ''); // 标记该片已完成（空），避免卡住后续按序冲刷
+        finish();
+        flushInOrder();
       }
     });
     port.onDisconnect.addListener(() => {
@@ -288,10 +350,23 @@
         whisperErrored = true;
         showError('Whisper 连接断开：' + chrome.runtime.lastError.message);
       }
-      if (whisperBusy) { whisperBusy = false; whisperPort = null; pumpWhisper(); }
+      if (!finished) {
+        whisperDone.set(seq, '');
+        finish();
+        flushInOrder();
+      }
     });
     try {
-      const buf = await item.blob.arrayBuffer();
+      const bytes = toBytes(item.audio);
+      if (!bytes) {
+        console.warn('[whisper] 音频数据无效，跳过该片');
+        whisperDone.set(seq, '');
+        finish();
+        flushInOrder();
+        return;
+      }
+      const blob = (bytes instanceof Blob) ? bytes : new Blob([bytes], { type: item.mime || 'audio/wav' });
+      const buf = await blob.arrayBuffer();
       port.postMessage({
         type: 'slice',
         whisperModelIds: cfg.whisperModelIds || [],
@@ -301,8 +376,33 @@
       });
     } catch (e) {
       console.warn('[whisper] 读取音频数据失败', e);
-      whisperBusy = false; whisperPort = null; port.disconnect(); pumpWhisper();
+      whisperDone.set(seq, '');
+      finish();
+      flushInOrder();
     }
+  }
+
+  // 按序号顺序冲刷已完成的转写结果，保证字幕不乱序。
+  function flushInOrder() {
+    while (whisperDone.has(whisperNextShow)) {
+      const txt = whisperDone.get(whisperNextShow);
+      whisperDone.delete(whisperNextShow);
+      whisperNextShow++;
+      if (txt) {
+        showCaption(txt);   // 复用翻译/显示流水线
+      } else {
+        // 该片段无有效语音：清掉仍停留在屏幕上的 partial 残影，避免显示错误的半句字幕
+        currentKey = '';
+        if (origEl) origEl.textContent = '';
+        if (transEl) transEl.textContent = '';
+      }
+    }
+    renderLiveForSeq();
+  }
+
+  // 流式显示：只展示“下一个待显示序号”那片的 partial，避免并发片的残影互相覆盖。
+  function renderLiveForSeq() {
+    renderStreaming(whisperLive.get(whisperNextShow) || '');
   }
   // 流式 partial：原文逐字刷新（双语模式显示原文 + "…"占位译文；单语模式直接显示）
   function renderStreaming(text) {
@@ -339,9 +439,9 @@
       sendResponse({ ok: true });
       return true;
     }
-    // Offscreen 文档捕获到的音频片段 → 送 Whisper 转写
+    // Offscreen 文档捕获到的音频片段（base64 字符串）→ 送 Whisper 转写
     if (msg.type === 'LIVE_CAPTION_AUDIO') {
-      enqueueWhisper(msg.blob, msg.mime);
+      enqueueWhisper(msg.audioB64, msg.mime);
       return;
     }
     // Offscreen 捕获失败（如权限不足 / activeTab 未授权）→ 仅提示，不阻塞
@@ -395,15 +495,18 @@
 
   function stop() {
     active = false;
-    // 先断开活跃的 Whisper 端口，阻止后续回调访问已销毁的 DOM
-    if (whisperPort) { try { whisperPort.disconnect(); } catch (_) {} whisperPort = null; }
+    // 先断开所有活跃的 Whisper 端口，阻止后续回调访问已销毁的 DOM
+    whisperPorts.forEach((p) => { try { p.disconnect(); } catch (_) {} });
+    whisperPorts.clear();
     if (captionObserver) { captionObserver.disconnect(); captionObserver = null; }
     if (captionPoller) { clearInterval(captionPoller); captionPoller = null; }
     if (trackWatch) { try { trackWatch.track.removeEventListener('cuechange', trackWatch.onCue); } catch (_) {} trackWatch = null; }
     if (prefetchTimer) { clearInterval(prefetchTimer); prefetchTimer = null; }
     // 通知后台停止 offscreen 音频捕获并关闭离屏文档，释放标签页音频、恢复原生声音
     try { chrome.runtime.sendMessage({ type: 'LIVE_CAPTION_STOP_CAPTURE' }); } catch (_) {}
-    whisperQueue = []; whisperBusy = false;
+    whisperQueue = []; whisperActive = 0; whisperRunning = false;
+    whisperSeq = 0; whisperNextShow = 0;
+    whisperDone.clear(); whisperLive.clear();
     if (batchTimer) { clearTimeout(batchTimer); batchTimer = null; }
     pendingBatch = []; currentKey = ''; cacheKeys.length = 0;
     if (overlay && overlay.parentNode) overlay.parentNode.removeChild(overlay);

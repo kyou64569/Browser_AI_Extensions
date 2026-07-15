@@ -11,15 +11,16 @@
 //
 // 注意：Offscreen 文档只能使用 chrome.runtime API，故音频片段经 chrome.runtime 端口回传 SW。
 
-const WHISPER_SLICE_MS = 4000;      // 每片时长
-const WHISPER_MIN_BLOB_SIZE = 1024; // 静音片段（过小）直接跳过，省额度
+const WHISPER_SLICE_MS = 2000;      // 每片（发送窗口）时长：连续捕获，按此周期切窗编码发送
+const WHISPER_PCM_SILENCE = 0.001;  // 窗口峰值低于此值视为静音，跳过发送省额度
 
 let capStream = null;     // 捕获到的标签页音频流
-let capAudioCtx = null;   // Web Audio 上下文（恢复被静音的标签页声音）
-let capRec = null;        // 当前 MediaRecorder
-let capSliceTimer = null;
+let capAudioCtx = null;   // Web Audio 上下文（恢复被静音的标签页声音 + 抓取 PCM）
+let capPcmNode = null;    // ScriptProcessorNode（持续抓取 PCM）
+let capPcmBuf = [];       // 当前窗口内累积的 Float32 帧（滑动窗口缓冲）
+let capPcmLen = 0;        // 当前窗口已累积样本数
+let capSliceTimer = null; // 切窗发送定时器（方案 C：setInterval）
 let capActive = false;
-let wavDecodeCtx = null;  // 持久 AudioContext，用于 webm→WAV 解码
 
 let swPort = null;        // 与 SW 的端口
 
@@ -67,76 +68,94 @@ function restoreTabAudio(stream) {
   } catch (_) { capAudioCtx = null; }
 }
 
+// 方案 C：用 Web Audio 直接抓取 PCM（而非 MediaRecorder 的 webm 分片）。
+// 原因：MediaRecorder 多块拼出的 webm 只有首块带文件头，后续窗口缺头无法解码（报 decode 错误）。
+// 改抓 PCM 后，每个窗口独立编码成合法的 WAV，全程连续、无 stop/start 空缺，且绝不会出现解码失败。
 function startSlice() {
   if (!capActive || !capStream) return;
-  let rec;
-  try {
-    const opts = (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported
-      && MediaRecorder.isTypeSupported('audio/webm')) ? { mimeType: 'audio/webm' } : undefined;
-    rec = new MediaRecorder(capStream, opts);
-  } catch (e) {
-    try { rec = new MediaRecorder(capStream); }
-    catch (e2) { console.warn('[offscreen] MediaRecorder 不支持任何音频格式', e2); return; }
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) { console.warn('[offscreen] 无 AudioContext，无法捕获'); return; }
+  if (!capAudioCtx) { // restoreTabAudio 已建好则复用，否则自建
+    try { capAudioCtx = new AC(); } catch (_) { console.warn('[offscreen] AudioContext 创建失败'); return; }
   }
-  capRec = rec;
-  const chunks = [];
-  rec.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data); };
-  rec.onerror = (e) => { console.warn('[offscreen] MediaRecorder error', e); };
-  rec.onstop = async () => {
-    const blob = new Blob(chunks, { type: 'audio/webm' });
-    if (blob.size >= WHISPER_MIN_BLOB_SIZE) { // 静音片段：跳过，省额度
-      let sendBlob = blob, mime = 'audio/webm';
-      try {
-        const wav = await toWav(blob); // webm/opus → WAV（可靠解析，避免 400）
-        sendBlob = wav; mime = 'audio/wav';
-      } catch (e) {
-        console.warn('[offscreen] webm→wav 失败，回退原始 webm', e);
-      }
-      if (swPort) swPort.postMessage({ type: 'AUDIO', blob: sendBlob, mime });
+  try {
+    const src = capAudioCtx.createMediaStreamSource(capStream);
+    // 抓取 PCM：ScriptProcessor 必须接在图中才会触发 onaudioprocess，
+    // 用静音增益接回 destination，避免重复出声（恢复声音由 restoreTabAudio 单独负责）。
+    const node = capAudioCtx.createScriptProcessor(4096, 1, 1);
+    capPcmNode = node;
+    capPcmBuf = [];
+    capPcmLen = 0;
+    node.onaudioprocess = (ev) => {
+      if (!capActive) return;
+      const ch = ev.inputBuffer.getChannelData(0);
+      capPcmBuf.push(new Float32Array(ch)); // 复制，避免被复用
+      capPcmLen += ch.length;
+    };
+    const silent = capAudioCtx.createGain();
+    silent.gain.value = 0;
+    src.connect(node);
+    node.connect(silent);
+    silent.connect(capAudioCtx.destination);
+    if (capAudioCtx.state === 'suspended') capAudioCtx.resume().catch(() => {});
+  } catch (e) {
+    console.warn('[offscreen] PCM 捕获初始化失败', e);
+    return;
+  }
+  capSliceTimer = setInterval(sendWindow, WHISPER_SLICE_MS);
+}
+
+// 把当前窗口内累积的 PCM 帧编码成 WAV 发送给 SW（内容脚本 → Whisper 转写）
+async function sendWindow() {
+  if (!capActive || !capAudioCtx) return;
+  const frames = capPcmBuf;
+  capPcmBuf = []; // 立即开新窗口，避免与正在进行的编码重叠累积
+  const total = capPcmLen;
+  capPcmLen = 0;
+  if (!frames.length || !total) return;
+  const data = new Float32Array(total);
+  let off = 0;
+  for (const f of frames) { data.set(f, off); off += f.length; }
+  // 静音窗口：峰值过低则跳过，省额度
+  let peak = 0;
+  for (let i = 0; i < data.length; i += 257) { const a = Math.abs(data[i]); if (a > peak) peak = a; }
+  if (peak < WHISPER_PCM_SILENCE) return;
+  // 直接编码 WAV（无需 webm 解码，彻底规避 decode 错误）
+  try {
+    const ab = capAudioCtx.createBuffer(1, total, capAudioCtx.sampleRate);
+    ab.copyToChannel(data, 0);
+    const wav = encodeWav(ab);
+    if (swPort) {
+      const buf = await wav.arrayBuffer();
+      const b64 = bufToBase64(buf);
+      // 音频编码为 base64 字符串再发送：跨进程消息对二进制（Blob/ArrayBuffer）不可靠，
+      // base64 是普通字符串，可 100% 可靠传输，内容脚本再解码回字节。
+      swPort.postMessage({ type: 'AUDIO', audioB64: b64, mime: 'audio/wav' });
     }
-    if (capActive) capSliceTimer = setTimeout(startSlice, 0); // 紧接着录下一片
-  };
-  if (!capActive || !capStream) return;
-  try { rec.start(); } catch (e) { console.warn('[offscreen] 录制失败', e); return; }
-  capSliceTimer = setTimeout(() => { try { capRec && capRec.stop(); } catch (_) {} }, WHISPER_SLICE_MS);
+  } catch (e) {
+    console.warn('[offscreen] 编码/发送 WAV 失败，跳过该片', e);
+  }
 }
 
 function stopCapture() {
   capActive = false;
-  if (capSliceTimer) { clearTimeout(capSliceTimer); capSliceTimer = null; }
-  if (capRec) { try { capRec.stop(); } catch (_) {} capRec = null; }
+  if (capSliceTimer) { clearInterval(capSliceTimer); capSliceTimer = null; }
+  if (capPcmNode) { try { capPcmNode.disconnect(); } catch (_) {} capPcmNode = null; }
+  capPcmBuf = []; capPcmLen = 0;
   if (capAudioCtx) { try { capAudioCtx.close(); } catch (_) {} capAudioCtx = null; }
   if (capStream) { capStream.getTracks().forEach(t => t.stop()); capStream = null; }
-  if (wavDecodeCtx) { try { wavDecodeCtx.close(); } catch (_) {} wavDecodeCtx = null; }
 }
 
 // ---------- webm/opus → WAV(PCM16) ----------
-async function toWav(blob) {
-  const raw = await blob.arrayBuffer();
-  const copy = raw.slice(0); // decodeAudioData 会 detach，每次用独立副本
-  const AC = window.AudioContext || window.webkitAudioContext;
-  const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
-  let audioBuf = null;
-  if (AC) {
-    try {
-      if (!wavDecodeCtx) {
-        wavDecodeCtx = new AC();
-        try { if (wavDecodeCtx.state === 'suspended') await wavDecodeCtx.resume(); } catch (_) {}
-      }
-      audioBuf = await wavDecodeCtx.decodeAudioData(copy);
-    } catch (e) {
-      console.warn('[offscreen] 持久 AudioContext decode 失败，尝试 OfflineAudioContext', e);
-    }
+// ArrayBuffer → base64 字符串（分块避免 String.fromCharCode 调用栈溢出）。
+function bufToBase64(buf) {
+  const bytes = new Uint8Array(buf);
+  let binary = '';
+  const CHUNK = 0x8000; // 32KB
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
   }
-  if (!audioBuf && OAC) {
-    const ctx = new OAC(1, 44100 * 60, 44100);
-    audioBuf = await ctx.decodeAudioData(copy);
-  }
-  if (!audioBuf) throw new Error('无可用的 AudioContext/OfflineAudioContext');
-  if (!audioBuf.length || audioBuf.duration <= 0) {
-    throw new Error('解码后的音频无有效采样（可能是静音段）');
-  }
-  return encodeWav(audioBuf);
+  return btoa(binary);
 }
 
 function encodeWav(audioBuffer) {
