@@ -8,6 +8,7 @@ import { LocalKbConnector } from '../connectors/local-kb.js';
 import { OnlineKbConnector } from '../connectors/online-kb.js';
 import { execTool } from './web-tools.js';
 import { createClient } from '../core/model-client.js';
+import { chunkUnits, RateGate } from '../core/translate-rate.js';
 import { hasCred, optionsFromModel } from '../shared/utils.js';
 
 /** Chrome 内部页面（无法注入 content script，也无法被 tabCapture 捕获音频） */
@@ -104,11 +105,18 @@ async function runSummarize(port) {
 // 网页翻译：content script 收集页面文本节点后，分批交给所选模型翻译。
 // 每段用 [N]…[/N] 包裹，要求模型仅返回同格式译文，便于稳定解析。
 // ============================================================
-// 每批段数：从 100 降到 40。原因（见网页翻译“只翻一半/漏地方”问题）：
-// ① 弱/便宜模型在大批次里会“中间丢失”段落（lost-in-the-middle）；
-// ② 100 段塞一条 prompt 的输出易超厂商默认 max_tokens 被截断 → 字面“翻一半”。
-// 40 是兼顾“弱模型可靠性”与“免费额度调用次数（如 Gemini 免费仅 15 RPM）”的折中。
-const TRANSLATE_BATCH = 40;
+// 每批 token 预算（软上限）：按估算 token 数分块，而非固定段数。
+// 兼顾“弱模型可靠性”（单批别太大，避免 lost-in-the-middle / 输出截断）
+// 与“免费额度 TPM/RPM”（单批别太小，减少调用次数）。句/段边界切分见 core/translate-rate.js。
+const MAX_BATCH_TOKENS = 2200;
+// 动态并发范围：在 TPM 配额允许内适度并发以提速；监控配额占用与 429 自适应下调（优化需求 5）。
+const INITIAL_CONCURRENCY = 2;
+const MIN_CONCURRENCY = 1;
+const MAX_CONCURRENCY = 6;
+// 模型未显式配置 tpm/rpm 时的宽松默认：基本不主动限流，
+// 真正保护来自“429 自适应下调 + 退避重试”（见 RateGate.onTokenRateLimit）。如显式配置则按真实配额限流。
+const DEFAULT_TPM = 1000000;
+const DEFAULT_RPM = 60;
 // 翻译是确定性任务，temperature 不读取模型配置，强制调低以减少漏翻/幻觉式复制原文。
 const TRANSLATE_TEMPERATURE = 0.1;
 // 输出 token 上限（按每批输入长度动态估算并夹在 [MIN,MAX] 内）。
@@ -173,6 +181,40 @@ async function chatAllWithRetry(client, params) {
   throw lastErr;
 }
 
+// 流式收集 + 429 重试（与 chatAllWithRetry 同款重试策略），并在每个增量到达时回调 onDelta(累计文本)。
+// 用于翻译进度：让慢模型在整批返回前也能持续回报“句子单元级”进度，而不是长时间卡在 0%。
+async function chatStreamWithRetry(client, params, onDelta) {
+  const MAX_ROUNDS = 3;
+  let lastErr;
+  for (let round = 0; round < MAX_ROUNDS; round++) {
+    try {
+      let out = '';
+      for await (const c of client.chat(params)) {
+        out += (c && c.delta) || '';
+        if (onDelta) onDelta(out);
+      }
+      return out;
+    } catch (e) {
+      lastErr = e;
+      if (round < MAX_ROUNDS - 1 && isRateLimit(e)) {
+        const explicit = parseRetryAfterSec(e);
+        if (isTokenRateLimit(e)) {
+          const wait = (explicit != null ? explicit : 25) * 1000;
+          console.warn(`[429 TPM·流式] 退避 ${Math.round(wait / 1000)}s 后重试（第 ${round + 1}/${MAX_ROUNDS - 1} 轮）`);
+          await sleep(wait);
+        } else {
+          const base = 800 * (round + 1);
+          const wait = explicit != null ? explicit * 1000 : base;
+          await sleep(wait);
+        }
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw lastErr;
+}
+
 // 强约束放进 system，比只放 user 更能约束中小模型，从根源降低“照抄原文不翻译”的概率。
 const TRANSLATE_SYSTEM_PROMPT = [
   'You are a professional real-time subtitle translator.',
@@ -223,16 +265,163 @@ function parseTranslateResponse(text, count) {
   return map;
 }
 
-async function translateSegments(model, texts, targetLang) {
+// 统计流式输出文本里已完整闭合的 [N]…[/N] 单元数。
+// 翻译提示词要求模型按 0,1,2… 顺序输出带标记分段，故从 0 起顺序统计“已闭合”的单元数，
+// 即可在流式翻译过程中做“句子单元级”进度插值（慢模型在整批返回前也能持续向前推进）。
+function countClosedUnits(raw, fromIdx = 0) {
+  if (!raw) return 0;
+  let count = fromIdx, idx = fromIdx;
+  while (true) {
+    const open = raw.indexOf('[' + idx + ']', count ? 0 : 0);
+    if (open === -1) break;
+    const close = raw.indexOf('[/' + idx + ']', open);
+    if (close === -1) break;
+    count++;
+    idx++;
+  }
+  return count;
+}
+
+// ---------- 可持久化翻译缓存（跨刷新 / 跨标签页复用，满足「增量翻译 + 缓存」）----------
+// 缓存键为「原文文本」，值为「整项译文」。命中即跳过模型调用；翻译成功后写回。
+// 仅对网页翻译开启（字幕碎片上下文相关，关闭缓存避免陈旧/误译复用）。
+const TRANSLATE_CACHE_KEY = 'translateCache';
+const TRANSLATE_CACHE_MAX = 3000; // LRU 上限，超出从头淘汰
+let _cacheMem = null;             // Map<string,string>
+let _cacheLoading = null;
+let _cacheDirty = false;
+
+async function loadTranslateCache() {
+  if (_cacheMem) return _cacheMem;
+  if (_cacheLoading) return _cacheLoading;
+  _cacheLoading = (async () => {
+    try {
+      const r = await chrome.storage.local.get(TRANSLATE_CACHE_KEY);
+      _cacheMem = new Map(Object.entries(r[TRANSLATE_CACHE_KEY] || {}));
+    } catch (_) {
+      _cacheMem = new Map();
+    }
+    return _cacheMem;
+  })();
+  return _cacheLoading;
+}
+async function persistTranslateCache() {
+  if (!_cacheMem || !_cacheDirty) return;
+  try {
+    while (_cacheMem.size > TRANSLATE_CACHE_MAX) {
+      const k = _cacheMem.keys().next().value;
+      _cacheMem.delete(k);
+    }
+    // 按字节大小预检，避免超出 chrome.storage.local 配额（~5MB，与全扩展共享）
+    const payload = JSON.stringify(Object.fromEntries(_cacheMem));
+    if (payload.length > 4_500_000) {
+      // 超出配额时按字节淘汰最老项直到安全线
+      const entries = [..._cacheMem.entries()];
+      _cacheMem.clear();
+      for (const [k, v] of entries) {
+        const next = JSON.stringify({ ...Object.fromEntries(_cacheMem), [k]: v });
+        if (next.length > 4_000_000) break;
+        _cacheMem.set(k, v);
+      }
+      console.warn('[cache] 超出存储配额，已按字节淘汰部分缓存（当前约 ' + Math.round(JSON.stringify(Object.fromEntries(_cacheMem)).length / 1024) + ' KB）');
+    }
+    await chrome.storage.local.set({ [TRANSLATE_CACHE_KEY]: Object.fromEntries(_cacheMem) });
+    _cacheDirty = false;  // 仅在写入成功后清除脏标记
+  } catch (e) {
+    console.warn('[cache] 持久化失败，下次重试：', e && e.message);
+  }
+}
+function cacheGet(text) {
+  if (!_cacheMem) return undefined;
+  const v = _cacheMem.get(text);
+  if (v !== undefined) { _cacheMem.delete(text); _cacheMem.set(text, v); } // 提到最近
+  return v;
+}
+function cacheSet(text, val) {
+  if (!_cacheMem) return;
+  if (_cacheMem.has(text)) _cacheMem.delete(text);
+  _cacheMem.set(text, val);
+  _cacheDirty = true;
+}
+
+// ---------- 每模型 TPM/RPM 限流门（会话内持久，支持 429 自适应下调）----------
+const _gates = new Map();
+function getRateGate(model) {
+  const id = model.id || model.model || 'default';
+  let g = _gates.get(id);
+  if (!g) {
+    const tpm = (typeof model.tpm === 'number' && model.tpm > 0) ? model.tpm : DEFAULT_TPM;
+    const rpm = (typeof model.rpm === 'number' && model.rpm > 0) ? model.rpm : DEFAULT_RPM;
+    g = new RateGate({ tpm, rpm });
+    _gates.set(id, g);
+  }
+  return g;
+}
+
+// 单批翻译 + 遗漏防护：解析失败/为空的单元单独重试（最多 2 轮），降低漏翻（优化需求 4）。
+// 返回与 units 等长的译文数组（缺失单元保留原文）。
+async function translateChunkWithRetry(client, baseOptions, units, targetLang, onStream) {
+  const doOne = async (us) => {
+    const inChars = us.reduce((s, u) => s + (u.text ? u.text.length : 0), 0);
+    const maxTokens = Math.min(MAX_TRANS_TOKENS, Math.max(MIN_TRANS_TOKENS, Math.ceil(inChars * TRANS_TOKENS_PER_CHAR)));
+    const prompt = buildTranslatePrompt(us.map(u => u.text), targetLang);
+    const params = {
+      messages: [{ role: 'system', content: TRANSLATE_SYSTEM_PROMPT }, { role: 'user', content: prompt }],
+      // 翻译默认走流式（模型支持时）：逐增量回报，使慢模型进度条持续前进而非卡在 0%。
+      stream: !!(client.config && client.config.supportsStream),
+      options: { ...baseOptions, maxTokens },
+    };
+    let raw;
+    if (params.stream) {
+      raw = await chatStreamWithRetry(client, params, onStream);
+    } else {
+      raw = await chatAllWithRetry(client, params);
+      if (onStream) onStream(raw); // 非流式模型：整批完成后回报一次（至少能推进到本批）
+    }
+    return { parsed: parseTranslateResponse(raw, us.length), raw };
+  };
+  const first = await doOne(units);
+  const parsed = first.parsed;
+  let lastRaw = first.raw;
+  // 收集解析失败/空的单元位置
+  let missing = [];
+  for (let k = 0; k < units.length; k++) {
+    if (parsed[k] == null || !parsed[k].trim()) missing.push(k);
+  }
+  let round = 0;
+  while (missing.length && round < 2) {
+    const subUnits = missing.map(k => units[k]);
+    const sub = await doOne(subUnits);
+    lastRaw = sub.raw;
+    const stillMissing = [];
+    missing.forEach((k, j) => {
+      if (sub.parsed[j] != null && sub.parsed[j].trim()) parsed[k] = sub.parsed[j].trim();
+      else stillMissing.push(k);
+    });
+    missing = stillMissing;
+    round++;
+  }
+  // 单段兜底：弱模型完全不遵守 [N][/N] 时，用整段原始输出（parseTranslateResponse 行序兜底已覆盖大部分）
+  if (units.length === 1 && (!parsed[0] || !parsed[0].trim())) {
+    const flat = (lastRaw || '').trim();
+    if (flat) parsed[0] = flat;
+  }
+  return parsed;
+}
+
+async function translateSegments(model, texts, targetLang, opts = {}) {
+  const useCache = opts.useCache !== false;
+  // 进度回调（可选）：在顶部定义，确保早期 return（缓存命中/无需翻译）也能回传“完成”信号给侧边栏
+  const onProgress = (typeof opts.onProgress === 'function') ? opts.onProgress : null;
   const result = texts.slice();
   const items = [];
-  texts.forEach((t, i) => { if (t && t.trim()) items.push({ i, t }); });
-  if (!items.length) return result;
+  texts.forEach((t, i) => { if (t && String(t).trim()) items.push({ i, t: String(t) }); });
+  if (!items.length) { if (useCache) await persistTranslateCache(); if (onProgress) onProgress({ phase: 'done', done: 0, total: 0, message: '无需翻译' }); return result; }
+
   let client;
   try { client = createClient(model); } catch (e) { throw new Error('翻译模型配置无效：' + e.message); }
-  if (!client) {
-    throw new Error('无法创建翻译客户端');
-  }
+  if (!client) throw new Error('无法创建翻译客户端');
+
   // 翻译专用参数：temperature 强制调低（不读取模型配置），其余采样参数沿用配置。
   // 注意：故意不读模型配置的 maxTokens —— 弱模型若未配置会落到厂商默认的小值，已用动态估算替代。
   const baseOptions = { ...optionsFromModel(model), temperature: TRANSLATE_TEMPERATURE };
@@ -241,42 +430,134 @@ async function translateSegments(model, texts, targetLang) {
   // 关闭后既省 token 又避免限流，且不影响正常翻译速度（adapter 仅在 thinkingStrength && !== 'off' 时发 reasoning_effort）。
   delete baseOptions.thinkingStrength;
 
-  // 分组成批（每批 TRANSLATE_BATCH 段）
-  const batches = [];
-  for (let s = 0; s < items.length; s += TRANSLATE_BATCH) {
-    batches.push(items.slice(s, s + TRANSLATE_BATCH));
+  // 1) 持久化缓存命中：仅翻译未命中项（增量翻译，避免重复请求）
+  if (useCache) {
+    await loadTranslateCache();
+    const stillUncached = [];
+    for (const it of items) {
+      const cached = cacheGet(it.t);
+      if (cached !== undefined && cached !== '') result[it.i] = cached;
+      else stillUncached.push(it);
+    }
+    if (!stillUncached.length) { await persistTranslateCache(); if (onProgress) onProgress({ phase: 'done', done: 0, total: 0, message: '已完成（全部命中缓存）' }); return result; }
+    items.length = 0;
+    items.push(...stillUncached);
   }
 
-  // 并发发送，最大 2 批同时进行（减小整体等待时间，同时避免触发免费额度频率限制，如 Gemini 15 RPM）。
-  const CONCURRENCY = 2;
-  for (let b = 0; b < batches.length; b += CONCURRENCY) {
-    const chunk = batches.slice(b, b + CONCURRENCY);
-    await Promise.all(chunk.map(async (batch) => {
-      const prompt = buildTranslatePrompt(batch.map(c => c.t), targetLang);
-      // 按本批输入长度动态估算输出上限，防止被截断（根治“翻一半”）。下限保证哪怕很短的批也有余量。
-      const inChars = batch.reduce((s, c) => s + (c.t ? c.t.length : 0), 0);
+  // 2) 按 token 预算分块（句/段边界切分，避免破坏语义）—— 优化需求 1
+  const chunks = chunkUnits(items, MAX_BATCH_TOKENS);
+  if (!chunks.length) { if (useCache) await persistTranslateCache(); if (onProgress) onProgress({ phase: 'done', done: 0, total: 0, message: '已完成' }); return result; }
+
+  // 3) 速率门（按模型 TPM/RPM 主动限流；未配置则用宽松默认 + 429 自适应下调）—— 优化需求 2
+  const gate = getRateGate(model);
+  // 注：onProgress 已在函数顶部定义（让缓存命中/无需翻译等早期 return 也能回传进度）。
+
+  // 4) 并发执行：动态并发 + 每批遗漏校验/重试 + TPM 自适应 —— 优化需求 4/5
+  const byItem = new Map(); // itemIndex -> [{partIndex, text, sep}]
+  let currentMax = INITIAL_CONCURRENCY;
+  let nextIdx = 0;
+  let activeCount = 0;
+  let doneCount = 0;
+  const total = chunks.length;
+  // 进度按“句子单元”粒度统计（比按批更细），慢模型也能看到明显推进，而非长时间卡在 0%
+  const totalUnits = chunks.reduce((s, c) => s + c.length, 0);
+  let translatedUnits = 0;
+  let maxReported = 0; // 保证进度单调不减（多批并发时各批回报值可能交错，避免进度条回退）
+  let goodStreak = 0;
+  let fallbackUnits = 0; // 翻译失败/保留原文（遗漏防护计数）
+
+  // 统一的进度回报：done 单调不减函数，indeterminate 表示“仍在等待首帧反馈”（慢模型动画态）
+  const reportProgress = (done, indeterminate) => {
+    if (!onProgress) return;
+    const clamped = Math.max(maxReported, Math.min(totalUnits, done | 0));
+    if (clamped > maxReported) maxReported = clamped;
+    onProgress({ phase: 'translate', done: clamped, total: totalUnits, message: `翻译中… ${clamped}/${totalUnits}`, indeterminate: !!indeterminate });
+  };
+
+  if (onProgress) onProgress({ phase: 'start', done: 0, total: totalUnits, message: '准备翻译…', indeterminate: true });
+
+  await new Promise((resolve) => {
+    const pump = () => {
+      while (activeCount < currentMax && nextIdx < total) {
+        const idx = nextIdx++;
+        activeCount++;
+        runChunk(idx).catch((e) => { console.error('[translate] chunk 执行异常', e); }).finally(() => {
+          activeCount--;
+          doneCount++;
+          if (doneCount >= total) resolve();
+          else pump();
+        });
+      }
+      if (doneCount >= total) resolve();
+    };
+
+    async function runChunk(idx) {
+      const chunk = chunks[idx];
+      const inTok = chunk.reduce((s, u) => s + u.tok, 0);
+      const inChars = chunk.reduce((s, u) => s + (u.text ? u.text.length : 0), 0);
       const maxTokens = Math.min(MAX_TRANS_TOKENS, Math.max(MIN_TRANS_TOKENS, Math.ceil(inChars * TRANS_TOKENS_PER_CHAR)));
-      const options = { ...baseOptions, maxTokens };
-      let out = '';
+      // 预约额度：输入 token + 输出预估(0.6*maxTokens) + prompt 开销，TPM 取二者之和做保守预算
+      const reserveTokens = inTok + Math.ceil(maxTokens * 0.6) + 250;
+      const t0 = Date.now();
+      let waited = 0;
+      try { waited = await gate.reserve(reserveTokens); } catch (_) { waited = Date.now() - t0; }
+      let hadTPM = false;
+      // 流式进度回调：用 lastClosedCount 累积计数，只对每个 delta 的增量内容扫描，避免 O(n²)
+      let lastClosedCount = 0;
+      const onStream = (raw) => {
+        const partial = countClosedUnits(raw, lastClosedCount);
+        lastClosedCount = partial;
+        reportProgress(translatedUnits + partial, false);
+      };
       try {
-        out = await chatAllWithRetry(client, { messages: [{ role: 'system', content: TRANSLATE_SYSTEM_PROMPT }, { role: 'user', content: prompt }], stream: false, options });
+        const parsed = await translateChunkWithRetry(client, baseOptions, chunk, targetLang, onStream);
+        chunk.forEach((u, k) => {
+          const tr = (parsed[k] != null && parsed[k].trim() !== '') ? parsed[k].trim() : u.text;
+          if (tr === u.text) fallbackUnits++; // 未能翻译，保留原文（遗漏计数）
+          if (!byItem.has(u.itemIndex)) byItem.set(u.itemIndex, []);
+          byItem.get(u.itemIndex).push({ partIndex: u.partIndex, text: tr, sep: u.sep });
+        });
+        // 本批完成：累加单元数并回报一个确定到本批终点的进度（与流式插值平滑衔接）
+        translatedUnits += chunk.length;
+        reportProgress(translatedUnits, false);
       } catch (e) {
-        console.error('Translation batch failed:', e);
-        return; // 整批失败（含 429 重试后仍失败）：保留原文，不中断其它批次
+        if (isTokenRateLimit(e)) { hadTPM = true; gate.onTokenRateLimit(); }
+        // 整批失败（含 TPM 重试后仍失败）：保留原文，不中断其它批次
+        chunk.forEach((u) => {
+          if (!byItem.has(u.itemIndex)) byItem.set(u.itemIndex, []);
+          byItem.get(u.itemIndex).push({ partIndex: u.partIndex, text: u.text, sep: u.sep });
+        });
+        console.error('[translate] 整批翻译失败，保留原文：', e && e.message);
       }
-      const parsed = parseTranslateResponse(out, batch.length);
-      batch.forEach((c, k) => {
-        const tr = parsed[k];
-        result[c.i] = (tr != null && tr.trim() !== '') ? tr.trim() : c.t;
-      });
-      // 单段且解析失败时，退化为整段输出（模型未遵守 [N][/N] 格式）
-      if (batch.length === 1 && (!parsed[0] || !parsed[0].trim())) {
-        const flat = out.trim();
-        if (flat) result[batch[0].i] = flat;
-      }
-    }));
+      // 动态调整并发（监控配额占用与 429）—— 优化需求 5
+      if (hadTPM) { currentMax = Math.max(MIN_CONCURRENCY, currentMax - 1); goodStreak = 0; }
+      else if (waited > 1500) { currentMax = Math.max(MIN_CONCURRENCY, currentMax - 1); }
+      else { goodStreak++; if (goodStreak >= 3) { currentMax = Math.min(MAX_CONCURRENCY, currentMax + 1); goodStreak = 0; } }
+    }
+
+    pump();
+  });
+
+  if (onProgress) onProgress({ phase: 'done', done: totalUnits, total: totalUnits, message: '翻译完成' });
+
+  // 5) 跨块重排并拼回每个原始项（同一项被拆到多处/多批时按 partIndex 排序拼接）
+  for (const [itemIndex, parts] of byItem) {
+    parts.sort((a, b) => a.partIndex - b.partIndex);
+    const joined = parts.map(p => (p.text || '') + (p.sep || '')).join('');
+    if (joined.trim()) result[itemIndex] = joined;
   }
 
+  // 6) 写回持久化缓存（仅记录确实翻译成功、且与原文不同的项）
+  if (useCache) {
+    for (const it of items) {
+      const v = result[it.i];
+      if (v && v.trim() && v !== it.t) cacheSet(it.t, v);
+    }
+    await persistTranslateCache();
+  }
+
+  // 遗漏防护日志：result 与输入等长保证区块数一致；此处记录未能翻译的单元数以便排查
+  if (fallbackUnits > 0) console.warn(`[translate] 完成：${items.length} 项（${chunks.length} 批），约 ${fallbackUnits} 个单元未能翻译、保留原文`);
   return result;
 }
 
@@ -649,7 +930,7 @@ chrome.runtime.onConnect.addListener((port) => {
 });
 
 // 网页翻译/字幕翻译：统一处理文本翻译请求（去重 model 选择 + credential 检查）
-async function handleTranslateBatch(modelId, targetLang, items, errLabel) {
+async function handleTranslateBatch(modelId, targetLang, items, errLabel, opts = {}) {
   if (!Array.isArray(items)) return { ok: false, error: `参数错误：${items === 'texts' ? 'texts' : 'lines'} 必须是数组` };
   const models = await getModels();
   const model = models.find(m => m.id === modelId)
@@ -657,7 +938,7 @@ async function handleTranslateBatch(modelId, targetLang, items, errLabel) {
     || models.find(m => m.enabled !== false);
   if (!model) return { ok: false, error: '未找到可用翻译模型，请先在设置添加模型' };
   if (!hasCred(model)) return { ok: false, error: '翻译模型缺少有效凭证（API Key）' };
-  const translations = await translateSegments(model, items, targetLang || '中文（简体）');
+  const translations = await translateSegments(model, items, targetLang || '中文（简体）', opts);
   return { ok: true, translations };
 }
 
@@ -746,10 +1027,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg.type === 'TRANSLATE_PAGE') {
     (async () => {
+      // 进度回传：SW 直接发往扩展页面（侧边栏/弹窗），不经 content 脚本中转。
+      // 原因：content 脚本在 await TRANSLATE_PAGE 响应期间自身被阻塞，经它中转的进度消息易丢失，
+      // 导致侧边栏只看到初始 0% 然后直接“完成”。直接回传最可靠。
+      const onProgress = (p) => {
+        try { chrome.runtime.sendMessage({ type: 'WEB_TRANSLATE_PROGRESS', payload: p }, () => { void chrome.runtime.lastError; }); }
+        catch (_) { /* 侧边栏未打开时忽略 */ }
+      };
       try {
         const { modelId, targetLang, texts } = msg;
         if (!Array.isArray(texts)) { sendResponse({ ok: false, error: '参数错误：texts 必须是数组' }); return; }
-        const result = await handleTranslateBatch(modelId, targetLang, texts);
+        const result = await handleTranslateBatch(modelId, targetLang, texts, null, { onProgress });
         sendResponse(result);
       } catch (e) {
         sendResponse({ ok: false, error: (e && e.message) ? e.message : '翻译失败' });
@@ -815,7 +1103,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       try {
         const { modelId, targetLang, lines } = msg;
         if (!Array.isArray(lines)) { sendResponse({ ok: false, error: '参数错误：lines 必须是数组' }); return; }
-        const result = await handleTranslateBatch(modelId, targetLang, lines);
+        // 字幕碎片上下文相关（同一短语脱离句子含义不同），关闭持久化缓存避免陈旧复用
+        const result = await handleTranslateBatch(modelId, targetLang, lines, null, { useCache: false });
         sendResponse(result);
       } catch (e) {
         sendResponse({ ok: false, error: (e && e.message) ? e.message : '字幕翻译失败' });

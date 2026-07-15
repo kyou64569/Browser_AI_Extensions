@@ -676,3 +676,34 @@ button.mini { padding: 4px 10px; font-size: 12px; }
 .conv-item-time { font-size: 11px; color: var(--muted); white-space: nowrap; }
 .conv-del { width: 28px; height: 28px; }
 .conv-empty { text-align: center; color: var(--muted); font-size: 13px; line-height: 1.8; padding: 40px 12px; }
+
+/* ---------- 网页翻译实时进度条 ---------- */
+.pt-progress-track {
+  width: 100%;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--line);
+  overflow: hidden;
+}
+.pt-progress-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--accent-2), var(--accent));
+  transition: width .25s ease;
+}
+/* 不确定进度（慢模型等待首帧反馈期间）：一段高亮在轨道内左右滑动，表示“正在工作”而非卡死 */
+.pt-progress-fill.indeterminate {
+  width: 40% !important;
+  animation: pt-indeterminate 1.15s cubic-bezier(.4, 0, .2, 1) infinite;
+}
+@keyframes pt-indeterminate {
+  0% { margin-left: -40%; }
+  100% { margin-left: 100%; }
+}
+.pt-progress-text {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--accent);
+  min-height: 14px;
+}

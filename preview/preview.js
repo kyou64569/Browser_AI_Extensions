@@ -52,6 +52,42 @@ function ensureBgPort() {
 }
 ensureBgPort();
 
+// ---------- 网页翻译实时进度（SW 直接回传 WEB_TRANSLATE_PROGRESS 给侧边栏）----------
+// payload: { phase: 'start'|'translate'|'done'|'error', done, total, message }
+let _ptHideTimer = null;
+function updateTranslateProgress(p) {
+  const wrap = document.getElementById('pt-progress');
+  const fill = document.getElementById('pt-progress-fill');
+  const text = document.getElementById('pt-progress-text');
+  if (!wrap || !fill) return;
+  // 完成/出错：先显示 100% 再短暂收起，给用户明确的“完成”反馈（不再直接卡在 0%）
+  if (!p || p.phase === 'done' || p.phase === 'error') {
+    wrap.style.display = 'block';
+    fill.classList.remove('indeterminate');
+    fill.style.width = '100%';
+    if (text) text.textContent = (p && p.message) || '翻译完成';
+    if (_ptHideTimer) clearTimeout(_ptHideTimer);
+    _ptHideTimer = setTimeout(() => { wrap.style.display = 'none'; fill.style.width = '0%'; }, 600);
+    return;
+  }
+  if (_ptHideTimer) { clearTimeout(_ptHideTimer); _ptHideTimer = null; }
+  wrap.style.display = 'block';
+  const total = p.total || 0;
+  const pct = total > 0 ? Math.max(0, Math.min(100, Math.round((p.done / total) * 100))) : 0;
+  if (p.indeterminate) {
+    // 慢模型等待首帧反馈期间：显示“不确定进度”动画，避免一直定格在 0% 让用户以为卡死
+    fill.classList.add('indeterminate');
+  } else {
+    fill.classList.remove('indeterminate');
+    fill.style.width = pct + '%';
+  }
+  if (text) text.textContent = (p.message || '翻译中…') + (total ? `（${pct}%）` : '') + (p.indeterminate ? ' · 等待模型响应…' : '');
+}
+
+chrome.runtime.onMessage.addListener((msg) => {
+  if (msg && msg.type === 'WEB_TRANSLATE_PROGRESS') updateTranslateProgress(msg.payload);
+});
+
 // ---------- bfcache 生命周期处理 ----------
 // 当用户通过前进/后退按钮导航，使“持有本扩展端口”的页面进入前进/后退缓存
 // （back/forward cache，简称 bfcache）时，浏览器会冻结该页面并强制关闭其消息通道，
@@ -2178,6 +2214,7 @@ function initPageTranslate() {
     }
     const targetLang = langSel.value;
     statusEl.textContent = '正在翻译…';
+    updateTranslateProgress({ phase: 'start', done: 0, total: 0, message: '正在翻译…' });
     try {
       const resp = await chrome.tabs.sendMessage(tabId, {
         type: 'WEB_TRANSLATE_EXECUTE',
@@ -2195,6 +2232,7 @@ function initPageTranslate() {
     } catch (e) {
       statusEl.textContent = '通信失败：' + (e && e.message ? e.message : e);
     }
+    updateTranslateProgress({ phase: 'done' });
   };
 
   // 还原

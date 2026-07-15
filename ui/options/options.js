@@ -25,6 +25,8 @@ function cardHtml(cfg, idx) {
     <label>API Key <input data-f="apiKey" type="password" value="${cfg.apiKey || ''}"></label>
     <label>Model <input data-f="model" value="${cfg.model || ''}"></label>
     <label>超时(ms) <input data-f="timeoutMs" type="number" value="${cfg.timeoutMs || 60000}"></label>
+    <label>TPM上限 <input data-f="tpm" type="number" min="0" step="1000" placeholder="留空=自适应" value="${cfg.tpm != null ? cfg.tpm : ''}"></label>
+    <label>RPM上限 <input data-f="rpm" type="number" min="0" step="1" placeholder="留空=自适应" value="${cfg.rpm != null ? cfg.rpm : ''}"></label>
     <label><input type="checkbox" data-f="enabled" ${cfg.enabled !== false ? 'checked' : ''}> 启用</label>
     <label><input type="checkbox" data-f="supportsVision" ${cfg.supportsVision ? 'checked' : ''}> 视觉</label>
     <label><input type="checkbox" data-f="supportsStream" ${cfg.supportsStream !== false ? 'checked' : ''}> 流式</label>
@@ -108,7 +110,12 @@ document.getElementById('save').onclick = async () => {
     card.querySelectorAll('[data-f]').forEach(inp => {
       const f = inp.dataset.f;
       const val = inp.type === 'checkbox' ? inp.checked : inp.value;
-      models[i][f] = (f === 'timeoutMs') ? Number(val) : val;
+      // 数值型字段转为 Number；空字符串视为未配置（undefined），让限流器走自适应默认
+      if (f === 'timeoutMs' || f === 'tpm' || f === 'rpm') {
+        models[i][f] = (val === '' || val == null) ? undefined : Number(val);
+      } else {
+        models[i][f] = val;
+      }
     });
   });
   await saveModels(models);
