@@ -272,6 +272,7 @@ body {
 }
 .status-bar.err { color: var(--err); }
 .status-bar.ok { color: var(--ok); }
+.status-bar.warn { color: #b7791f; }
 
 /* 输入区：更大的聊天框 */
 .composer {
@@ -587,6 +588,13 @@ button.mini { padding: 4px 10px; font-size: 12px; }
 .model-status.ok { color: var(--ok); }
 .model-status.err { color: var(--err); }
 
+/* 多模态卡片折叠（已保存）态摘要 */
+.mc-summary {
+  display: flex; flex-wrap: wrap; gap: 4px 16px;
+  font-size: 12px; color: var(--muted); padding: 2px 0 4px;
+}
+.mc-summary b { color: var(--text); font-weight: 600; }
+
 /* Whisper 模型下拉（原生 select，避免 datalist 选中后锁定）+ 手动输入回退 */
 .model-select { width: 100%; }
 .model-manual { width: 100%; margin-top: 6px; }
@@ -603,6 +611,15 @@ button.mini { padding: 4px 10px; font-size: 12px; }
 }
 .mc-checks { display: flex; gap: 14px; font-size: 11px; margin-top: 8px; color: var(--muted); }
 .mc-checks label { display: flex; align-items: center; gap: 5px; }
+/* 多模态卡片：模态复选区 */
+.mm-mod { display: flex; flex-direction: column; gap: 5px; margin-top: 4px; }
+.mm-mod-title { font-size: 11px; color: var(--muted); }
+.mm-mod-checks { display: flex; flex-wrap: wrap; gap: 14px; }
+.mm-mod-checks .chk { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--text); }
+.mm-mod-checks .chk input { accent-color: var(--accent); }
+/* 多模态生成结果展示 */
+.mm-note { font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+.mm-media { max-width: 100%; border-radius: 10px; margin-top: 4px; }
 /* 折叠状态：仅显示别名框 + 图标按钮，详情区收起 */
 .model-card.collapsed .mc-grid,
 .model-card.collapsed .mc-checks { display: none; }

@@ -58,6 +58,9 @@
                   <button type="button" class="func-item" role="menuitem" data-act="file">
                     <span class="fi-ico">📎</span><span class="fi-label">添加文件</span>
                   </button>
+                  <button type="button" class="func-item" role="menuitem" data-act="websearch">
+                    <span class="fi-ico">🌍</span><span class="fi-label">联网搜索</span>
+                  </button>
                   <button type="button" class="func-item" role="menuitem" data-act="summarize">
                     <span class="fi-ico">📄</span><span class="fi-label">总结网页</span>
                   </button>
@@ -204,6 +207,15 @@
           </div>
           <p class="card-note">用于“实时字幕”功能中<strong>无平台字幕</strong>的视频语音转写。可配置多个（如两个免费额度模型），开启字幕时按顺序负载均衡、单个超额或失败时自动切换下一个。</p>
           <div id="whisperModelList" class="model-list"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h3>多模态模型配置</h3>
+            <button class="mini" id="addMultimodalModel">+ 添加多模态模型</button>
+          </div>
+          <p class="card-note">用于聊天中的多模态任务（如生成图片 / 音频 / 视频）。勾选该模型支持的模态，AI 会自动按任务类型调用对应模型；未配置该模态模型时，AI 会提示你先配置多模态模型。</p>
+          <div id="multimodalModelList" class="model-list"></div>
         </div>
 
         <div class="card tip">

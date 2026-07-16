@@ -4,6 +4,7 @@
 const KEYS = {
   MODELS: 'models',        // ModelConfig[]
   WHISPER: 'whisperModels',// Whisper 语音识别模型配置 []
+  MULTIMODAL: 'multimodalModels', // 多模态模型配置 [{...modalities:{image,audio,video}}]
   KB: 'kb',                // { type:'local'|'online', cfg }
   SETTINGS: 'settings',    // 杂项
 };
@@ -33,6 +34,23 @@ export async function getWhisperModels() {
 
 export async function saveKbConfig(cfg) {
   await chrome.storage.local.set({ [KEYS.KB]: cfg });
+}
+
+/**
+ * 读取多模态模型配置（聊天中的图像/音频/视频生成任务路由）。
+ * @returns {Promise<Array>}
+ */
+export async function getMultimodalModels() {
+  const r = await chrome.storage.local.get(KEYS.MULTIMODAL);
+  return r[KEYS.MULTIMODAL] || [];
+}
+
+/**
+ * 保存多模态模型配置。
+ * @param {Array} arr
+ */
+export async function saveMultimodalModels(arr) {
+  await chrome.storage.local.set({ [KEYS.MULTIMODAL]: arr || [] });
 }
 
 export async function getSettings() {

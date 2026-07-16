@@ -942,8 +942,99 @@ async function handleTranslateBatch(modelId, targetLang, items, errLabel, opts =
   return { ok: true, translations };
 }
 
+// ============================================================
+// 联网搜索：service worker 中无 DOMParser，故用 fetch 抓取 DuckDuckGo
+// 免密 HTML 版结果页并以正则解析。利用 host_permissions <all_urls>，
+// 后台发起的请求不受页面 CORS 限制。
+// ============================================================
+/** 清理 HTML 片段为纯文本（去标签 + 解码常见实体） */
+function stripHtmlText(s) {
+  return String(s || '')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#x27;|&#39;/g, "'")
+    .replace(/&nbsp;/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/** 还原 DuckDuckGo 结果链接（去掉 //duckduckgo.com/l/?uddg= 重定向包装） */
+function decodeDdgUrl(href) {
+  try {
+    let h = String(href || '').replace(/&amp;/g, '&');
+    if (h.startsWith('//')) h = 'https:' + h;
+    const u = new URL(h);
+    const uddg = u.searchParams.get('uddg');
+    return uddg ? decodeURIComponent(uddg) : h;
+  } catch (_) {
+    return href;
+  }
+}
+
+/** 解析 DuckDuckGo HTML 结果页，提取前 maxResults 条 { title, url, snippet } */
+function parseDdgResults(html, maxResults) {
+  const results = [];
+  const titleRe = /<a[^>]+class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
+  let m;
+  while ((m = titleRe.exec(html)) && results.length < maxResults) {
+    const title = stripHtmlText(m[2]);
+    if (!title) continue;
+    results.push({ title, url: decodeDdgUrl(m[1]), snippet: '' });
+  }
+  const snipRe = /<a[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>/g;
+  let sm, i = 0;
+  while ((sm = snipRe.exec(html)) && i < results.length) {
+    results[i].snippet = stripHtmlText(sm[1]);
+    i++;
+  }
+  return results;
+}
+
+/** 抓取联网搜索结果：优先 GET，无结果时回退 POST（DDG 偶尔仅接受 POST） */
+async function webSearch(query, maxResults = 6) {
+  const endpoint = 'https://html.duckduckgo.com/html/';
+  const headers = { 'Accept': 'text/html', 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8' };
+  let html = '';
+  try {
+    const res = await fetch(endpoint + '?q=' + encodeURIComponent(query), { method: 'GET', headers });
+    if (res.ok) html = await res.text();
+  } catch (e) {
+    // 记录 GET 请求失败原因，便于调试
+    console.warn('[webSearch] GET 请求失败，尝试 POST 回退:', e?.message || String(e));
+  }
+
+  let results = html ? parseDdgResults(html, maxResults) : [];
+  if (!results.length) {
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: { ...headers, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: 'q=' + encodeURIComponent(query),
+    });
+    if (!res.ok) throw new Error('搜索服务返回 HTTP ' + res.status);
+    results = parseDdgResults(await res.text(), maxResults);
+  }
+  return results;
+}
+
 // content script / popup 的简单请求
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg.type === 'WEB_SEARCH') {
+    (async () => {
+      try {
+        const q = (msg.query || '').trim();
+        if (!q) { sendResponse({ error: '搜索关键词为空' }); return; }
+        const results = await webSearch(q, msg.maxResults || 6);
+        if (!results.length) { sendResponse({ error: '未获取到搜索结果，请稍后重试或更换关键词' }); return; }
+        sendResponse({ results });
+      } catch (e) {
+        sendResponse({ error: e?.message || '联网搜索失败' });
+      }
+    })();
+    return true; // 异步 sendResponse
+  }
   if (msg.type === 'SUMMARIZE') {
     // 兼容非 port 调用：直接返回（简单起见复用 port 逻辑需要连接，这里仅提示用侧边栏）
     sendResponse({ type: 'INFO', message: '请打开侧边栏（右键图标 -> 在边栏中打开本扩展）' });

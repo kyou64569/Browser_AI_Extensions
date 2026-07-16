@@ -2,13 +2,14 @@
 // 侧边栏应用入口：复用同一套核心模块（core / connectors / features）。
 // 三个视图：chat（主） / features / settings，单页切换，无整页刷新。
 
-import { chatStream } from '../features/chat.js';
+import { chatStream, chatOnce } from '../features/chat.js';
 import { summarizePage, summarizeStream } from '../features/summarize.js';
 import { processSelection } from '../features/selection.js';
 import { LocalKbConnector } from '../connectors/local-kb.js';
 import { buildToolSystemPrompt, parseToolCalls, parseToolCall, stripToolCall } from '../features/automation.js';
 import { listModels } from '../core/list-models.js';
 import { thinkingLevels } from '../shared/utils.js';
+import { postJson, fetchWithTimeout } from '../core/http.js';
 
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => document.querySelectorAll(s);
@@ -219,6 +220,224 @@ async function persistWhisperToStorage(arr) {
     try { await chrome.storage.local.set({ whisperModels: arr }); } catch (_) {}
   }
 }
+
+// ============================================================
+// 多模态模型配置（聊天中的图像/音频/视频生成任务路由）
+// 卡片 UI 与 Whisper 一致；每个卡片额外提供 图像/音频/视频 三个复选框，
+// 标识该模型支持的模态，供 AI 按任务类型自动选择对应模型。
+// ============================================================
+async function loadMultimodalFromStorage() {
+  if (hasChromeStorage()) {
+    try {
+      const r = await chrome.storage.local.get('multimodalModels');
+      if (Array.isArray(r.multimodalModels) && r.multimodalModels.length) return r.multimodalModels;
+    } catch (_) { /* 退回 localStorage */ }
+  }
+  return LS.get('preview.multimodalModels', []);
+}
+async function persistMultimodalToStorage(arr) {
+  multimodalModels = arr;
+  LS.set('preview.multimodalModels', arr);
+  if (hasChromeStorage()) {
+    try { await chrome.storage.local.set({ multimodalModels: arr }); } catch (_) {}
+  }
+}
+function defaultMultimodalModel() {
+  return {
+    id: 'm' + Date.now().toString(36),
+    name: '多模态模型',
+    apiBase: 'https://api.openai.com/v1',
+    apiKey: '',
+    model: '',
+    timeoutMs: 120000,
+    size: '',
+    modalities: { image: false, audio: false, video: false },
+  };
+}
+/**
+ * 构建多模态模型下拉选项：已获取的模型列表 + 当前已保存值 + 占位项。
+ * 用原生 <select>，用户直接从下拉选择，无需手动输入模型名。
+ * @param {object} m 单个多模态模型配置
+ */
+function multimodalModelOptions(m) {
+  const list = fetchedModels[m.id] || [];
+  const sel = m.model || '';
+  const inList = list.includes(sel);
+  let opts = `<option value="">— 选择模型 —</option>`;
+  if (sel && !inList) {
+    // 已保存但不在候选列表中的值：保留为可选项，避免被清空
+    opts += `<option value="${escapeHtml(sel)}" selected>${escapeHtml(sel)}（当前已保存）</option>`;
+  }
+  opts += list.map(id => `<option value="${escapeHtml(id)}" ${id === sel ? 'selected' : ''}>${escapeHtml(id)}</option>`).join('');
+  return opts;
+}
+
+function renderMultimodalModels() {
+  const wrap = $('#multimodalModelList');
+  if (!wrap) return;
+  if (!multimodalModels.length) {
+    wrap.innerHTML = '<div class="empty" style="color:#6b7280;font-size:12px;padding:6px 0;">尚未添加多模态模型。点击右上角"+ 添加多模态模型"。</div>';
+  } else {
+    wrap.innerHTML = multimodalModels.map((m, i) => {
+      const mod = m.modalities || {};
+      // 折叠（已保存）态：别名只读展示，并提供摘要与"编辑"入口
+      if (m.collapsed) {
+        const modLabels = ['image', 'audio', 'video']
+          .filter(k => mod[k])
+          .map(k => modalityLabel(k))
+          .join(' ');
+        return `
+        <div class="model-card collapsed" data-i="${i}">
+          <div class="mc-head">
+            <input data-f="name" class="mc-alias" value="${escapeHtml(m.name || '')}" placeholder="模型别名" readonly />
+            <button class="icon-btn mc-save" data-save="${i}" title="展开编辑">${ICON_EDIT}</button>
+            <button class="icon-btn del" data-del="${i}" title="删除">${ICON_TRASH}</button>
+          </div>
+          <div class="mc-summary">
+            <span>模型：<b>${escapeHtml(m.model || '—')}</b></span>
+            <span>Base：${escapeHtml(m.apiBase || '—')}</span>
+            <span>尺寸：${escapeHtml(m.size || '默认')}</span>
+            <span>模态：${modLabels || '未设置'}</span>
+          </div>
+        </div>`;
+      }
+      // 编辑态：可填写 Base / Key 并从下拉选择模型，勾选支持模态
+      return `
+      <div class="model-card" data-i="${i}">
+        <div class="mc-head">
+          <input data-f="name" class="mc-alias" value="${escapeHtml(m.name || '')}" placeholder="模型别名（选填，默认同所选模型）" />
+          <button class="icon-btn mc-save" data-save="${i}" title="保存并收起">${ICON_SAVE}</button>
+          <button class="icon-btn del" data-del="${i}" title="删除">${ICON_TRASH}</button>
+        </div>
+        <div class="mc-grid">
+          <label class="full">API Base
+            <input data-f="apiBase" value="${escapeHtml(m.apiBase || '')}" placeholder="https://api.openai.com/v1" />
+          </label>
+          <label class="full">API Key
+            <input data-f="apiKey" type="password" value="${escapeHtml(m.apiKey || '')}" placeholder="sk-…（多模态接口密钥）" />
+          </label>
+          <label class="full">模型
+            <select data-f="model" class="model-select">${multimodalModelOptions(m)}</select>
+            <span class="model-status"></span>
+          </label>
+          <label>超时 ms <input data-f="timeoutMs" type="number" value="${m.timeoutMs || 120000}" /></label>
+          <label>尺寸 <input data-f="size" value="${escapeHtml(m.size || '')}" placeholder="如 1024x1024" /></label>
+          <label class="full mm-mod">
+            <span class="mm-mod-title">支持模态（勾选该模型可处理的任务类型）</span>
+            <span class="mm-mod-checks">
+              <label class="chk"><input type="checkbox" data-f="mod-image" ${mod.image ? 'checked' : ''}/> 图像</label>
+              <label class="chk"><input type="checkbox" data-f="mod-audio" ${mod.audio ? 'checked' : ''}/> 音频</label>
+              <label class="chk"><input type="checkbox" data-f="mod-video" ${mod.video ? 'checked' : ''}/> 视频</label>
+            </span>
+          </label>
+        </div>
+      </div>`;
+    }).join('');
+
+    // 已填好 API Base / Key 的卡片，加载时即自动拉取模型列表
+    multimodalModels.forEach((m, i) => {
+      if ((m.apiBase || '').trim() && (m.apiKey || '').trim()) refreshMultimodalList(multimodalModels, i, wrap);
+    });
+  }
+}
+
+// 事件委托：处理多模态模型卡片的所有交互（避免重复添加监听器导致的内存泄漏）
+$('#multimodalModelList').addEventListener('change', (e) => {
+  const inp = e.target.closest('[data-f]');
+  if (!inp) return;
+  const card = inp.closest('.model-card');
+  if (!card) return;
+  const i = +card.dataset.i;
+  const f = inp.dataset.f;
+  const val = inp.type === 'checkbox' ? inp.checked : inp.value;
+  if (f === 'model') {
+    multimodalModels[i].model = val;
+    syncAlias(card, multimodalModels, i, val);
+  } else if (f.startsWith('mod-')) {
+    const key = f.slice(4);
+    multimodalModels[i].modalities = multimodalModels[i].modalities || {};
+    multimodalModels[i].modalities[key] = inp.checked;
+  } else {
+    multimodalModels[i][f] = (f === 'timeoutMs') ? Number(val) : val;
+    if (f === 'name') multimodalModels[i].nameEdited = !!String(val).trim();
+  }
+  persistMultimodalToStorage(multimodalModels);
+  if (f === 'apiBase' || f === 'apiKey') {
+    // 清除缓存以避免使用过期的模型列表
+    delete fetchedModels[multimodalModels[i]?.id];
+    refreshMultimodalList(multimodalModels, i, card.closest('#multimodalModelList'));
+  }
+});
+
+$('#multimodalModelList').addEventListener('click', (e) => {
+  const delBtn = e.target.closest('[data-del]');
+  if (delBtn) {
+    const i = +delBtn.dataset.del;
+    delete fetchedModels[multimodalModels[i]?.id];
+    multimodalModels.splice(i, 1);
+    persistMultimodalToStorage(multimodalModels);
+    renderMultimodalModels();
+    return;
+  }
+
+  const saveBtn = e.target.closest('[data-save]');
+  if (saveBtn) {
+    const i = +saveBtn.dataset.save;
+    const card = saveBtn.closest('.model-card');
+    if (!multimodalModels[i].collapsed) {
+      const alias = card.querySelector('input[data-f="name"]');
+      if (alias) { multimodalModels[i].name = alias.value; multimodalModels[i].nameEdited = !!alias.value.trim(); }
+      multimodalModels[i].collapsed = true;
+    } else {
+      multimodalModels[i].collapsed = false;
+    }
+    persistMultimodalToStorage(multimodalModels);
+    renderMultimodalModels();
+  }
+});
+
+/**
+ * 自动获取并填充某多模态卡片的模型候选列表（供 <select> 下拉选择）。
+ * 走 OpenAI 兼容接口 GET {base}/models；不覆盖已选模型名，仅提供候选。
+ * @param {Array} arr multimodalModels
+ * @param {number} i 模型在 arr 中的下标
+ * @param {HTMLElement} wrap 卡片容器
+ */
+async function refreshMultimodalList(arr, i, wrap) {
+  const m = arr[i];
+  if (!m) return;
+  const card = wrap.querySelector(`.model-card[data-i="${i}"]`);
+  if (!card) return;
+  const sel = card.querySelector('select[data-f="model"]');
+  const status = card.querySelector('.model-status');
+  const base = (m.apiBase || '').trim();
+  const key = (m.apiKey || '').trim();
+
+  if (!base || !key) {
+    delete fetchedModels[m.id];
+    if (sel) sel.innerHTML = multimodalModelOptions(m);
+    if (status) { status.textContent = '填写 API Base / Key 后自动获取模型列表'; status.className = 'model-status'; }
+    return;
+  }
+
+  if (status) { status.textContent = '正在获取模型列表…'; status.className = 'model-status loading'; }
+  try {
+    const list = await listModels({ apiBase: base, apiKey: key, timeoutMs: m.timeoutMs });
+    // 防止竞态条件：检查卡片是否仍然存在且模型配置未改变
+    const currentCard = wrap.querySelector(`.model-card[data-i="${i}"]`);
+    if (!currentCard || currentCard !== card) return;
+    const currentM = multimodalModels[i];
+    if (!currentM || currentM.id !== m.id || currentM.apiBase !== base || currentM.apiKey !== key) return;
+
+    fetchedModels[m.id] = list;
+    if (sel) sel.innerHTML = multimodalModelOptions(m);
+    if (status) { status.textContent = `已获取 ${list.length} 个模型，请下拉选择`; status.className = 'model-status ok'; }
+  } catch (e) {
+    delete fetchedModels[m.id];
+    if (sel) sel.innerHTML = multimodalModelOptions(m);
+    if (status) { status.textContent = '获取失败：' + e.message; status.className = 'model-status err'; }
+  }
+}
 /** 启动或存储变更后：从权威源（chrome.storage）同步配置到内存并重渲染 */
 async function syncConfigFromStorage() {
   const loaded = await loadModelsFromStorage();
@@ -233,6 +452,12 @@ async function syncConfigFromStorage() {
     whisperModels = wm;
     LS.set('preview.whisperModels', wm);
     renderWhisperModels();
+  }
+  const mm = await loadMultimodalFromStorage();
+  if (mm && JSON.stringify(mm) !== JSON.stringify(multimodalModels)) {
+    multimodalModels = mm;
+    persistMultimodalToStorage(mm);
+    renderMultimodalModels();
   }
   const kb = await loadKbFromStorage();
   if (kb && JSON.stringify(kb) !== JSON.stringify(kbCfg)) {
@@ -252,6 +477,7 @@ let kbCfg = LS.get('preview.kb', { baseUrl: '' });
 let imgUploadCfg = LS.get('preview.imgUpload', { url: '', auth: '', path: '' });
 let conversations = LS.get('preview.conversations', []); // 历史会话列表
 let whisperModels = LS.get('preview.whisperModels', []);  // Whisper 语音识别模型配置 []
+let multimodalModels = LS.get('preview.multimodalModels', []); // 多模态模型配置 [{...modalities:{image,audio,video}}]
 let ccWhisperRefresh = null;  // 实时字幕卡中 Whisper 复选列表的刷新钩子（initLiveCaption 内赋值）
 let currentConvId = null;                          // 当前会话 id（null = 尚未归入某个会话）
 let messages = [];          // 聊天历史 {role, content}
@@ -343,6 +569,8 @@ function persistActiveConversation() {
       role: m.role,
       content: m.content,
       ...(m.attachments ? { attachments: m.attachments.map(a => ({ ...a })) } : {}),
+      // 多模态生成结果的结构化信息（历史回放时仍以媒体元素展示，而非纯 URL 文本）
+      ...(m.media ? { media: { type: m.media.type, url: m.media.url, name: m.media.name || null } } : {}),
     };
     // 保留工具调用结构化信息（历史回放时仍以 AI 消息归属渲染为工具卡片）
     if (m.tool) {
@@ -389,6 +617,7 @@ function loadConversation(id) {
     role: m.role,
     content: m.content,
     ...(m.attachments ? { attachments: m.attachments.map(a => ({ ...a })) } : {}),
+    ...(m.media ? { media: { type: m.media.type, url: m.media.url, name: m.media.name || null } } : {}),
   }));
   chatScroll.innerHTML = '';
   if (!messages.length) {
@@ -405,7 +634,22 @@ function loadConversation(id) {
         const el = document.createElement('div');
         el.className = 'msg assistant';
         el.innerHTML = `<div class="avatar">AI</div><div class="bubble"></div>`;
-        el.querySelector('.bubble').textContent = m.content || '';
+        const bubble = el.querySelector('.bubble');
+        // 多模态生成结果：以图片/音频/视频媒体元素直接展示（与实时生成一致）；
+        // 优先用结构化 media 字段；旧会话仅有纯文本则尝试解析 "[图像] url" 兼容升级；
+        // 两者皆无（纯文本回复/报错）则回退为纯文本。
+        if (m.media && m.media.url) {
+          bubble.innerHTML = multimodalInnerHtml(m.media.type, escapeHtml(m.media.url), m.media.name);
+          wireMultimodalMedia(bubble);
+        } else {
+          const legacy = parseLegacyMedia(m.content);
+          if (legacy && legacy.url) {
+            bubble.innerHTML = multimodalInnerHtml(legacy.type, escapeHtml(legacy.url), '');
+            wireMultimodalMedia(bubble);
+          } else {
+            bubble.textContent = m.content || '';
+          }
+        }
         chatScroll.appendChild(el);
       }
     }
@@ -623,6 +867,28 @@ async function send() {
     return;
   }
 
+  // 联网搜索模式：先抓取实时搜索结果，再交给当前模型链路基于结果作答
+  if (activeMode && activeMode.type === 'websearch') {
+    if (streaming) return;
+    if (!text) { setStatus('请输入要联网搜索的问题', 'err'); return; }
+    const query = text;
+    input.value = ''; autosize();
+    attachments = []; renderAttachments();
+    clearFuncMode();
+    runWebSearchInChat(query);
+    return;
+  }
+
+  // 多模态任务路由：先判断用户是否在请求图像/音频/视频生成（关键词预筛 + LLM 分类），
+  // 命中则自动调用已配置的对应多模态模型；未配置该模态模型时直接提示用户配置。
+  if (streaming) return;
+  const mmTask = await detectMultimodalTask(text);
+  if (mmTask) {
+    await routeMultimodalTask(mmTask, text);
+    return;
+  }
+
+
   // 翻译 / 解释 / OCR 功能模式：允许“按功能发送”；OCR 只需图片，其余需正文
   const funcMode = (activeMode && (activeMode.type === 'translate' || activeMode.type === 'explain' || activeMode.type === 'summarize' || activeMode.type === 'ocr'))
     ? activeMode.type : null;
@@ -683,7 +949,7 @@ async function send() {
       return;
     }
   } else if (!models.some(m => m.id === chatModelId)) {
-    alert('请先在设置中添加并启用模型');
+    alert('请先在设置中添加模型');
     return;
   }
 
@@ -875,7 +1141,7 @@ async function runAutomation(userText) {
       return;
     }
   } else if (!models.some(m => m.id === chatModelId)) {
-    alert('请先在设置中添加并启用模型');
+    alert('请先在设置中添加模型');
     return;
   }
   const ref = currentRefModel();
@@ -888,6 +1154,7 @@ async function runAutomation(userText) {
   streaming = true; sendBtn.disabled = true; setStatus('思考中…');
   try {
     let iter = 0;
+    let finished = false;
     while (iter < MAX_TOOL_ITERS) {
       iter++;
       a = a || newAssistant();
@@ -1017,7 +1284,19 @@ async function runAutomation(userText) {
         if (a && a.el) a.setText(messages[messages.length - 1].content);
       }
       setStatus('');
+      finished = true;
       break;
+    }
+    // 轮次上限兜底：若因最后一轮仍在调用工具（calls.length 分支无条件 continue）而退出循环，
+    // 上面的 break 收尾分支不会执行，状态会卡在“正在执行操作…”，且“已达上限”提示不会显示。
+    // 此处统一补一条收尾消息并重置状态，确保界面不会永久停留在该提示。
+    if (!finished && iter >= MAX_TOOL_ITERS) {
+      const note = '⚠️ 已达到最大操作轮次（' + MAX_TOOL_ITERS + '），期间工具调用均失败或未能完成任务。' +
+        '可调整指令（选择器 / 步骤）或换用更稳定的模型后重新发起。';
+      messages.push({ role: 'assistant', content: note });
+      const fin = newAssistant();
+      fin.setText(note);
+      setStatus('已达上限，任务未完成', 'warn');
     }
   } catch (e) {
     if (a) {
@@ -1077,6 +1356,15 @@ function activateFunc(act) {
     // 预填总结指令到输入框，等待用户手动编辑并点击发送（不再自动发送）
     input.value = '请总结当前网页';
     input.placeholder = '可编辑总结指令，点击发送后总结当前网页…';
+    autosize();
+    input.focus();
+    updateSendState();
+    return;
+  }
+  if (act === 'websearch') {
+    setMode({ type: 'websearch', label: '🌍 联网搜索' });
+    input.value = '';
+    input.placeholder = '输入要联网搜索的问题，发送后基于实时搜索结果回答…';
     autosize();
     input.focus();
     updateSendState();
@@ -1427,6 +1715,299 @@ async function runSummarizeInChat(instruction) {
     clearFuncMode();
     persistActiveConversation();   // 总结网页会话同样自动保存
   }
+}
+
+/** 联网搜索：抓取实时搜索结果 → 交由当前模型链路基于结果流式作答 */
+async function runWebSearchInChat(query) {
+  if (streaming) return;
+  const welcome = $('#welcome');
+  if (welcome) welcome.remove();
+  pushUser(query);
+  const a = newAssistant();
+  streaming = true; sendBtn.disabled = true;
+  setStatus('正在联网搜索…');
+
+  // 1) 抓取搜索结果（由 background 跨域 fetch，规避页面 CORS）
+  let results = [];
+  try {
+    if (typeof chrome === 'undefined' || !chrome.runtime || !chrome.runtime.id) {
+      throw new Error('联网搜索需在扩展环境中使用');
+    }
+    // 添加超时包装，避免消息无响应时永久挂起
+    const timeoutMs = 30000;
+    const resp = await Promise.race([
+      chrome.runtime.sendMessage({ type: 'WEB_SEARCH', query, maxResults: 6 }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('联网搜索超时')), timeoutMs))
+    ]);
+    if (!resp) throw new Error('联网搜索无响应');
+    if (resp.error) throw new Error(resp.error);
+    results = resp.results || [];
+    if (!results.length) throw new Error('未获取到搜索结果');
+  } catch (e) {
+    a.stopTyping();
+    a.setText('联网搜索失败：' + e.message);
+    setStatus('联网搜索失败：' + e.message, 'err');
+    streaming = false; updateSendState(); scrollBottom();
+    persistActiveConversation();
+    return;
+  }
+
+  // 2) 构造带搜索结果的上下文，交给当前模型作答
+  const today = new Date().toLocaleDateString('zh-CN');
+  const refs = results
+    .map((r, i) => `[${i + 1}] ${r.title}\n${r.snippet || '（无摘要）'}\n来源：${r.url}`)
+    .join('\n\n');
+  const prompt =
+    `你是联网搜索助手。以下是针对用户问题的实时联网搜索结果（来自 DuckDuckGo，当前日期 ${today}）。` +
+    `请综合这些结果用中文回答用户问题，回答要准确、简洁；若结果相互矛盾或不足以回答，请如实说明。` +
+    `回答末尾用“参考来源”列出你实际引用的条目编号与对应链接。\n\n` +
+    `用户问题：${query}\n\n搜索结果：\n${refs}`;
+
+  const apiMessages = [...messages, { role: 'user', content: prompt }];
+  const mode = chatModelId === '__collab__' ? 'collab' : 'single';
+  if (mode === 'collab') {
+    if (!models.filter(m => m.enabled !== false).some(m => m.isPrimary)) {
+      a.stopTyping(); a.setText('请在模型配置页面选择主模型后再进行联网搜索');
+      setStatus('未选择主模型', 'err');
+      streaming = false; updateSendState(); persistActiveConversation();
+      return;
+    }
+  } else if (!models.some(m => m.id === chatModelId)) {
+    a.stopTyping(); a.setText('请先在设置中添加模型');
+    setStatus('未配置模型', 'err');
+    streaming = false; updateSendState(); persistActiveConversation();
+    return;
+  }
+  const ref = currentRefModel();
+  const ts = (ref && ref.supportsThinking) ? thinkingStrength : undefined;
+
+  setStatus('正在整理搜索结果…');
+  let acc = ''; let started = false;
+  try {
+    for await (const chunk of chatStream({ models, backupModels }, apiMessages, {
+      mode,
+      selectedId: mode === 'single' ? chatModelId : undefined,
+      thinkingStrength: ts,
+      onFallback: (i, cfg, reason) => setStatus(`已切换到备用模型 #${i + 1}：${cfg.name}（${reason}）`),
+    })) {
+      if (chunk.error === 'NO_PRIMARY') {
+        a.stopTyping(); a.setText('请在模型配置页面选择主模型后再进行联网搜索');
+        setStatus('未选择主模型', 'err');
+        return;
+      }
+      if (!started) { started = true; a.stopTyping(); setStatus('正在回复…'); }
+      else a.stopTyping();
+      acc += chunk.delta;
+      a.setText(acc);
+      scrollBottom();
+    }
+    // 持久化：用户消息只记原始问题（不含长搜索上下文），保持会话清爽
+    messages.push({ role: 'user', content: query });
+    messages.push({ role: 'assistant', content: acc });
+    setStatus('');
+  } catch (e) {
+    a.stopTyping();
+    a.setText(acc ? acc + '\n\n[中断] ' + e.message : '错误：' + e.message);
+    setStatus('错误：' + e.message, 'err');
+  } finally {
+    streaming = false; updateSendState(); scrollBottom();
+    persistActiveConversation();
+  }
+}
+
+// ============================================================
+// 多模态任务路由：聊天中用户发出“生成图片/音频/视频”等请求时，
+// 由 AI（当前聊天模型）判断任务模态，自动调用设置中已勾选对应模态的模型；
+// 若用户未配置处理该任务的模型，AI 直接回复“请先配置多模态模型”。
+// ============================================================
+/** 模态类型 → 中文标签 */
+function modalityLabel(type) {
+  return type === 'image' ? '图像' : type === 'audio' ? '音频' : type === 'video' ? '视频' : '多模态';
+}
+
+// 关键词预筛：仅当消息疑似媒体生成时才调用 LLM 分类，避免每条消息都做分类请求
+// 优化：添加边界和上下文检查，减少误匹配（如"画图解释"等非生成语境）
+const MM_KEYWORDS = /(?:帮我|请|能)?(?:生成|制作|创作|绘制).*?(?:一张|一幅|一个)?(?:图片|图像|图|插画|海报|照片|画作|头像|壁纸|封面)|(?:帮我|请|能)?(?:画|绘制)(?:一张|一幅|一个)?(?:图|插画|海报|头像|壁纸|封面)(?:给我|出来)?|文生图|生图|出图|画一张(?:给我)?|制作(?:一张|一幅|一个)?(?:图片|海报|头像)(?:给我)?|生成(?:一张|一幅|一个)?(?:音频|语音|音乐|配音|朗读|播客|歌)(?:给我)?|(?:配音|朗读|语音合成|文生音频|音乐生成)(?:给我)?|生成(?:一张|一个)?(?:视频|短片|动画)(?:给我)?|制作(?:一张|一个)?(?:视频|短片|动画)(?:给我)?|文生视频|做(?:一张|一个)?(?:视频|短片|动画)(?:给我)?/i;
+const MM_KEYWORDS_EN = /(?:generate|create|make|draw|paint)(?: an?| one)? (?:image|picture|photo|audio|video|song|music)(?: for me)?|text[ -]?to[ -]?image|text[ -]?to[ -]?speech|\btts\b|image generation/i;
+
+const MM_CLASSIFY_SYS =
+  '你是一个任务分类器。判断用户请求是否属于"多模态生成"任务，并给出具体模态类型。\n' +
+  '只输出一个 JSON 对象，不要输出任何其他文字：{"type":"image"|"audio"|"video"|"none"}\n' +
+  '- image：生成、绘制、创作、设计图片/图像/插画/海报/头像/照片等视觉内容\n' +
+  '- audio：生成或合成音频/语音/音乐/配音/朗读/播客等声音内容\n' +
+  '- video：生成或制作视频/短片/动画等动态影像内容\n' +
+  '- none：不属于以上任意一种（如写文章、翻译、问答、写代码等纯文本任务）\n' +
+  '若用户只是在描述或讨论图片/视频，而非要求生成，输出 {"type":"none"}。';
+
+/**
+ * 判断用户消息是否为多模态生成任务。
+ * @param {string} text 用户消息
+ * @returns {Promise<{type:string,prompt:string}|null>}
+ */
+async function detectMultimodalTask(text) {
+  if (!text) return null;
+  if (!MM_KEYWORDS.test(text) && !MM_KEYWORDS_EN.test(text)) return null;
+  try {
+    const { text: out } = await chatOnce(
+      { models, backupModels },
+      [
+        { role: 'system', content: MM_CLASSIFY_SYS },
+        { role: 'user', content: text },
+      ],
+      {
+        mode: chatModelId === '__collab__' ? 'collab' : 'single',
+        selectedId: chatModelId !== '__collab__' ? chatModelId : undefined,
+      }
+    );
+    const m = out.match(/\{[\s\S]*\}/);
+    if (!m) return null;
+    const obj = JSON.parse(m[0]);
+    return ['image', 'audio', 'video'].includes(obj.type) ? { type: obj.type, prompt: text } : null;
+  } catch (_) {
+    return null; // 分类失败（如未配置模型）则按普通聊天处理
+  }
+}
+
+/**
+ * 执行多模态任务：找到已配置的对应模态模型并调用；无可用模型时直接回复提示。
+ * @param {{type:string,prompt:string}} task
+ * @param {string} prompt 用户原始输入
+ */
+async function routeMultimodalTask(task, prompt) {
+  if (streaming) return;
+  input.value = ''; autosize();
+  attachments = []; renderAttachments();
+  const welcome = $('#welcome');
+  if (welcome) welcome.remove();
+  pushUser(prompt);
+  const a = newAssistant();
+  streaming = true; sendBtn.disabled = true;
+  const label = modalityLabel(task.type);
+  setStatus(`正在调用${label}模型…`);
+
+  const candidates = (multimodalModels || []).filter(
+    m => m.apiBase && m.apiKey && m.model && m.modalities && m.modalities[task.type]
+  );
+
+  let blobUrlToRevoke = null; // 用于清理音频 blob URL
+
+  try {
+    if (!candidates.length) {
+      a.stopTyping();
+      a.setText('请先配置多模态模型');
+      setStatus('未配置' + label + '模型', 'err');
+    } else {
+      const cfg = candidates[0];
+      const payload = await callMultimodalModel(cfg, task.type, prompt);
+      if (payload.blobUrl) blobUrlToRevoke = payload.blobUrl;
+      renderMultimodalResult(a, task.type, cfg, payload);
+      messages.push({ role: 'user', content: prompt });
+      // 保存结构化 media 信息，确保历史会话回放时仍能以图片/音频/视频直接展示（而非纯 URL 文本）
+      messages.push({ role: 'assistant', content: `[${label}] ${payload.url}`,
+        media: { type: task.type, url: payload.url, name: cfg.name || cfg.model } });
+    }
+    setStatus('');
+  } catch (e) {
+    a.stopTyping();
+    a.setText('多模态生成失败：' + e.message);
+    setStatus('多模态生成失败：' + e.message, 'err');
+  } finally {
+    // 清理 blob URL 避免内存泄漏
+    if (blobUrlToRevoke) {
+      try { URL.revokeObjectURL(blobUrlToRevoke); } catch (_) {}
+    }
+    streaming = false; updateSendState(); scrollBottom();
+    persistActiveConversation();
+  }
+}
+
+/**
+ * 调用多模态模型生成内容。接口形态对齐 OpenAI 兼容约定，端点按模态拼接在 apiBase 之后。
+ * @returns {Promise<{url:string}>}
+ */
+async function callMultimodalModel(cfg, type, prompt) {
+  const base = (cfg.apiBase || '').replace(/\/+$/, '');
+  if (!base) throw new Error('多模态模型缺少 API Base');
+  const headers = { 'Authorization': 'Bearer ' + (cfg.apiKey || ''), 'Content-Type': 'application/json' };
+  const timeout = cfg.timeoutMs || 120000;
+
+  if (type === 'image') {
+    const url = base + '/images/generations';
+    // 不同图像模型支持的 size 取值不同（如 OpenAI 用 1024x1024，商汤 sensenova 用 2048x2048 等），
+    // 因此 size 暴露为可配置项；未填写时回退到 OpenAI 兼容默认值。
+    const size = (cfg.size && cfg.size.trim()) ? cfg.size.trim() : '1024x1024';
+    const data = await postJson(url, { model: cfg.model, prompt, n: 1, size }, headers, timeout);
+    // 兼容多种响应格式：OpenAI {data:[{url,b64_json}]} 或直接 {url,b64_json}
+    const item = (data && data.data && data.data[0]) || data || {};
+    const imgUrl = item.url || (item.b64_json ? 'data:image/png;base64,' + item.b64_json : null) ||
+                    (item.image_url || item.image || null); // 兼容其他可能的字段名
+    if (!imgUrl) throw new Error('接口未返回图片（' + JSON.stringify(data).slice(0, 120) + '）');
+    return { url: imgUrl };
+  }
+  if (type === 'audio') {
+    const url = base + '/audio/speech';
+    const res = await fetchWithTimeout(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ model: cfg.model, input: prompt, voice: 'alloy' }),
+    }, timeout);
+    const blob = await res.blob();
+    const blobUrl = URL.createObjectURL(blob);
+    return { url: blobUrl, blobUrl }; // 返回 blobUrl 以便后续清理
+  }
+  if (type === 'video') {
+    const url = base + '/videos/generations';
+    const data = await postJson(url, { model: cfg.model, prompt, n: 1 }, headers, timeout);
+    // 兼容多种响应格式：OpenAI {data:[{url,video_url}]} 或直接 {url,video_url}
+    const item = (data && data.data && data.data[0]) || data || {};
+    const vUrl = item.url || item.video_url || item.output_url ||
+                  (item.b64_json ? 'data:video/mp4;base64,' + item.b64_json : null) ||
+                  (item.video || null); // 兼容其他可能的字段名
+    if (!vUrl) throw new Error('接口未返回视频（' + JSON.stringify(data).slice(0, 120) + '）');
+    return { url: vUrl };
+  }
+  throw new Error('不支持的模态类型：' + type);
+}
+
+/** 生成多模态结果气泡的 HTML（图片/音频/视频以媒体元素展示），供实时与历史回放共用 */
+function multimodalInnerHtml(type, src, modelLabel) {
+  const label = modalityLabel(type);
+  let inner = `<div class="mm-note">已为你生成${label}（来源模型：${escapeHtml(modelLabel || '')}）：</div>`;
+  if (type === 'image') {
+    inner += `<img class="mm-media" src="${src}" alt="生成${label}" />`;
+  } else if (type === 'audio') {
+    inner += `<audio class="mm-media" controls src="${src}"></audio>`;
+  } else if (type === 'video') {
+    inner += `<video class="mm-media" controls src="${src}"></video>`;
+  }
+  return inner;
+}
+
+/**
+ * 兼容升级：解析旧版本以纯文本存储的多模态结果（形如 "[图像] <url>"），
+ * 使其在历史回放时也能以媒体元素展示，而非退化为 URL 文本。
+ * @returns {{type:string,url:string}|null}
+ */
+function parseLegacyMedia(content) {
+  // 改进：使用 (.+) 捕获剩余所有内容，支持包含空格的 URL
+  const m = /^\[(图像|音频|视频)\]\s+(.+)$/.exec((content || '').trim());
+  if (!m) return null;
+  const type = m[1] === '图像' ? 'image' : m[1] === '音频' ? 'audio' : 'video';
+  return { type, url: m[2].trim() };
+}
+
+/** 把多模态生成结果渲染到助手气泡（图片/音频/视频以媒体元素直接展示） */
+function renderMultimodalResult(a, type, cfg, payload) {
+  const bubble = a.el.querySelector('.bubble');
+  a.stopTyping();
+  bubble.innerHTML = multimodalInnerHtml(type, escapeHtml(payload.url), cfg.name || cfg.model);
+  wireMultimodalMedia(bubble);
+}
+
+/** 为已渲染的多模态媒体元素绑定交互（图片点击放大查看原图） */
+function wireMultimodalMedia(bubble) {
+  const img = bubble && bubble.querySelector('img.mm-media');
+  if (img) img.onclick = () => openImagePreview(img.src);
 }
 
 // ============================================================
@@ -1974,6 +2555,7 @@ async function refreshWhisperModelList(arr, i, wrap) {
   }
 }
 $('#addWhisperModel').onclick = () => { whisperModels.push(defaultWhisperModel()); persistWhisperToStorage(whisperModels); renderWhisperModels(); if (ccWhisperRefresh) ccWhisperRefresh(); };
+$('#addMultimodalModel').onclick = () => { multimodalModels.push(defaultMultimodalModel()); persistMultimodalToStorage(multimodalModels); renderMultimodalModels(); };
 
 $('#kbBase').value = kbCfg.baseUrl || '';
 $('#kbBase').addEventListener('change', () => { kbCfg.baseUrl = $('#kbBase').value; persistKbToStorage(kbCfg); });
@@ -2076,8 +2658,7 @@ function renderModelSelect() {
     .filter(m => !m.supportsVision)
     .map(m => {
       const label = m.name || m.model || m.vendor || '未命名模型';
-      const disabled = m.enabled === false ? ' （已停用）' : '';
-      return `<option value="${escapeHtml(m.id)}" ${m.id === chatModelId ? 'selected' : ''}>${escapeHtml(label + disabled)}</option>`;
+      return `<option value="${escapeHtml(m.id)}" ${m.id === chatModelId ? 'selected' : ''}>${escapeHtml(label)}</option>`;
     }).join('');
   sel.innerHTML = collab + modelOpts;
   sel.value = chatModelId || '';
@@ -2125,9 +2706,9 @@ function initPageTranslate() {
   // 语言下拉
   langSel.innerHTML = PAGE_TRANSLATE_LANGS.map(l => `<option value="${l}">${l}</option>`).join('');
 
-  // 模型下拉（禁用/启用过滤同 settings 逻辑，且隐藏辅助视觉模型——与主聊天框保持一致）
+  // 模型下拉（不按“启用”过滤：该复选框仅控制“多模型协作”模式；隐藏辅助视觉模型——与主聊天框保持一致）
   function popModelSelect() {
-    const enabled = (models || []).filter(m => m.enabled !== false && !m.supportsVision);
+    const enabled = (models || []).filter(m => !m.supportsVision);
     if (!enabled.length) {
       modelSel.innerHTML = '<option value="">（请先在设置添加模型）</option>';
       return;
@@ -2199,8 +2780,8 @@ function initPageTranslate() {
   // 翻译本页
   $('#pt-translate').onclick = async () => {
     const modelId = modelSel.value;
-    if (!modelId || !(models || []).some(m => m.id === modelId && m.enabled !== false)) {
-      statusEl.textContent = '请先在设置中添加并启用模型';
+    if (!modelId || !(models || []).some(m => m.id === modelId && !m.supportsVision)) {
+      statusEl.textContent = '请先在设置中添加模型';
       return;
     }
     statusEl.textContent = '正在连接页面 Worker…';
@@ -2293,9 +2874,9 @@ function initLiveCaption() {
   langSel.innerHTML = PAGE_TRANSLATE_LANGS.map(l => `<option value="${l}">${l}</option>`).join('');
   srcSel.innerHTML = CC_SOURCE_LANGS.map(l => `<option value="${l}">${l}</option>`).join('');
 
-  // 模型下拉：与网页翻译一致，仅列出已启用且非视觉模型
+  // 模型下拉：与网页翻译一致，不按“启用”过滤，仅排除辅助视觉模型
   function popModelSelect() {
-    const enabled = (models || []).filter(m => m.enabled !== false && !m.supportsVision);
+    const enabled = (models || []).filter(m => !m.supportsVision);
     if (!enabled.length) {
       modelSel.innerHTML = '<option value="">（请先在设置添加模型）</option>';
       return;
@@ -2386,8 +2967,8 @@ function initLiveCaption() {
 
   $('#cc-start').onclick = async () => {
     const modelId = modelSel.value;
-    if (!modelId || !(models || []).some(m => m.id === modelId && m.enabled !== false)) {
-      statusEl.textContent = '请先在设置中添加并启用模型';
+    if (!modelId || !(models || []).some(m => m.id === modelId && !m.supportsVision)) {
+      statusEl.textContent = '请先在设置中添加模型';
       return;
     }
     savePrefs();
@@ -2472,6 +3053,7 @@ initThemeSwitch();
 renderModels();
 renderBackupModels();
 renderWhisperModels();
+renderMultimodalModels();
 renderModelSelect();
 initPageTranslate();
 initLiveCaption();
