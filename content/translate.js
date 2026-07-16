@@ -26,35 +26,42 @@
 
   // ---------- 文本节点收集 ----------
   function collectTextGroups(rootEl) {
-    const raw = [];
-    const walker = document.createTreeWalker(rootEl, NodeFilter.SHOW_TEXT, {
-      acceptNode(node) {
-        const v = node.nodeValue;
-        if (!v || !v.trim()) return NodeFilter.FILTER_REJECT;
-        let p = node.parentElement;
-        while (p) {
-          if (SKIP.has(p.tagName) || p.isContentEditable) return NodeFilter.FILTER_REJECT;
-          p = p.parentElement;
-        }
-        return NodeFilter.FILTER_ACCEPT;
-      },
-    });
-    let n;
-    while ((n = walker.nextNode())) raw.push(n);
     const groups = [];
-    let i = 0;
-    while (i < raw.length) {
-      const nodes = [raw[i]];
-      let j = i + 1;
-      while (j < raw.length && raw[j].parentNode === raw[i].parentNode) { nodes.push(raw[j]); j++; }
-      groups.push({
-        nodes,
-        text: nodes.map(nd => nd.nodeValue).join(''),
-        getOrig: n => n.nodeValue,
-        setTrans: (n, t) => { n.nodeValue = t; },
-      });
-      i = j;
+    // 显式递归遍历 DOM，按“连续的非代码文本片段”分组，正确处理 <code> 边界：
+    //   1) 命中 <code>（及 SKIP 列表元素）时整体跳过其子树，绝不翻译其内部文字；
+    //   2) 跳过标签后，继续遍历其后续兄弟 / 父级文本节点（即 </code> 之后照常收集翻译）；
+    //   3) 同一父级下被任意数量 <code> 分隔的文本片段，均按 DOM 顺序逐段收集并参与翻译，
+    //      翻译结果按原节点顺序回填，保持 DOM 结构与节点顺序不变。
+    function walk(el) {
+      let pending = [];
+      const flush = () => {
+        if (pending.length) {
+          groups.push({
+            nodes: pending,
+            text: pending.map(nd => nd.nodeValue).join(''),
+            getOrig: n => n.nodeValue,
+            setTrans: (n, t) => { n.nodeValue = t; },
+          });
+          pending = [];
+        }
+      };
+      for (const child of el.childNodes) {
+        if (child.nodeType === Node.TEXT_NODE) {
+          const v = child.nodeValue;
+          if (v && v.trim()) pending.push(child);          // 收集非空白文本节点
+        } else if (child.nodeType === Node.ELEMENT_NODE) {
+          if (SKIP.has(child.tagName) || child.isContentEditable) {
+            flush();                                        // 先收尾已收集的片段
+            continue;                                      // 跳过 code 等标签的整个子树（其内部文字不翻译）
+          }
+          flush();                                         // 进入子元素前，收尾本层已积累的直接文本
+          walk(child);                                     // 递归遍历（继续处理其内部及后续文本节点）
+          flush();                                         // 回到本层后，收尾直接文本，确保 </code> 之后的文本继续被收集
+        }
+      }
+      flush();
     }
+    walk(rootEl);
     // 按钮型 input 的 value 属性（每项 single-node 组）
     document.querySelectorAll('input[type="submit"], input[type="button"], input[type="reset"]').forEach(el => {
       const v = (el.value || '').trim();
@@ -146,7 +153,7 @@
   function doRestore() {
     if (!originalSnapshot) { active = false; return 0; }
     const snap = originalSnapshot.groups;
-    // 重新收集当前页面文本组。collectTextGroups 用固定顺序的 TreeWalker，
+    // 重新收集当前页面文本组。collectTextGroups 按固定（文档顺序）递归遍历，
     // 重渲染（节点对象被替换但结构未变）后按相同下标仍能对齐到原组。
     const current = collectTextGroups(document.body);
     let restored = 0;
