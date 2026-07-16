@@ -2807,6 +2807,9 @@ function initPageTranslate() {
         statusEl.textContent = `已翻译本页（${targetLang}）${detail}`;
         // 保存偏好，包括当前激活状态供自动模式使用
         savePtPrefs({ modelId, targetLang, mode: $('#pt-mode-auto').classList.contains('active') ? 'auto' : 'manual', active: true, activeHost: location.hostname });
+        // 翻译成功后立即刷新“还原”按钮的启用/置灰状态，否则按钮仍是初始置灰、
+        // 用户点击“还原”会因 onclick 的 disabled 判断直接 return，表现为“点了没反应”。
+        updatePtStatus();
       } else {
         statusEl.textContent = '翻译失败：' + ((resp && resp.error) || '未知错误');
       }
@@ -2818,25 +2821,41 @@ function initPageTranslate() {
 
   // 还原
   $('#pt-restore').onclick = async () => {
+    const b = document.getElementById('pt-restore');
+    if (b && b.disabled) return; // 已置灰（当前页未翻译），不发送还原指令，避免误触发
     const tabId = await getActiveTabId();
     if (!tabId) { statusEl.textContent = '未找到活动标签页'; return; }
     try {
       const r = await chrome.tabs.sendMessage(tabId, { type: 'WEB_TRANSLATE_RESTORE' });
-      statusEl.textContent = '已还原原文' + (r && r.restored ? `（${r.restored} 组）` : '');
+      if (r && r.restored > 0) {
+        statusEl.textContent = `已还原原文（${r.restored} 组）`;
+      } else {
+        // 还原返回 0：当前页未翻译 / 已是原文 / 页面已变更导致快照失效
+        statusEl.textContent = '当前页面无需还原（未翻译或页面已变更）';
+      }
+      updatePtStatus(); // 还原后刷新按钮启用/置灰状态，与实际翻译状态保持一致
     } catch (e) {
       statusEl.textContent = '通信失败：' + (e && e.message ? e.message : e);
     }
   };
 
+  // 还原按钮按“当前活动标签页”的翻译状态启用/禁用：仅对已翻译页面可还原
+  function setRestoreEnabled(on) {
+    const b = document.getElementById('pt-restore');
+    if (b) b.disabled = !on;
+  }
+
   // 查询当前页面翻译状态
   async function updatePtStatus() {
     const tabId = await getActiveTabId();
-    if (!tabId) { statusEl.textContent = ''; return; }
+    if (!tabId) { statusEl.textContent = ''; setRestoreEnabled(false); return; }
     try {
       const resp = await chrome.tabs.sendMessage(tabId, { type: 'WEB_TRANSLATE_STATUS' });
-      if (resp && resp.active) statusEl.textContent = `已翻译（${resp.count} 组文本）`;
+      const isActive = !!(resp && resp.active);
+      if (isActive) statusEl.textContent = `已翻译（${resp.count} 组文本）`;
       else statusEl.textContent = '';
-    } catch (_) { statusEl.textContent = ''; }
+      setRestoreEnabled(isActive); // 每个标签页独立维护状态：未翻译的标签页“还原”按钮置灰
+    } catch (_) { statusEl.textContent = ''; setRestoreEnabled(false); }
   }
 
   // 当切换到「功能」视图时刷新状态
@@ -2845,6 +2864,20 @@ function initPageTranslate() {
     origShow(name);
     if (name === 'features') updatePtStatus();
   };
+  // 切换标签页时同步当前页翻译状态（避免沿用上一页的“已翻译/可还原”状态）
+  if (chrome.tabs && chrome.tabs.onActivated) {
+    chrome.tabs.onActivated.addListener(() => { updatePtStatus(); });
+  }
+  // 内容脚本翻译完成（含自动模式）后通知侧边栏，刷新“还原”按钮状态。
+  // 否则自动模式在侧边栏已打开时翻译，按钮仍停在初始置灰，点“还原”毫无反应。
+  if (chrome.runtime && chrome.runtime.onMessage && !window.__ptDoneListenerInstalled) {
+    window.__ptDoneListenerInstalled = true;
+    chrome.runtime.onMessage.addListener((msg) => {
+      if (msg && msg.type === 'WEB_TRANSLATE_DONE') updatePtStatus();
+    });
+  }
+  // 初始按当前页状态设置一次
+  updatePtStatus();
 }
 
 // ============================================================
