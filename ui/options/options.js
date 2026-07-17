@@ -11,6 +11,15 @@ const listEl = document.getElementById('modelList');
 // 内存中的模型列表，便于复选框联动即时生效（点“保存”时写回 storage）
 let models = [];
 
+function thinkLabel(v) {
+  return { off: '关闭', low: '低', medium: '中', high: '高' }[v] || v;
+}
+
+/** 是否展示“支持 reasoning_effort”开关：仅 OpenAI 兼容厂商（openai/ollama/gemini）且已开启思考时 */
+function showResFlag(cfg) {
+  return cfg.supportsThinking && cfg.vendor !== 'anthropic';
+}
+
 function cardHtml(cfg, idx) {
   return `
   <div class="model-card" data-idx="${idx}">
@@ -27,11 +36,20 @@ function cardHtml(cfg, idx) {
     <label>超时(ms) <input data-f="timeoutMs" type="number" value="${cfg.timeoutMs || 60000}"></label>
     <label>TPM上限 <input data-f="tpm" type="number" min="0" step="1000" placeholder="留空=自适应" value="${cfg.tpm != null ? cfg.tpm : ''}"></label>
     <label>RPM上限 <input data-f="rpm" type="number" min="0" step="1" placeholder="留空=自适应" value="${cfg.rpm != null ? cfg.rpm : ''}"></label>
+    <label>Temperature <input data-f="temperature" type="number" min="0" max="2" step="0.1" placeholder="留空=厂商默认" value="${cfg.temperature != null ? cfg.temperature : ''}"></label>
+    <label>Top P <input data-f="top_p" type="number" min="0" max="1" step="0.05" placeholder="留空=厂商默认" value="${cfg.top_p != null ? cfg.top_p : ''}"></label>
+    <label class="think-strength" style="display:${cfg.supportsThinking ? '' : 'none'}">思考强度
+      <select data-f="thinkingStrength">
+        ${['off', 'low', 'medium', 'high'].map(v =>
+          `<option value="${v}" ${cfg.thinkingStrength === v ? 'selected' : ''}>${thinkLabel(v)}</option>`).join('')}
+      </select>
+    </label>
     <label><input type="checkbox" data-f="enabled" ${cfg.enabled !== false ? 'checked' : ''}> 启用</label>
     <label><input type="checkbox" data-f="supportsVision" ${cfg.supportsVision ? 'checked' : ''}> 视觉</label>
     <label><input type="checkbox" data-f="supportsStream" ${cfg.supportsStream !== false ? 'checked' : ''}> 流式</label>
     <label><input type="checkbox" data-f="isPrimary" ${cfg.isPrimary ? 'checked' : ''}> 主模型</label>
     <label><input type="checkbox" data-f="supportsThinking" ${cfg.supportsThinking ? 'checked' : ''}> 思考</label>
+    <label class="res-flag" style="display:${showResFlag(cfg) ? '' : 'none'}"><input type="checkbox" data-f="reasoningEffortSupported" ${cfg.reasoningEffortSupported ? 'checked' : ''}> 支持 reasoning_effort（推理模型如 o1/o3）</label>
     <button class="del">删除</button>
   </div>`;
 }
@@ -54,6 +72,18 @@ function refreshChecks() {
     enabledCb.disabled = isVision;
     streamCb.disabled = isVision;
     thinkCb.disabled = isVision;
+
+    // 思考强度选择器：仅开启“思考”且非视觉模型时显示
+    const thinkStrengthLabel = card.querySelector('.think-strength');
+    if (thinkStrengthLabel) thinkStrengthLabel.style.display = (m.supportsThinking && !isVision) ? '' : 'none';
+    // reasoning_effort 开关：仅 OpenAI 兼容厂商 + 开启思考时显示并可用
+    const resFlagLabel = card.querySelector('.res-flag');
+    const showRes = m.supportsThinking && m.vendor !== 'anthropic' && !isVision;
+    if (resFlagLabel) {
+      resFlagLabel.style.display = showRes ? '' : 'none';
+      const resCb = resFlagLabel.querySelector('input[data-f="reasoningEffortSupported"]');
+      if (resCb) resCb.disabled = isVision;
+    }
 
     const primaryDisabled = isVision || m.enabled === false || (primaryIdx >= 0 && i !== primaryIdx);
     primaryCb.disabled = primaryDisabled;
@@ -110,8 +140,8 @@ document.getElementById('save').onclick = async () => {
     card.querySelectorAll('[data-f]').forEach(inp => {
       const f = inp.dataset.f;
       const val = inp.type === 'checkbox' ? inp.checked : inp.value;
-      // 数值型字段转为 Number；空字符串视为未配置（undefined），让限流器走自适应默认
-      if (f === 'timeoutMs' || f === 'tpm' || f === 'rpm') {
+      // 数值型字段转为 Number；空字符串视为未配置（undefined），让适配器走厂商默认
+      if (f === 'timeoutMs' || f === 'tpm' || f === 'rpm' || f === 'temperature' || f === 'top_p') {
         models[i][f] = (val === '' || val == null) ? undefined : Number(val);
       } else {
         models[i][f] = val;

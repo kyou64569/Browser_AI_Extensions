@@ -19,8 +19,10 @@
  * @property {number} timeoutMs    单次调用超时（默认 60000）
  * @property {boolean} [enabled]   是否启用（默认 true；仅"多模型协作"模式下参与协作对话）
  * @property {boolean} [isPrimary] 是否设为主模型（仅"多模型协作"模式生效，单选）
- * @property {boolean} [supportsThinking] 是否开启"思考"能力
+ * @property {boolean} [supportsThinking] 是否开启"思考"能力（UI 展示思考选择器；Anthropic 直接据此发 thinking budget）
  * @property {string}  [thinkingStrength] 思考强度：'off'|'low'|'medium'|'high'（默认 'off'）
+ * @property {boolean} [reasoningEffortSupported] OpenAI 兼容厂商专用：模型是否接受 reasoning_effort 参数（o1/o3 等推理模型）。
+ *   仅当此标志为真时，openai/ollama 适配器才会发送 reasoning_effort；普通模型（gpt-4o 等）置 false 以避免 HTTP 400。
  * @property {number}  [tpm] 翻译限速用：该模型每分钟 Token 上限（TPM）。留空则由限流器用宽松默认 + 429 自适应学习。
  * @property {number}  [rpm] 翻译限速用：该模型每分钟请求数上限（RPM）。留空同上。
  */
@@ -45,6 +47,7 @@ export function createModelConfig(overrides = {}) {
     isPrimary: overrides.isPrimary ?? false,
     supportsThinking: overrides.supportsThinking ?? false,
     thinkingStrength: overrides.thinkingStrength || 'off',
+    reasoningEffortSupported: overrides.reasoningEffortSupported ?? false,
     tpm: overrides.tpm,
     rpm: overrides.rpm,
   };

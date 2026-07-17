@@ -114,7 +114,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 if __name__ == '__main__':
-    with socketserver.TCPServer(('', PORT), Handler) as s:
+    # 用多线程服务器：流式代理请求较慢（最长 120s）时，仍可同时响应页面静态 JS/CSS，
+    # 避免对话期间预览页“卡住加载”。（与 .mjs 版的异步并发行为对齐）
+    with socketserver.ThreadingTCPServer(('', PORT), Handler) as s:
         print(f'\n  本地预览已启动:  http://localhost:{PORT}')
         print(f'  代理模式:       {"已配置密钥" if secrets else "未配置 preview/secrets.json（仅直连模式）"}\n')
         s.serve_forever()

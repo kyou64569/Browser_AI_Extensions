@@ -21,9 +21,16 @@ export function optionsFromModel(m = {}) {
   if (typeof m.temperature === 'number') o.temperature = m.temperature;
   if (typeof m.top_p === 'number') o.top_p = m.top_p;
   if (typeof m.maxTokens === 'number') o.maxTokens = m.maxTokens;
-  // 思考强度：仅当明确开启思考且非 'off' 时透传，避免把无关字段发往 API
-  if (m.supportsThinking && m.thinkingStrength && m.thinkingStrength !== 'off') {
-    o.thinkingStrength = m.thinkingStrength;
+  // 思考强度：仅当开启思考且非 'off' 时透传。
+  // OpenAI 兼容厂商（openai/ollama/gemini）走 reasoning_effort，必须模型显式支持
+  // （reasoningEffortSupported），否则普通模型（gpt-4o 等）会因该参数返回 HTTP 400；
+  // Anthropic 走 thinking budget，只需 supportsThinking 即可。
+  const wantThink = m.supportsThinking && m.thinkingStrength && m.thinkingStrength !== 'off';
+  if (wantThink) {
+    const reasoningVendor = m.vendor === 'openai' || m.vendor === 'ollama' || m.vendor === 'gemini';
+    if (!reasoningVendor || m.reasoningEffortSupported) {
+      o.thinkingStrength = m.thinkingStrength;
+    }
   }
   return o;
 }

@@ -36,7 +36,9 @@ export class OpenAIAdapter extends ModelClient {
       messages: this._toVendor(req),
       stream: true,
       ...(maxTokens != null ? { max_tokens: maxTokens } : {}),
-      ...(thinkingStrength && thinkingStrength !== 'off' ? { reasoning_effort: thinkingStrength } : {}),
+      // reasoning_effort 仅对真正支持的推理模型发送；否则普通模型会返回 HTTP 400
+      ...(this.config.reasoningEffortSupported && thinkingStrength && thinkingStrength !== 'off'
+          ? { reasoning_effort: thinkingStrength } : {}),
       ...otherOptions,
     };
     const res = await fetchWithTimeout(this.endpoint, {
@@ -83,7 +85,8 @@ export class OpenAIAdapter extends ModelClient {
       messages: this._toVendor(req),
       stream: false,
       ...(maxTokens != null ? { max_tokens: maxTokens } : {}),
-      ...(thinkingStrength && thinkingStrength !== 'off' ? { reasoning_effort: thinkingStrength } : {}),
+      ...(this.config.reasoningEffortSupported && thinkingStrength && thinkingStrength !== 'off'
+          ? { reasoning_effort: thinkingStrength } : {}),
       ...otherOptions,
     };
     const json = await postJson(

@@ -118,7 +118,7 @@ function defaultModel() {
     apiBase: 'https://openrouter.ai/api/v1', apiKey: '',
     model: 'openai/gpt-4o-mini',
     supportsVision: false, supportsStream: true, timeoutMs: 60000, enabled: true,
-    isPrimary: false, supportsThinking: false, thinkingStrength: 'off',
+    isPrimary: false, supportsThinking: false, thinkingStrength: 'off', reasoningEffortSupported: false,
   };
 }
 
@@ -2184,14 +2184,14 @@ function renderModels() {
           <span class="range-wrap">
             <input type="range" data-f="temperature" min="0" max="2" step="0.1"
                    value="${typeof m.temperature === 'number' ? m.temperature : 1}" />
-            <span class="range-val" data-val="temperature">${typeof m.temperature === 'number' ? m.temperature : 1}</span>
+            <span class="range-val" data-val="temperature">${typeof m.temperature === 'number' ? m.temperature : '默认'}</span>
           </span>
         </label>
         <label class="full range-row">Top P
           <span class="range-wrap">
             <input type="range" data-f="top_p" min="0" max="1" step="0.05"
-                   value="${typeof m.top_p === 'number' ? m.top_p : 1}" />
-            <span class="range-val" data-val="top_p">${typeof m.top_p === 'number' ? m.top_p : 1}</span>
+                   value="${typeof m.top_p === 'number' ? m.top_p : 0.5}" />
+            <span class="range-val" data-val="top_p">${typeof m.top_p === 'number' ? m.top_p : '默认'}</span>
           </span>
         </label>
       </div>
@@ -2201,6 +2201,7 @@ function renderModels() {
         <label><input type="checkbox" data-f="supportsStream" ${m.supportsStream !== false ? 'checked' : ''}/> 流式</label>
         <label><input type="checkbox" data-f="isPrimary" ${m.isPrimary ? 'checked' : ''}/> 主模型</label>
         <label><input type="checkbox" data-f="supportsThinking" ${m.supportsThinking ? 'checked' : ''}/> 思考</label>
+        <label class="res-flag" style="display:${m.supportsThinking && m.vendor !== 'anthropic' ? '' : 'none'}"><input type="checkbox" data-f="reasoningEffortSupported" ${m.reasoningEffortSupported ? 'checked' : ''}/> 支持 reasoning_effort（推理模型）</label>
       </div>
     </div>`;
   }).join('');
@@ -2696,6 +2697,12 @@ function refreshCheckboxUI() {
     streamCb.disabled = isVision;
     thinkCb.disabled = isVision;
 
+    // reasoning_effort 开关：仅 OpenAI 兼容厂商（openai/ollama/gemini）+ 开启思考时显示
+    const resFlagLabel = card.querySelector('.res-flag');
+    if (resFlagLabel) {
+      resFlagLabel.style.display = (m.supportsThinking && m.vendor !== 'anthropic') ? '' : 'none';
+    }
+
     // 主模型：仅“已启用且非视觉”的模型可选；且全局单选（已有主模型时其余禁用并取消勾选）
     const primaryDisabled = isVision || m.enabled === false || (primaryIdx >= 0 && i !== primaryIdx);
     primaryCb.disabled = primaryDisabled;
@@ -2719,7 +2726,9 @@ function renderThinkingSelect() {
   const sel = document.getElementById('thinkingSelect');
   if (!sel) return;
   const ref = currentRefModel();
-  if (!ref || !ref.supportsThinking) { sel.hidden = true; sel.innerHTML = ''; return; }
+  // 仅当参考模型真正支持思考才显示：Anthropic 看 supportsThinking；OpenAI 兼容厂商看 reasoningEffortSupported
+  const canThink = ref && (ref.vendor === 'anthropic' ? ref.supportsThinking : ref.reasoningEffortSupported);
+  if (!canThink) { sel.hidden = true; sel.innerHTML = ''; return; }
   const levels = thinkingLevels(ref.vendor);
   const cur = thinkingStrength || ref.thinkingStrength || 'off';
   sel.hidden = false;

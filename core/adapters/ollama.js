@@ -29,7 +29,7 @@ export class OllamaAdapter extends ModelClient {
   }
 
   async *_stream(req, signal) {
-    const { maxTokens, ...otherOptions } = req.options || {};
+    const { maxTokens, thinkingStrength, ...otherOptions } = req.options || {};
     const body = {
       model: this.config.model,
       messages: this._toVendor(req),
@@ -67,7 +67,7 @@ export class OllamaAdapter extends ModelClient {
   }
 
   async *_nonStream(req, signal) {
-    const { maxTokens, ...otherOptions } = req.options || {};
+    const { maxTokens, thinkingStrength, ...otherOptions } = req.options || {};
     const body = { model: this.config.model, messages: this._toVendor(req), stream: false, ...(maxTokens != null ? { max_tokens: maxTokens } : {}), ...otherOptions };
     const json = await postJson(this.endpoint, body, {}, this.config.timeoutMs);
     yield { delta: json.message?.content || '', done: true, meta: { raw: json } };

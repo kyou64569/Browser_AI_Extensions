@@ -977,14 +977,16 @@ function decodeDdgUrl(href) {
 /** 解析 DuckDuckGo HTML 结果页，提取前 maxResults 条 { title, url, snippet } */
 function parseDdgResults(html, maxResults) {
   const results = [];
-  const titleRe = /<a[^>]+class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
+  // DDG 真实 class 为 result__a（小写）；统一加 i 标志做大小写不敏感匹配，
+  // 避免旧写法 result__A 大写导致永远匹配不到、联网搜索返回空。
+  const titleRe = /<a[^>]+class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
   let m;
   while ((m = titleRe.exec(html)) && results.length < maxResults) {
     const title = stripHtmlText(m[2]);
     if (!title) continue;
     results.push({ title, url: decodeDdgUrl(m[1]), snippet: '' });
   }
-  const snipRe = /<a[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>/g;
+  const snipRe = /<a[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>/gi;
   let sm, i = 0;
   while ((sm = snipRe.exec(html)) && i < results.length) {
     results[i].snippet = stripHtmlText(sm[1]);
