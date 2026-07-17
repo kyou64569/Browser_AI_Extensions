@@ -250,6 +250,7 @@ function defaultMultimodalModel() {
     apiKey: '',
     model: '',
     timeoutMs: 120000,
+    taskTimeoutMs: 600000,
     size: '',
     modalities: { image: false, audio: false, video: false },
   };
@@ -321,6 +322,7 @@ function renderMultimodalModels() {
             <span class="model-status"></span>
           </label>
           <label>超时 ms <input data-f="timeoutMs" type="number" value="${m.timeoutMs || 120000}" /></label>
+          <label>任务总超时 ms <input data-f="taskTimeoutMs" type="number" value="${m.taskTimeoutMs || 600000}" title="从发起任务到拿到视频的总上限（含 AI 后台制作时间），为 0 或不填则回退到 600000（10 分钟）" /></label>
           <label>尺寸 <input data-f="size" value="${escapeHtml(m.size || '')}" placeholder="如 1024x1024" /></label>
           <label class="full mm-mod">
             <span class="mm-mod-title">支持模态（勾选该模型可处理的任务类型）</span>
@@ -358,7 +360,7 @@ $('#multimodalModelList').addEventListener('change', (e) => {
     multimodalModels[i].modalities = multimodalModels[i].modalities || {};
     multimodalModels[i].modalities[key] = inp.checked;
   } else {
-    multimodalModels[i][f] = (f === 'timeoutMs') ? Number(val) : val;
+    multimodalModels[i][f] = (f === 'timeoutMs' || f === 'taskTimeoutMs') ? Number(val) : val;
     if (f === 'name') multimodalModels[i].nameEdited = !!String(val).trim();
   }
   persistMultimodalToStorage(multimodalModels);
@@ -1827,8 +1829,31 @@ function modalityLabel(type) {
 
 // 关键词预筛：仅当消息疑似媒体生成时才调用 LLM 分类，避免每条消息都做分类请求
 // 优化：添加边界和上下文检查，减少误匹配（如"画图解释"等非生成语境）
-const MM_KEYWORDS = /(?:帮我|请|能)?(?:生成|制作|创作|绘制).*?(?:一张|一幅|一个)?(?:图片|图像|图|插画|海报|照片|画作|头像|壁纸|封面)|(?:帮我|请|能)?(?:画|绘制)(?:一张|一幅|一个)?(?:图|插画|海报|头像|壁纸|封面)(?:给我|出来)?|文生图|生图|出图|画一张(?:给我)?|制作(?:一张|一幅|一个)?(?:图片|海报|头像)(?:给我)?|生成(?:一张|一幅|一个)?(?:音频|语音|音乐|配音|朗读|播客|歌)(?:给我)?|(?:配音|朗读|语音合成|文生音频|音乐生成)(?:给我)?|生成(?:一张|一个)?(?:视频|短片|动画)(?:给我)?|制作(?:一张|一个)?(?:视频|短片|动画)(?:给我)?|文生视频|做(?:一张|一个)?(?:视频|短片|动画)(?:给我)?/i;
-const MM_KEYWORDS_EN = /(?:generate|create|make|draw|paint)(?: an?| one)? (?:image|picture|photo|audio|video|song|music)(?: for me)?|text[ -]?to[ -]?image|text[ -]?to[ -]?speech|\btts\b|image generation/i;
+// 量词与媒体名词片段：视频/音频常见量词为"段/个/支/部/条"，必须全部覆盖，
+// 否则"生成一段视频""生成个视频"等自然说法会漏匹配，请求便落入普通聊天，
+// 表现为"AI 回答无法生成视频文件"。宁可误召回（多一次分类调用），也不要漏召回。
+const MM_Q = '(?:一张|一幅|一个|个|段|一段|一支|一部|一条)?';
+const MM_IMG = '(?:图片|图像|图|插画|海报|照片|画作|头像|壁纸|封面)';
+const MM_AUD = '(?:音频|语音|音乐|配音|朗读|播客|歌)';
+const MM_VID = '(?:视频|短片|动画|影片)';
+const MM_KEYWORDS = new RegExp(
+  // 图像
+  `(?:帮我|请|能)?(?:生成|制作|创作|绘制).*?${MM_Q}${MM_IMG}` +
+  `|(?:帮我|请|能)?(?:画|绘制)${MM_Q}(?:图|插画|海报|头像|壁纸|封面)(?:给我|出来)?` +
+  `|文生图|生图|出图|画一张(?:给我)?` +
+  `|制作${MM_Q}(?:图片|海报|头像)(?:给我)?` +
+  // 音频
+  `|生成${MM_Q}${MM_AUD}(?:给我)?` +
+  `|(?:配音|朗读|语音合成|文生音频|音乐生成|音频生成)(?:给我)?` +
+  // 视频（覆盖段/个等量词、裸"做视频/制作视频"及"视频生成/图生视频"等说法）
+  `|生成${MM_Q}${MM_VID}(?:给我)?` +
+  `|制作${MM_Q}${MM_VID}(?:给我)?` +
+  `|做${MM_Q}${MM_VID}(?:给我)?` +
+  `|文生视频|图生视频|视频生成|视频生成任务` +
+  `|(?:帮我|请|能)?(?:用文字|根据文字|用文本|用prompt)?(?:生成|制作|创作|做|来|给).{0,4}?${MM_VID}`,
+  'i'
+);
+const MM_KEYWORDS_EN = /(?:generate|create|make|draw|paint|synthesize)(?: an?| one)? (?:image|picture|photo|audio|video|song|music|clip)(?: for me)?|text[ -]?to[ -]?image|text[ -]?to[ -]?speech|text[ -]?to[ -]?video|\btts\b|image generation|video generation/i;
 
 const MM_CLASSIFY_SYS =
   '你是一个任务分类器。判断用户请求是否属于"多模态生成"任务，并给出具体模态类型。\n' +
@@ -1921,6 +1946,9 @@ async function routeMultimodalTask(task, prompt) {
   }
 }
 
+/** 简单的延时等待（视频生成轮询用） */
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 /**
  * 调用多模态模型生成内容。接口形态对齐 OpenAI 兼容约定，端点按模态拼接在 apiBase 之后。
  * @returns {Promise<{url:string}>}
@@ -1956,15 +1984,96 @@ async function callMultimodalModel(cfg, type, prompt) {
     return { url: blobUrl, blobUrl }; // 返回 blobUrl 以便后续清理
   }
   if (type === 'video') {
-    const url = base + '/videos/generations';
-    const data = await postJson(url, { model: cfg.model, prompt, n: 1 }, headers, timeout);
-    // 兼容多种响应格式：OpenAI {data:[{url,video_url}]} 或直接 {url,video_url}
-    const item = (data && data.data && data.data[0]) || data || {};
-    const vUrl = item.url || item.video_url || item.output_url ||
-                  (item.b64_json ? 'data:video/mp4;base64,' + item.b64_json : null) ||
-                  (item.video || null); // 兼容其他可能的字段名
-    if (!vUrl) throw new Error('接口未返回视频（' + JSON.stringify(data).slice(0, 120) + '）');
-    return { url: vUrl };
+    // OpenAI 兼容视频接口为异步流程：
+    //   POST /videos            → 创建任务，返回 { id, status: "queued"|"in_progress", ... }
+    //   GET  /videos/{id}       → 轮询状态，status 变为 "completed" / "failed" / "expired"
+    //   GET  /videos/{id}/content → 任务完成后流式返回 MP4 二进制（JSON 里无 video_url 字段）
+    const createUrl = base + '/videos';
+    const createRes = await postJson(createUrl, { model: cfg.model, prompt }, headers, timeout);
+    const videoId = createRes && createRes.id;
+    if (!videoId) throw new Error('创建视频任务失败（未返回 id）：' + JSON.stringify(createRes).slice(0, 160));
+
+    // 轮询任务状态直到终态（completed / failed / expired）。视频生成通常耗时数分钟，
+    // 因此用「任务总超时 taskTimeoutMs」约束从创建到拿到视频的总时长（含 AI 后台制作时间），
+    // 而每轮轮询/创建/下载请求各自受「单次请求超时 timeout」保护。两者语义分离、均可配置。
+    const pollUrl = base + '/videos/' + videoId;
+    const maxWaitMs = cfg.taskTimeoutMs || 600000; // 任务总超时（创建→拿到视频），不再与单次请求超时取 max
+    const intervalMs = 5000;
+    const start = Date.now();
+    let latest = createRes;
+    let lastRawText = (typeof createRes === 'object') ? JSON.stringify(createRes) : ''; // 记录最近一次原始响应，便于超时诊断
+
+
+    // 终态判断做成「容错多义词」：不再只认 status==='completed'。
+    // 只要命中「completed 等同义词 / 存在 completed_at / progress≥100 / 存在可下载 URL」任一条件即视为完成。
+    const isDone = (o) => {
+      if (!o || typeof o !== 'object') return false;
+      const s = String(o.status || '').toLowerCase();
+      if (['completed', 'succeeded', 'success', 'finished', 'done'].includes(s)) return true;
+      if (o.completed_at) return true;
+      if (typeof o.progress === 'number' && o.progress >= 100) return true;
+      const u = o.url || o.video_url || o.download_url || o.content_url || o.output_url ||
+                (o.metadata && o.metadata.url) || (o.output && o.output.url);
+      if (u && /^https?:\/\//i.test(u)) return true;
+      return false;
+    };
+    const isFailed = (o) => {
+      if (!o || typeof o !== 'object') return false;
+      const s = String(o.status || '').toLowerCase();
+      return ['failed', 'expired', 'error', 'cancelled', 'canceled'].includes(s);
+    };
+
+    while (true) {
+      const pct = (latest && typeof latest.progress === 'number') ? latest.progress : 0;
+      setStatus(`视频生成中（${pct}%）…`);
+
+      // 完成判断放到请求之前，避免「超时检查抢先抛错而读不到已完成响应」
+      if (isDone(latest)) break;
+      if (isFailed(latest)) {
+        const err = (latest && latest.error && (latest.error.message || latest.error)) || ('视频生成' + (latest.status || '失败'));
+        throw new Error('视频生成失败：' + err);
+      }
+      // 超时检查放到最末：先读最新状态，确认确实还没好再判超时
+      if (Date.now() - start > maxWaitMs) {
+        const tail = lastRawText ? '；最近一次原始响应（前 400 字符）：' + lastRawText.slice(0, 400) : '';
+        throw new Error('视频生成超时（>' + Math.round(maxWaitMs / 1000) + 's），任务最后状态：' +
+          (latest && latest.status || '未知') + '（进度 ' + pct + '%），任务 id：' + videoId + tail);
+      }
+
+      await sleep(intervalMs);
+      // cache:'no-store' 关键：破除浏览器对轮询 GET 的响应缓存（否则生成中的 30% 响应被缓存，
+      // 后续轮询一直返回这个旧值，直到超时；而手动查询不带缓存能看到最新的 completed）。
+      const pollRes = await fetchWithTimeout(
+        pollUrl,
+        { headers: { ...headers, Accept: 'application/json' }, cache: 'no-store' },
+        timeout
+      );
+      // 不再静默吞掉解析错误：解析失败时记录原始响应文本，便于排查服务端到底回了什么
+      const rawText = await pollRes.text().catch(() => '');
+      lastRawText = rawText;
+      try {
+        latest = JSON.parse(rawText);
+      } catch (e) {
+        console.warn('[video-poll] 轮询返回非 JSON 响应，已保留上次状态。原始内容（前 300 字符）：', rawText.slice(0, 300));
+      }
+    }
+
+    // 完成时优先使用任务对象中直接给出的可下载 URL（部分第三方网关会返回）；
+    // 否则按 OpenAI 官方行为走 /content 端点下载为 blob（该端点需鉴权，
+    // 浏览器 <video> 无法附带 Bearer，故下载成 blob URL 再播放）。
+    const directUrl = latest.url || latest.video_url || latest.download_url ||
+                      latest.content_url || latest.output_url ||
+                      (latest.metadata && latest.metadata.url) ||
+                      (latest.output && latest.output.url);
+    if (directUrl && /^https?:\/\//i.test(directUrl)) {
+      return { url: directUrl };
+    }
+    const authHeader = { Authorization: headers.Authorization };
+    const contentRes = await fetchWithTimeout(pollUrl + '/content', { headers: authHeader }, timeout);
+    const blob = await contentRes.blob();
+    if (!blob || !blob.size) throw new Error('视频内容为空（任务 id：' + videoId + '）');
+    const blobUrl = URL.createObjectURL(blob);
+    return { url: blobUrl, blobUrl }; // 返回 blobUrl 以便后续清理
   }
   throw new Error('不支持的模态类型：' + type);
 }
