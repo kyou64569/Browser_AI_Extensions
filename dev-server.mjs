@@ -19,6 +19,7 @@ const VENDOR_BASE = {
   anthropic: 'https://api.anthropic.com/v1',
   gemini: 'https://generativelanguage.googleapis.com/v1beta',
   ollama: 'http://localhost:11434',
+  ima: 'https://ima.qq.com',
 };
 
 // 服务端密钥（绝不发送到前端）。从 preview/secrets.json 读取。
@@ -86,6 +87,10 @@ function proxy(req, res, vendor, restPath) {
       headers['anthropic-version'] = '2023-06-01';
     }
     if (vendor === 'gemini') delete headers.authorization;
+    if (vendor === 'ima' && secrets.ima) {
+      headers['ima-openapi-clientid'] = secrets.ima.clientId || '';
+      headers['ima-openapi-apikey'] = secrets.ima.apiKey || '';
+    }
 
     const lib = parsed.protocol === 'https:' ? https : http;
     const opt = {

@@ -44,6 +44,8 @@
       <form class="composer" id="composer">
         <!-- 功能模式高亮标签：激活功能期间显示，发送消息或手动关闭后消失 -->
         <div class="func-tag" id="funcTag" hidden></div>
+        <!-- 常驻知识库标签：选中知识库后常驻显示，直到手动关闭 -->
+        <div class="func-tag" id="kbTag" hidden></div>
         <div class="chat-box">
           <div class="attachments" id="attachments"></div>
           <textarea id="chatInput" rows="2" placeholder="给 AI 助手发消息…  (Enter 发送，Shift+Enter 换行)"></textarea>
@@ -75,6 +77,9 @@
                   </button>
                   <button type="button" class="func-item" role="menuitem" data-act="automate">
                     <span class="fi-ico">🤖</span><span class="fi-label">网页操作</span>
+                  </button>
+                  <button type="button" class="func-item" role="menuitem" data-act="kb">
+                    <span class="fi-ico">📚</span><span class="fi-label">知识库</span>
                   </button>
                 </div>
               </div>
@@ -158,9 +163,12 @@
           <div id="cc-status" style="margin-top:6px;color:#6b7280;font-size:12px;min-height:16px;"></div>
         </div>
 
-        <div class="card">
-          <h3>本地知识库（可选）</h3>
-          <label class="field">服务地址 <input id="kbBase" placeholder="http://localhost:8000" /></label>
+        <div class="card" id="kbCard">
+          <h3>📚 知识库</h3>
+          <p class="card-note">选择一个知识库来源并填写凭证，之后在聊天框「＋」菜单中即可选择具体知识库进行提问。凭证仅保存在本地，不会上传到第三方。</p>
+          <div class="kb-providers" id="kbProviderTabs" role="tablist"></div>
+          <div id="kbProviderForms"></div>
+          <div id="kbStatus" style="margin-top:6px;color:#6b7280;font-size:12px;min-height:16px;"></div>
         </div>
       </div>
     </section>
@@ -230,6 +238,21 @@
   <div class="img-lightbox" id="imgLightbox" hidden>
     <button type="button" class="img-lightbox-close" id="imgLightboxClose" title="关闭">×</button>
     <img class="img-lightbox-img" id="imgLightboxImg" alt="图片预览" />
+  </div>
+
+  <!-- 知识库选择弹层：点击加号「知识库」后，列出当前账号下的知识库供选择 -->
+  <div class="kb-picker" id="kbPicker" hidden>
+    <div class="kb-picker-mask" id="kbPickerMask"></div>
+    <div class="kb-picker-panel" role="dialog" aria-label="选择知识库">
+      <div class="kb-picker-head">
+        <span>选择知识库</span>
+        <div class="kb-providers kb-providers-inline" id="kbPickerProviderTabs"></div>
+        <button type="button" class="kb-picker-close" id="kbPickerClose" title="关闭" aria-label="关闭">×</button>
+      </div>
+      <div class="kb-picker-body" id="kbPickerList">
+        <div class="kb-picker-loading">加载中…</div>
+      </div>
+    </div>
   </div>
 
   <script type="module" src="preview.js"></script>

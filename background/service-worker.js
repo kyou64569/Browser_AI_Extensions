@@ -2,10 +2,11 @@
 // MV3 service worker：模块装配中枢。持有 router / fallback / kb 连接器。
 // 通过消息与 side panel / popup / content script 通信。
 
-import { getModels, getKbConfig, getWhisperModels } from '../shared/storage.js';
+import { getModels, getKbConfig, getKbState, getWhisperModels } from '../shared/storage.js';
 import { summarizePage } from '../features/summarize.js';
 import { LocalKbConnector } from '../connectors/local-kb.js';
 import { OnlineKbConnector } from '../connectors/online-kb.js';
+import { createKbConnector, getKbProviderDef } from '../connectors/kb-registry.js';
 import { execTool } from './web-tools.js';
 import { createClient } from '../core/model-client.js';
 import { chunkUnits, RateGate } from '../core/translate-rate.js';
@@ -1204,6 +1205,61 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
     })();
     return true;
+  }
+  // 知识库（多 provider 可切换）：连接测试 / 列出知识库 / 检索。
+  // 凭证来自 getKbState()，按 msg.provider 取对应 provider 的配置并实例化连接器。
+  // 后台发起请求配合 host_permissions <all_urls>，不受 CORS 限制。
+  if (msg.type === 'KB_TEST' || msg.type === 'KB_LIST' || msg.type === 'KB_SEARCH') {
+    let settled = false;
+    const SAFETY_MS = 55000; // 略小于发送端 60s 超时，确保发送端先收到明确的超时错误
+    const safety = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { sendResponse({ error: '知识库请求超时' }); } catch (_) {}
+    }, SAFETY_MS);
+    (async () => {
+      try {
+        const state = await getKbState();
+        const providerId = msg.provider || state.active;
+        const provider = state.providers[providerId];
+        if (!provider || provider.placeholder) {
+          if (!settled) { settled = true; clearTimeout(safety); }
+          sendResponse({ error: `未配置知识库来源「${providerId}」` });
+          return;
+        }
+        const def = getKbProviderDef(providerId);
+        if (def && def.placeholder) {
+          if (!settled) { settled = true; clearTimeout(safety); }
+          sendResponse({ error: `「${def.label}」尚未支持` });
+          return;
+        }
+        const kb = createKbConnector(provider.type, provider.cfg);
+        if (!kb) {
+          if (!settled) { settled = true; clearTimeout(safety); }
+          sendResponse({ error: `暂不支持的知识库类型：${provider.type}` });
+          return;
+        }
+        if (msg.type === 'KB_TEST') {
+          const r = await kb.test();
+          if (!settled) { settled = true; clearTimeout(safety); }
+          sendResponse({ ok: true, info: r });
+        } else if (msg.type === 'KB_LIST') {
+          const list = await kb.listKb({ limit: 100 });
+          if (!settled) { settled = true; clearTimeout(safety); }
+          sendResponse({ ok: true, list });
+        } else if (msg.type === 'KB_SEARCH') {
+          const chunks = await kb.search(msg.query || '', {
+            knowledgeBaseId: msg.knowledgeBaseId || undefined,
+          });
+          if (!settled) { settled = true; clearTimeout(safety); }
+          sendResponse({ ok: true, chunks });
+        }
+      } catch (e) {
+        if (!settled) { settled = true; clearTimeout(safety); }
+        sendResponse({ error: e?.message || '知识库请求失败' });
+      }
+    })();
+    return true; // 异步 sendResponse
   }
   // 实时字幕：把一句话的 ASR 碎片整段整理 + 翻译，替换草稿区的零散词组
   if (msg.type === 'LIVE_CAPTION_REFINE') {

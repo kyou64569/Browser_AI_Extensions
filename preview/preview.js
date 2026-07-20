@@ -5,11 +5,12 @@
 import { chatStream, chatOnce } from '../features/chat.js';
 import { summarizePage, summarizeStream } from '../features/summarize.js';
 import { processSelection } from '../features/selection.js';
-import { LocalKbConnector } from '../connectors/local-kb.js';
 import { buildToolSystemPrompt, parseToolCalls, parseToolCall, stripToolCall } from '../features/automation.js';
 import { listModels } from '../core/list-models.js';
 import { thinkingLevels } from '../shared/utils.js';
 import { postJson, fetchWithTimeout } from '../core/http.js';
+import { normalizeKbState, defaultKbState } from '../shared/storage.js';
+import { KB_PROVIDERS, createKbConnector } from '../connectors/kb-registry.js';
 
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => document.querySelectorAll(s);
@@ -150,14 +151,14 @@ async function loadModelsFromStorage() {
   }
   return LS.get('preview.models', [defaultModel()]);
 }
-async function loadKbFromStorage() {
+async function loadKbState() {
   if (hasChromeStorage()) {
     try {
       const r = await chrome.storage.local.get('kb');
-      if (r.kb) return r.kb;
+      if (r.kb) return normalizeKbState(r.kb);
     } catch (_) { /* 退回 localStorage */ }
   }
-  return LS.get('preview.kb', { baseUrl: '' });
+  return normalizeKbState(LS.get('preview.kb', null));
 }
 async function persistModelsToStorage(arr) {
   models = arr;
@@ -166,11 +167,11 @@ async function persistModelsToStorage(arr) {
     try { await chrome.storage.local.set({ models: arr }); } catch (_) {}
   }
 }
-async function persistKbToStorage(cfg) {
-  kbCfg = cfg;
-  LS.set('preview.kb', cfg);
+async function persistKbState(state) {
+  kbState = state;
+  LS.set('preview.kb', state);
   if (hasChromeStorage()) {
-    try { await chrome.storage.local.set({ kb: cfg }); } catch (_) {}
+    try { await chrome.storage.local.set({ kb: state }); } catch (_) {}
   }
 }
 async function loadImgUploadFromStorage() {
@@ -461,10 +462,27 @@ async function syncConfigFromStorage() {
     persistMultimodalToStorage(mm);
     renderMultimodalModels();
   }
-  const kb = await loadKbFromStorage();
-  if (kb && JSON.stringify(kb) !== JSON.stringify(kbCfg)) {
-    kbCfg = kb;
-    LS.set('preview.kb', kbCfg);
+  const kb = await loadKbState();
+  if (kb && JSON.stringify(kb) !== JSON.stringify(kbState)) {
+    kbState = kb;
+    LS.set('preview.kb', kbState);
+  }
+  // 用已加载的状态刷新功能页知识库区（凭证/激活来源）
+  renderKbProviderTabs();
+  renderKbForms();
+  // 恢复常驻知识库（activeKb）
+  if (hasChromeStorage()) {
+    try {
+      const r = await chrome.storage.local.get('kbActive');
+      if (r.kbActive && r.kbActive.id) {
+        // 仅当来源仍有效时恢复（provider 仍存在于注册表 + 当前状态中）
+        const def = KB_PROVIDERS.find(p => p.id === r.kbActive.provider);
+        if (def && !def.placeholder && kbState.providers[r.kbActive.provider]) {
+          activeKb = r.kbActive;
+          renderKbTag();
+        }
+      }
+    } catch (_) { /* 忽略 */ }
   }
   const imgUp = await loadImgUploadFromStorage();
   if (imgUp && JSON.stringify(imgUp) !== JSON.stringify(imgUploadCfg)) {
@@ -475,7 +493,8 @@ async function syncConfigFromStorage() {
 
 let models = LS.get('preview.models', [defaultModel()]);
 let backupModels = LS.get('preview.backupModels', []);
-let kbCfg = LS.get('preview.kb', { baseUrl: '' });
+let kbState = defaultKbState();
+let activeKb = null; // 常驻知识库：{ provider, id, name }，选中后跨消息生效直到手动关闭
 let imgUploadCfg = LS.get('preview.imgUpload', { url: '', auth: '', path: '' });
 let conversations = LS.get('preview.conversations', []); // 历史会话列表
 let whisperModels = LS.get('preview.whisperModels', []);  // Whisper 语音识别模型配置 []
@@ -610,6 +629,14 @@ function startNewChat() {
   input.focus();
 }
 
+// 从存储的历史消息中剥离“【参考知识库：…】”检索前缀，恢复为用户原文。
+// 仅用于清理旧版本误把 KB 上下文存进用户消息的脏数据；标记唯一，不会误伤真实用户输入。
+function stripKbPrefix(text) {
+  if (typeof text !== 'string' || !text.startsWith('【参考知识库：「')) return text;
+  const idx = text.lastIndexOf('\n\n');
+  return idx >= 0 ? text.slice(idx + 2) : '';
+}
+
 // 恢复历史会话：将其聊天记录加载到主界面，可继续对话
 function loadConversation(id) {
   const conv = conversations.find(c => c.id === id);
@@ -617,7 +644,7 @@ function loadConversation(id) {
   currentConvId = id;
   messages = (conv.messages || []).map(m => ({
     role: m.role,
-    content: m.content,
+    content: m.role === 'user' ? stripKbPrefix(m.content) : m.content,
     ...(m.attachments ? { attachments: m.attachments.map(a => ({ ...a })) } : {}),
     ...(m.media ? { media: { type: m.media.type, url: m.media.url, name: m.media.name || null } } : {}),
   }));
@@ -917,6 +944,18 @@ async function send() {
     return;
   }
 
+  // 常驻知识库检索增强（仅普通聊天路径注入；功能模式各自有上下文，不叠加 KB）
+  let kbChunks = null;
+  if (!funcMode && activeKb) {
+    setStatus('正在检索知识库…');
+    try {
+      kbChunks = await searchKbInChat(text);
+    } catch (e) {
+      console.warn('[kb] 检索失败，跳过知识库增强：', e.message);
+      kbChunks = null;
+    }
+  }
+
   // 翻译 / 解释 / OCR：把用户输入包上指令前缀；其余情况正常拼装（图片走多模态附件）
   const content = funcMode
     ? (funcMode === 'translate'
@@ -927,6 +966,15 @@ async function send() {
           // OCR：识别并提取图片中的文字，只输出纯文本（无需用户输入正文）
           : '请识别并提取图片中的所有文字内容，只输出识别出的纯文本，不要添加任何解释、注释或额外说明。' + (text ? '\n\n补充说明：' + text : ''))
     : buildContent(text, attachments);
+
+  // 常驻知识库检索增强（RAG）：仅注入到“发给模型的上下文”中，用户气泡只展示原本发送的内容，
+  // 避免气泡里出现一长串“【参考知识库：…】”检索片段。ima / 本地知识库统一走此逻辑。
+  let apiContent = content;
+  if (!funcMode && kbChunks && kbChunks.length) {
+    apiContent = '【参考知识库：「' + activeKb.name + '」中检索到的相关内容】\n' +
+      kbChunks.map((c, i) => `[${i + 1}] ${c.content}\n（来源：${c.source || '未知'}）`).join('\n\n') +
+      '\n\n' + content;
+  }
   // 图片转为多模态附件（data URL），文本文件保留正文
   const imageAttachments = attachments
     .filter(a => a.type.startsWith('image/') && a.dataUrl)
@@ -935,12 +983,14 @@ async function send() {
   if (funcMode === 'ocr' && imageAttachments.length === 0) {
     setStatus('请先添加要识别的图片', 'err'); return;
   }
+  // 历史与气泡只存用户原文（content）；发给模型的上下文用 apiContent（含知识库检索片段）。
   const userMsg = { role: 'user', content, ...(imageAttachments.length ? { attachments: imageAttachments } : {}) };
+  const apiUserMsg = (apiContent === content) ? userMsg : { ...userMsg, content: apiContent };
 
   input.value = ''; autosize();
   attachments = []; renderAttachments();
   pushUser(content, imageAttachments.map(a => a.data));
-  const apiMessages = [...messages, userMsg];
+  const apiMessages = [...messages, apiUserMsg];
 
   // 决定模式与候选模型
   const mode = chatModelId === '__collab__' ? 'collab' : 'single';
@@ -1136,15 +1186,26 @@ async function runAutomation(userText) {
   let lastToolFailed = false;
 
   // 模型可用性检查（与 send() 一致）
-  const mode = chatModelId === '__collab__' ? 'collab' : 'single';
-  if (mode === 'collab') {
-    if (!models.filter(m => m.enabled !== false).some(m => m.isPrimary)) {
+  // 网页操作的 ReAct 工具循环必须由单一模型驱动页面变更：
+  // 多个模型分别操作同一页面会互相干扰、破坏页面状态。因此选中“多模型协作”时，
+  // 降级为「仅主模型」单模型执行（即安全形态的“主模型操作网页”），不进入 chatStream 的整合分支
+  // （整合分支会把 AI 的 toolcall 意图替换成自然语言总结，导致网页实际不被操作）。
+  let autoMode, autoSelectedId;
+  if (chatModelId === '__collab__') {
+    const primary = models.filter(m => m.enabled !== false).find(m => m.isPrimary);
+    if (!primary) {
       alert('请在模型配置页面选择主模型后再进行网页操作');
       return;
     }
-  } else if (!models.some(m => m.id === chatModelId)) {
-    alert('请先在设置中添加模型');
-    return;
+    autoMode = 'single';
+    autoSelectedId = primary.id;
+  } else {
+    if (!models.some(m => m.id === chatModelId)) {
+      alert('请先在设置中添加模型');
+      return;
+    }
+    autoMode = 'single';
+    autoSelectedId = chatModelId;
   }
   const ref = currentRefModel();
   const ts = (ref && ref.supportsThinking) ? thinkingStrength : undefined;
@@ -1166,8 +1227,8 @@ async function runAutomation(userText) {
       setStatus('思考中…');
       const apiMessages = [sysMsg, ...messages, ...loop];
       for await (const chunk of chatStream({ models, backupModels }, apiMessages, {
-        mode,
-        selectedId: mode === 'single' ? chatModelId : undefined,
+        mode: autoMode,
+        selectedId: autoSelectedId,
         thinkingStrength: ts,
         onFallback: (i, cfg, reason) => setStatus(`已切换到备用模型 #${i + 1}：${cfg.name}（${reason}）`),
       })) {
@@ -1401,6 +1462,125 @@ function activateFunc(act) {
     updateSendState();
     return;
   }
+  if (act === 'kb') {
+    openKbPicker();
+    return;
+  }
+}
+
+// ============================================================
+// 知识库（腾讯 ima）：加号菜单「知识库」→ 拉列表 → 选库常驻
+// ============================================================
+/** 渲染弹层顶部 provider 切换标签（仅非占位来源） */
+function renderKbPickerProviderTabs() {
+  const tabs = $('#kbPickerProviderTabs');
+  if (!tabs) return;
+  tabs.innerHTML = '';
+  KB_PROVIDERS.filter((p) => !p.placeholder).forEach((p) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'kb-provider-tab' + (p.id === kbState.active ? ' active' : '');
+    b.textContent = p.label;
+    b.onclick = () => {
+      if (kbState.active === p.id) return;
+      kbState.active = p.id;
+      persistKbState(kbState);
+      closeKb(); // 切换来源后，原选中库失效
+      renderKbPickerProviderTabs();
+      openKbPicker(); // 重新拉列表
+    };
+    tabs.appendChild(b);
+  });
+}
+
+/** 打开知识库选择弹层，并拉取当前激活 provider 下的知识库列表 */
+function openKbPicker() {
+  const picker = $('#kbPicker');
+  const list = $('#kbPickerList');
+  if (list) list.innerHTML = '<div class="kb-picker-loading">加载中…</div>';
+  renderKbPickerProviderTabs();
+  picker.hidden = false;
+  if (typeof chrome === 'undefined' || !chrome.runtime || !chrome.runtime.id) {
+    list.innerHTML = '<div class="kb-picker-err">请先在扩展环境中配置知识库凭证（功能页 → 知识库）</div>';
+    return;
+  }
+  const providerId = kbState.active;
+  const def = KB_PROVIDERS.find((p) => p.id === providerId);
+  (async () => {
+    try {
+      const resp = await chrome.runtime.sendMessage({ type: 'KB_LIST', provider: providerId });
+      if (!resp) throw new Error('无响应');
+      if (resp.error) throw new Error(resp.error);
+      const kbs = resp.list || [];
+      if (!kbs.length) {
+        list.innerHTML = `<div class="kb-picker-err">「${def ? def.label : providerId}」中未找到知识库，请先在对应服务中创建</div>`;
+        return;
+      }
+      list.innerHTML = '';
+      kbs.forEach((kb) => {
+        const item = document.createElement('button');
+        item.type = 'button';
+        item.className = 'kb-picker-item';
+        if (activeKb && activeKb.provider === providerId && activeKb.id === kb.id) item.classList.add('active');
+        item.innerHTML =
+          `<span class="kb-name">${escapeHtml(kb.name)}</span>` +
+          `<span class="kb-count">${kb.contentCount || 0} 条</span>`;
+        item.onclick = () => {
+          activeKb = { provider: providerId, id: kb.id, name: kb.name };
+          try { chrome.storage.local.set({ kbActive: activeKb }); } catch (_) {}
+          picker.hidden = true;
+          renderKbTag();
+          input.focus();
+        };
+        list.appendChild(item);
+      });
+    } catch (e) {
+      list.innerHTML = '<div class="kb-picker-err">获取失败：' + escapeHtml(e.message) + '</div>';
+    }
+  })();
+}
+
+/** 渲染常驻知识库标签（聊天框上方） */
+function renderKbTag() {
+  const box = $('#kbTag');
+  if (!activeKb) { box.hidden = true; box.innerHTML = ''; return; }
+  box.hidden = false;
+  const provDef = KB_PROVIDERS.find((p) => p.id === (activeKb && activeKb.provider));
+  const provLabel = provDef ? provDef.label : '知识库';
+  box.innerHTML =
+    `<span class="func-tag-pill">📚 ${escapeHtml(provLabel)}：${escapeHtml(activeKb.name)}` +
+    `<button type="button" class="func-tag-x" id="kbTagClose" title="关闭知识库" aria-label="关闭">×</button></span>`;
+  $('#kbTagClose').onclick = closeKb;
+}
+/** 关闭常驻知识库 */
+function closeKb() {
+  activeKb = null;
+  try { chrome.storage.local.set({ kbActive: null }); } catch (_) {}
+  renderKbTag();
+}
+
+// 弹层关闭交互
+if ($('#kbPickerClose')) $('#kbPickerClose').onclick = () => { $('#kbPicker').hidden = true; };
+if ($('#kbPickerMask')) $('#kbPickerMask').onclick = () => { $('#kbPicker').hidden = true; };
+
+/** 知识库检索（聊天常驻注入用）：经后台 KB_SEARCH 取片段，带超时保护 */
+async function searchKbInChat(query) {
+  if (typeof chrome === 'undefined' || !chrome.runtime || !chrome.runtime.id) {
+    throw new Error('知识库检索需在扩展环境中使用');
+  }
+  const timeoutMs = 30000;
+  let resp;
+  try {
+    resp = await Promise.race([
+      chrome.runtime.sendMessage({ type: 'KB_SEARCH', provider: activeKb.provider, query, knowledgeBaseId: activeKb.id }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('知识库检索超时')), timeoutMs)),
+    ]);
+  } catch (e) {
+    throw e;
+  }
+  if (!resp) throw new Error('知识库无响应');
+  if (resp.error) throw new Error(resp.error);
+  return resp.chunks || [];
 }
 
 /** 设置功能模式并渲染标签 */
@@ -1692,10 +1872,22 @@ async function runSummarizeInChat(instruction) {
   streaming = true; sendBtn.disabled = true; setStatus('正在总结…');
 
   let acc = ''; let started = false;
+  const sumMode = chatModelId === '__collab__' ? 'collab' : 'single';
+  if (sumMode === 'collab' && !models.filter(m => m.enabled !== false).some(m => m.isPrimary)) {
+    a.stopTyping();
+    a.setText('请在模型配置页面选择主模型后再进行网页总结');
+    setStatus('未选择主模型', 'err');
+    streaming = false; updateSendState(); persistActiveConversation();
+    return;
+  }
+  const sumRef = currentRefModel();
+  const sumTs = (sumRef && sumRef.supportsThinking) ? thinkingStrength : undefined;
   try {
     for await (const chunk of summarizeStream({ models: prepareModels() }, page, {
       kb: makeKb(),
       instruction: prompt,
+      mode: sumMode,
+      thinkingStrength: sumTs,
       onFallback: (i, cfg, reason) => setStatus(`已切换到备用模型 #${i + 1}：${cfg.name}（${reason}）`),
     })) {
       if (!started) { started = true; a.stopTyping(); setStatus('正在回复…'); }
@@ -2196,12 +2388,12 @@ function renderModels() {
         </label>
       </div>
       <div class="mc-checks">
-        <label><input type="checkbox" data-f="enabled" ${m.enabled !== false ? 'checked' : ''}/> 启用</label>
-        <label><input type="checkbox" data-f="supportsVision" ${m.supportsVision ? 'checked' : ''}/> 视觉</label>
-        <label><input type="checkbox" data-f="supportsStream" ${m.supportsStream !== false ? 'checked' : ''}/> 流式</label>
-        <label><input type="checkbox" data-f="isPrimary" ${m.isPrimary ? 'checked' : ''}/> 主模型</label>
-        <label><input type="checkbox" data-f="supportsThinking" ${m.supportsThinking ? 'checked' : ''}/> 思考</label>
-        <label class="res-flag" style="display:${m.supportsThinking && m.vendor !== 'anthropic' ? '' : 'none'}"><input type="checkbox" data-f="reasoningEffortSupported" ${m.reasoningEffortSupported ? 'checked' : ''}/> 支持 reasoning_effort（推理模型）</label>
+        <label data-tip="勾选后此模型参与多模型协作；单模型处理时此复选框无作用"><input type="checkbox" data-f="enabled" ${m.enabled !== false ? 'checked' : ''}/> 启用</label>
+        <label data-tip="辅助视觉模型：勾选后，当聊天模型不支持视觉处理时自动调用此模型；只能勾选一个视觉模型"><input type="checkbox" data-f="supportsVision" ${m.supportsVision ? 'checked' : ''}/> 视觉</label>
+        <label data-tip="逐字流式输出；关闭则等待完整结果后一次性返回"><input type="checkbox" data-f="supportsStream" ${m.supportsStream !== false ? 'checked' : ''}/> 流式</label>
+        <label data-tip="多模型协作时由它整合各子模型结果；只能勾选一个主模型"><input type="checkbox" data-f="isPrimary" ${m.isPrimary ? 'checked' : ''}/> 主模型</label>
+        <label data-tip="开启推理/思考能力，推理模型会先思考再作答（Anthropic 走 thinking budget）"><input type="checkbox" data-f="supportsThinking" ${m.supportsThinking ? 'checked' : ''}/> 思考</label>
+        <label class="res-flag" data-tip="OpenAI 兼容推理模型（o1/o3 等）专用：开启后发送 reasoning_effort 参数；普通模型（如 gpt-4o）请勿勾选，否则会报 HTTP 400" style="display:${m.supportsThinking && m.vendor !== 'anthropic' ? '' : 'none'}"><input type="checkbox" data-f="reasoningEffortSupported" ${m.reasoningEffortSupported ? 'checked' : ''}/> 推理</label>
       </div>
     </div>`;
   }).join('');
@@ -2667,8 +2859,100 @@ async function refreshWhisperModelList(arr, i, wrap) {
 $('#addWhisperModel').onclick = () => { whisperModels.push(defaultWhisperModel()); persistWhisperToStorage(whisperModels); renderWhisperModels(); if (ccWhisperRefresh) ccWhisperRefresh(); };
 $('#addMultimodalModel').onclick = () => { multimodalModels.push(defaultMultimodalModel()); persistMultimodalToStorage(multimodalModels); renderMultimodalModels(); };
 
-$('#kbBase').value = kbCfg.baseUrl || '';
-$('#kbBase').addEventListener('change', () => { kbCfg.baseUrl = $('#kbBase').value; persistKbToStorage(kbCfg); });
+// ============================================================
+// 知识库（多 provider 可切换）：功能页凭证区
+// ============================================================
+/** 渲染功能页 provider 切换标签 */
+function renderKbProviderTabs() {
+  const tabs = $('#kbProviderTabs');
+  if (!tabs) return;
+  tabs.innerHTML = '';
+  KB_PROVIDERS.forEach((p) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'kb-provider-tab' + (p.id === kbState.active ? ' active' : '') + (p.placeholder ? ' placeholder' : '');
+    b.textContent = p.label;
+    b.disabled = !!p.placeholder;
+    b.onclick = () => selectKbProvider(p.id);
+    tabs.appendChild(b);
+  });
+}
+/** 切换当前激活的 provider（决定「＋」菜单拉哪个来源的列表） */
+function selectKbProvider(id) {
+  const def = KB_PROVIDERS.find((p) => p.id === id);
+  if (!def || def.placeholder) return;
+  kbState.active = id;
+  persistKbState(kbState);
+  renderKbProviderTabs();
+  renderKbForms();
+}
+/** 根据当前激活 provider 渲染凭证表单 */
+function renderKbForms() {
+  const wrap = $('#kbProviderForms');
+  if (!wrap) return;
+  const id = kbState.active;
+  const def = KB_PROVIDERS.find((p) => p.id === id);
+  if (!def) return;
+  if (def.placeholder) {
+    wrap.innerHTML = '<p class="card-note">该知识库来源即将推出，敬请期待。</p>';
+    return;
+  }
+  const cfg = (kbState.providers[id] && kbState.providers[id].cfg) || {};
+  const fieldsHtml = def.fields.map((f) => {
+    const val = cfg[f.key] || '';
+    return `<label class="field">${escapeHtml(f.label)} <input id="kbF_${f.key}" type="${f.type}" value="${escapeHtml(val)}" placeholder="${escapeHtml(f.placeholder || '')}" autocomplete="off" spellcheck="false" /></label>`;
+  }).join('');
+  wrap.innerHTML =
+    fieldsHtml +
+    `<div style="display:flex;gap:8px;margin-top:10px;">
+       <button type="button" class="primary" id="kbSave" style="flex:1;">保存</button>
+       <button type="button" id="kbTest" style="flex:1;">连接测试</button>
+     </div>`;
+  $('#kbSave').onclick = () => saveKbProviderCreds(id);
+  $('#kbTest').onclick = () => testKbProvider(id);
+}
+/** 读取当前表单并保存某个 provider 的凭证到状态 */
+function saveKbProviderCreds(id) {
+  const def = KB_PROVIDERS.find((p) => p.id === id);
+  if (!def) return;
+  const cfg = {};
+  def.fields.forEach((f) => {
+    const el = document.getElementById('kbF_' + f.key);
+    cfg[f.key] = el ? el.value.trim() : '';
+  });
+  kbState.providers[id] = kbState.providers[id] || { type: def.id, cfg: {} };
+  kbState.providers[id].type = def.id;
+  kbState.providers[id].cfg = cfg;
+  kbState.active = id;
+  persistKbState(kbState);
+  renderKbProviderTabs();
+  const st = $('#kbStatus');
+  st.textContent = '已保存（如未填写密钥则不生效）';
+  st.className = '';
+}
+/** 连接测试：保存最新输入后，经后台 KB_TEST 验证 */
+async function testKbProvider(id) {
+  saveKbProviderCreds(id);
+  const st = $('#kbStatus');
+  if (typeof chrome === 'undefined' || !chrome.runtime || !chrome.runtime.id) {
+    st.textContent = '连接测试需在扩展环境中使用'; st.className = 'model-status err';
+    return;
+  }
+  st.textContent = '正在连接测试…'; st.className = '';
+  try {
+    const resp = await chrome.runtime.sendMessage({ type: 'KB_TEST', provider: id });
+    if (!resp) throw new Error('无响应');
+    if (resp.error) throw new Error(resp.error);
+    const info = resp.info || {};
+    st.textContent = `连接成功！状态：${info.status || 'ok'}` + (info.version ? `（v${info.version}）` : '');
+    st.className = 'model-status ok';
+  } catch (e) {
+    st.textContent = '连接失败：' + e.message; st.className = 'model-status err';
+  }
+}
+// 初始化功能页知识库区
+renderKbProviderTabs();
+renderKbForms();
 
 // ============================================================
 // 模型配置复选框联动（视觉全局互斥 / 主模型单选受启用约束）
@@ -2790,7 +3074,9 @@ function renderModelSelect() {
   renderThinkingSelect();
 }
 function makeKb() {
-  return kbCfg.baseUrl ? new LocalKbConnector({ baseUrl: kbCfg.baseUrl }) : null;
+  const p = kbState.providers[kbState.active];
+  if (!p || p.placeholder) return null;
+  return createKbConnector(p.type, p.cfg || {});
 }
 
 // ============================================================
@@ -3228,7 +3514,7 @@ if (hasChromeStorage()) {
       LS.set('preview.whisperModels', whisperModels);
       renderWhisperModels();
     }
-    if (changes.kb) { kbCfg = changes.kb.newValue || kbCfg; LS.set('preview.kb', kbCfg); }
+    if (changes.kb) { kbState = normalizeKbState(changes.kb.newValue || kbState); LS.set('preview.kb', kbState); }
     if (changes.conversations) {
       // 会话数据被其他来源修改（如跨实例同步）：以存储为权威源刷新内存与界面，
       // 确保主页面会话列表准确过滤已删除项，避免缓存/未刷新导致的残留显示。
@@ -3252,3 +3538,39 @@ syncConfigFromStorage();
 if (hasChromeStorage()) {
   loadConversationsFromStorage().then(arr => { conversations = arr || []; });
 }
+
+// ---------- 复选框悬停提示：浮动提示框，自动夹在视口内避免溢出屏幕外 ----------
+(function initTips() {
+  const tip = document.createElement('div');
+  tip.className = 'tip-pop';
+  document.body.appendChild(tip);
+  let current = null;
+  function place(el) {
+    const r = el.getBoundingClientRect();
+    tip.style.visibility = 'hidden';
+    const tw = tip.offsetWidth, th = tip.offsetHeight;
+    tip.style.visibility = 'visible';
+    let left = r.left + r.width / 2 - tw / 2;
+    left = Math.max(8, Math.min(left, window.innerWidth - tw - 8));
+    let top = r.top - th - 8;
+    if (top < 8) top = r.bottom + 8;
+    tip.style.left = left + 'px';
+    tip.style.top = top + 'px';
+  }
+  document.addEventListener('mouseover', (e) => {
+    const el = e.target.closest('[data-tip]');
+    if (el && el !== current) {
+      current = el;
+      tip.textContent = el.getAttribute('data-tip');
+      tip.style.display = 'block';
+      place(el);
+    }
+  });
+  document.addEventListener('mouseout', (e) => {
+    const el = e.target.closest('[data-tip]');
+    if (el && !el.contains(e.relatedTarget)) {
+      tip.style.display = 'none';
+      current = null;
+    }
+  });
+})();

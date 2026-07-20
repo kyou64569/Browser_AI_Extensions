@@ -3,13 +3,50 @@
 // 复选框与侧边栏设置页保持一致：启用 / 视觉 / 流式 / 主模型 / 思考，
 // 并实现同样的联动（视觉全局互斥、主模型单选受启用约束）。
 
-import { getModels, saveModels, getKbConfig, saveKbConfig } from '../../shared/storage.js';
+import { getModels, saveModels, getKbState, saveKbState } from '../../shared/storage.js';
 import { createModelConfig } from '../../core/model-config.js';
+import { KB_PROVIDERS } from '../../connectors/kb-registry.js';
 
 const listEl = document.getElementById('modelList');
 
 // 内存中的模型列表，便于复选框联动即时生效（点“保存”时写回 storage）
 let models = [];
+
+// 知识库多 provider 状态的草稿（随表单输入实时更新，点“保存”时写回 storage）
+let kbStateDraft = null;
+
+/** 渲染知识库 provider 切换标签 + 当前 provider 的凭证表单 */
+async function renderKbProviders() {
+  kbStateDraft = await getKbState();
+  const tabs = document.getElementById('kbProviderTabs');
+  tabs.innerHTML = '';
+  KB_PROVIDERS.forEach((p) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'kb-provider-tab' + (p.id === kbStateDraft.active ? ' active' : '') + (p.placeholder ? ' placeholder' : '');
+    b.textContent = p.label;
+    b.disabled = !!p.placeholder;
+    b.onclick = () => { kbStateDraft.active = p.id; renderKbProviders(); };
+    tabs.appendChild(b);
+  });
+  const wrap = document.getElementById('kbProviderForms');
+  const id = kbStateDraft.active;
+  const def = KB_PROVIDERS.find((p) => p.id === id);
+  if (!def) { wrap.innerHTML = ''; return; }
+  if (def.placeholder) { wrap.innerHTML = '<p class="card-note">该知识库来源即将推出，敬请期待。</p>'; return; }
+  const cfg = (kbStateDraft.providers[id] && kbStateDraft.providers[id].cfg) || {};
+  wrap.innerHTML = def.fields.map((f, i) => `<label>${f.label} <input id="kbF_${i}" type="${f.type}" placeholder="${f.placeholder || ''}" /></label>`).join('');
+  def.fields.forEach((f, i) => {
+    const el = document.getElementById('kbF_' + i);
+    el.value = cfg[f.key] || '';
+    el.oninput = () => {
+      kbStateDraft.providers[id] = kbStateDraft.providers[id] || { type: def.id, cfg: {} };
+      kbStateDraft.providers[id].type = def.id;
+      kbStateDraft.providers[id].cfg = kbStateDraft.providers[id].cfg || {};
+      kbStateDraft.providers[id].cfg[f.key] = el.value.trim();
+    };
+  });
+}
 
 function thinkLabel(v) {
   return { off: '关闭', low: '低', medium: '中', high: '高' }[v] || v;
@@ -44,12 +81,12 @@ function cardHtml(cfg, idx) {
           `<option value="${v}" ${cfg.thinkingStrength === v ? 'selected' : ''}>${thinkLabel(v)}</option>`).join('')}
       </select>
     </label>
-    <label><input type="checkbox" data-f="enabled" ${cfg.enabled !== false ? 'checked' : ''}> 启用</label>
-    <label><input type="checkbox" data-f="supportsVision" ${cfg.supportsVision ? 'checked' : ''}> 视觉</label>
-    <label><input type="checkbox" data-f="supportsStream" ${cfg.supportsStream !== false ? 'checked' : ''}> 流式</label>
-    <label><input type="checkbox" data-f="isPrimary" ${cfg.isPrimary ? 'checked' : ''}> 主模型</label>
-    <label><input type="checkbox" data-f="supportsThinking" ${cfg.supportsThinking ? 'checked' : ''}> 思考</label>
-    <label class="res-flag" style="display:${showResFlag(cfg) ? '' : 'none'}"><input type="checkbox" data-f="reasoningEffortSupported" ${cfg.reasoningEffortSupported ? 'checked' : ''}> 支持 reasoning_effort（推理模型如 o1/o3）</label>
+    <label data-tip="勾选后此模型参与多模型协作；单模型处理时此复选框无作用"><input type="checkbox" data-f="enabled" ${cfg.enabled !== false ? 'checked' : ''}> 启用</label>
+    <label data-tip="辅助视觉模型：勾选后，当聊天模型不支持视觉处理时自动调用此模型；只能勾选一个视觉模型"><input type="checkbox" data-f="supportsVision" ${cfg.supportsVision ? 'checked' : ''}> 视觉</label>
+    <label data-tip="逐字流式输出；关闭则等待完整结果后一次性返回"><input type="checkbox" data-f="supportsStream" ${cfg.supportsStream !== false ? 'checked' : ''}> 流式</label>
+    <label data-tip="多模型协作时由它整合各子模型结果；只能勾选一个主模型"><input type="checkbox" data-f="isPrimary" ${cfg.isPrimary ? 'checked' : ''}> 主模型</label>
+    <label data-tip="开启推理/思考能力，推理模型会先思考再作答（Anthropic 走 thinking budget）"><input type="checkbox" data-f="supportsThinking" ${cfg.supportsThinking ? 'checked' : ''}> 思考</label>
+    <label class="res-flag" data-tip="OpenAI 兼容推理模型（o1/o3 等）专用：开启后发送 reasoning_effort 参数；普通模型（如 gpt-4o）请勿勾选，否则会报 HTTP 400" style="display:${showResFlag(cfg) ? '' : 'none'}"><input type="checkbox" data-f="reasoningEffortSupported" ${cfg.reasoningEffortSupported ? 'checked' : ''}> 推理</label>
     <button class="del">删除</button>
   </div>`;
 }
@@ -124,9 +161,7 @@ async function render() {
   });
   refreshChecks();
 
-  const kb = await getKbConfig();
-  document.getElementById('kbBase').value = kb.cfg?.baseUrl || '';
-  document.getElementById('kbKey').value = kb.cfg?.apiKey || '';
+  await renderKbProviders();
 }
 
 document.getElementById('addModel').onclick = async () => {
@@ -149,15 +184,46 @@ document.getElementById('save').onclick = async () => {
     });
   });
   await saveModels(models);
-  await saveKbConfig({
-    type: 'local',
-    cfg: {
-      baseUrl: document.getElementById('kbBase').value,
-      apiKey: document.getElementById('kbKey').value,
-    },
-  });
+  // 知识库：保存当前 provider 草稿（随表单输入实时更新，不覆盖其他 provider）
+  await saveKbState(kbStateDraft);
   document.getElementById('msg').textContent = '已保存';
   setTimeout(() => (document.getElementById('msg').textContent = ''), 2000);
 };
 
 render();
+
+// ---------- 复选框悬停提示：浮动提示框，自动夹在视口内避免溢出屏幕外 ----------
+(function initTips() {
+  const tip = document.createElement('div');
+  tip.className = 'tip-pop';
+  document.body.appendChild(tip);
+  let current = null;
+  function place(el) {
+    const r = el.getBoundingClientRect();
+    tip.style.visibility = 'hidden';
+    const tw = tip.offsetWidth, th = tip.offsetHeight;
+    tip.style.visibility = 'visible';
+    let left = r.left + r.width / 2 - tw / 2;
+    left = Math.max(8, Math.min(left, window.innerWidth - tw - 8));
+    let top = r.top - th - 8;
+    if (top < 8) top = r.bottom + 8;
+    tip.style.left = left + 'px';
+    tip.style.top = top + 'px';
+  }
+  document.addEventListener('mouseover', (e) => {
+    const el = e.target.closest('[data-tip]');
+    if (el && el !== current) {
+      current = el;
+      tip.textContent = el.getAttribute('data-tip');
+      tip.style.display = 'block';
+      place(el);
+    }
+  });
+  document.addEventListener('mouseout', (e) => {
+    const el = e.target.closest('[data-tip]');
+    if (el && !el.contains(e.relatedTarget)) {
+      tip.style.display = 'none';
+      current = null;
+    }
+  });
+})();

@@ -8,6 +8,7 @@
 import { Router } from '../core/router.js';
 import { FallbackManager } from '../core/fallback.js';
 import { hasCred, optionsFromModel } from '../shared/utils.js';
+import { chatStream } from './chat.js';
 
 /**
  * 生成总结 prompt
@@ -138,11 +139,23 @@ export async function* summarizeStream(ctx, page, opts = {}) {
     catch { kbChunks = []; }
   }
 
+  const apiMessages = buildMessages(page.title, page.text, kbChunks, opts.instruction);
+
+  // 多模型协作：交给 chatStream 的统一协作逻辑（子模型各自非流式回答，主模型整合流式输出）
+  if (opts.mode === 'collab') {
+    yield* chatStream({ models: ctx.models }, apiMessages, {
+      mode: 'collab',
+      thinkingStrength: opts.thinkingStrength,
+      ...(opts.signal ? { signal: opts.signal } : {}),
+    });
+    return;
+  }
+
   const fb = new FallbackManager({ onFallback: opts.onFallback });
   const options = { ...optionsFromModel(candidates[0]) };
   if (opts.thinkingStrength != null) options.thinkingStrength = opts.thinkingStrength;
   yield* fb.callStream(candidates, {
-    messages: buildMessages(page.title, page.text, kbChunks, opts.instruction),
+    messages: apiMessages,
     stream: true,
     options,
     ...(opts.signal ? { signal: opts.signal } : {}),

@@ -293,7 +293,7 @@ body {
   flex: 1 1 auto; resize: none; width: 100%;
   background: transparent; color: var(--text);
   border: none; border-radius: 0;
-  padding: 2px 2px; font: inherit; line-height: 1.5;
+  padding: 2px 2px; font: inherit; line-height: 1.5; font-size: 13.5px;
   max-height: 200px; outline: none;
 }
 .composer textarea:focus { border-color: transparent; }
@@ -609,8 +609,16 @@ button.mini { padding: 4px 10px; font-size: 12px; }
   flex: 0 0 auto; min-width: 30px; text-align: right;
   font-variant-numeric: tabular-nums; font-weight: 600; font-size: 12px; color: var(--text);
 }
-.mc-checks { display: flex; gap: 14px; font-size: 11px; margin-top: 8px; color: var(--muted); }
-.mc-checks label { display: flex; align-items: center; gap: 5px; }
+.mc-checks { display: flex; flex-wrap: wrap; gap: 8px 14px; font-size: 11px; margin-top: 8px; color: var(--muted); }
+.mc-checks label { display: flex; align-items: center; gap: 5px; min-width: 0; overflow-wrap: anywhere; }
+/* 复选框悬停提示（JS 驱动的浮动提示框，自动夹在视口内避免溢出屏幕外） */
+.mc-checks label[data-tip] { cursor: help; }
+.tip-pop {
+  position: fixed; z-index: 9999; max-width: 240px; padding: 7px 10px;
+  background: #1f2430; color: #fff; font-size: 12px; line-height: 1.5; border-radius: 8px;
+  box-shadow: 0 4px 14px rgba(0,0,0,.25); white-space: normal; text-align: left;
+  pointer-events: none; display: none;
+}
 /* 多模态卡片：模态复选区 */
 .mm-mod { display: flex; flex-direction: column; gap: 5px; margin-top: 4px; }
 .mm-mod-title { font-size: 11px; color: var(--muted); }
@@ -724,3 +732,51 @@ button.mini { padding: 4px 10px; font-size: 12px; }
   color: var(--accent);
   min-height: 14px;
 }
+
+/* ============================================================
+   知识库选择弹层（加号菜单「知识库」）
+   ============================================================ */
+.kb-picker { position: fixed; inset: 0; z-index: 50; display: flex; align-items: center; justify-content: center; }
+.kb-picker[hidden] { display: none; }
+.kb-picker-mask { position: absolute; inset: 0; background: rgba(0, 0, 0, .42); backdrop-filter: blur(1px); }
+.kb-picker-panel {
+  position: relative; width: min(380px, 90vw); max-height: 70vh; display: flex; flex-direction: column;
+  background: var(--panel); color: var(--text);
+  border: 1px solid var(--line); border-radius: 14px; box-shadow: 0 16px 48px rgba(0, 0, 0, .35);
+  overflow: hidden;
+}
+.kb-picker-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 14px; border-bottom: 1px solid var(--line); font-weight: 700; font-size: 14px;
+}
+.kb-picker-close {
+  width: 26px; height: 26px; padding: 0; border: none; border-radius: 50%; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  background: color-mix(in srgb, var(--text) 10%, transparent); color: var(--text); font-size: 16px; line-height: 1;
+}
+.kb-picker-close:hover { background: color-mix(in srgb, var(--text) 20%, transparent); }
+.kb-picker-body { padding: 8px; overflow-y: auto; }
+.kb-picker-loading, .kb-picker-err { padding: 20px 12px; text-align: center; color: var(--muted, #6b7280); font-size: 13px; }
+.kb-picker-item {
+  width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 10px 12px; margin-bottom: 6px; border-radius: 10px; cursor: pointer; text-align: left;
+  background: color-mix(in srgb, var(--text) 4%, transparent); color: var(--text);
+  border: 1px solid transparent; font: inherit;
+}
+.kb-picker-item:hover { border-color: color-mix(in srgb, var(--accent) 50%, transparent); }
+.kb-picker-item.active { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.kb-name { font-weight: 600; font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.kb-count { flex: 0 0 auto; font-size: 12px; color: var(--muted, #6b7280); }
+
+/* 知识库 provider 切换标签（功能页 + 弹层共用） */
+.kb-providers { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 10px; }
+.kb-providers-inline { margin: 0; flex: 1 1 auto; }
+.kb-provider-tab {
+  padding: 5px 10px; border-radius: 999px; cursor: pointer; font: inherit; font-size: 12.5px;
+  background: color-mix(in srgb, var(--text) 5%, transparent); color: var(--text);
+  border: 1px solid var(--line);
+}
+.kb-provider-tab:hover { border-color: color-mix(in srgb, var(--accent) 50%, transparent); }
+.kb-provider-tab.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+.kb-provider-tab.placeholder { opacity: .55; cursor: not-allowed; }
+.kb-picker-head .kb-providers-inline { justify-content: flex-end; }

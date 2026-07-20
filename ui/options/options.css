@@ -3,7 +3,25 @@ h2 { border-bottom: 1px solid #eee; padding-bottom: 6px; margin-top: 28px; }
 label { display: block; margin: 8px 0; }
 input, select { padding: 6px; width: 320px; max-width: 100%; }
 .model-card { border: 1px solid #ddd; border-radius: 8px; padding: 10px; margin: 10px 0; }
-.model-card label { display: inline-block; width: 30%; margin: 4px 0; }
+.model-card label { display: inline-block; width: 30%; margin: 4px 0; vertical-align: top; overflow-wrap: anywhere; }
+/* 复选框悬停提示（JS 驱动的浮动提示框，自动夹在视口内避免溢出屏幕外） */
+.model-card label[data-tip] { cursor: help; }
+.tip-pop {
+  position: fixed; z-index: 9999; max-width: 240px; padding: 7px 10px;
+  background: #1f2430; color: #fff; font-size: 12px; line-height: 1.5; border-radius: 8px;
+  box-shadow: 0 4px 14px rgba(0,0,0,.25); white-space: normal; text-align: left;
+  pointer-events: none; display: none;
+}
 .actions { margin-top: 20px; }
 #msg { color: green; margin-left: 10px; }
 button { padding: 8px 12px; cursor: pointer; }
+
+/* 知识库 provider 切换标签 */
+.kb-providers { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0 12px; }
+.kb-provider-tab {
+  padding: 6px 12px; border-radius: 999px; cursor: pointer; font-size: 13px;
+  background: #f1f1f4; color: #222; border: 1px solid #ddd;
+}
+.kb-provider-tab:hover { border-color: #888; }
+.kb-provider-tab.active { background: #2563eb; color: #fff; border-color: #2563eb; }
+.kb-provider-tab.placeholder { opacity: .55; cursor: not-allowed; }
