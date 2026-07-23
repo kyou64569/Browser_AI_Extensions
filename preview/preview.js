@@ -415,9 +415,10 @@ async function refreshMultimodalList(arr, i, wrap) {
   const status = card.querySelector('.model-status');
   const base = (m.apiBase || '').trim();
   const key = (m.apiKey || '').trim();
+  const modelId = m.id; // 保存 ID，避免数组索引漂移
 
   if (!base || !key) {
-    delete fetchedModels[m.id];
+    delete fetchedModels[modelId];
     if (sel) sel.innerHTML = multimodalModelOptions(m);
     if (status) { status.textContent = '填写 API Base / Key 后自动获取模型列表'; status.className = 'model-status'; }
     return;
@@ -426,17 +427,18 @@ async function refreshMultimodalList(arr, i, wrap) {
   if (status) { status.textContent = '正在获取模型列表…'; status.className = 'model-status loading'; }
   try {
     const list = await listModels({ apiBase: base, apiKey: key, timeoutMs: m.timeoutMs });
-    // 防止竞态条件：检查卡片是否仍然存在且模型配置未改变
+    // 防止竞态条件：通过 ID 查找模型，避免数组索引漂移导致误判
+    const currentM = multimodalModels.find(mm => mm.id === modelId);
+    if (!currentM || currentM.apiBase !== base || currentM.apiKey !== key) return;
+    // 再次检查卡片是否仍存在（可能已被删除重建）
     const currentCard = wrap.querySelector(`.model-card[data-i="${i}"]`);
     if (!currentCard || currentCard !== card) return;
-    const currentM = multimodalModels[i];
-    if (!currentM || currentM.id !== m.id || currentM.apiBase !== base || currentM.apiKey !== key) return;
 
-    fetchedModels[m.id] = list;
-    if (sel) sel.innerHTML = multimodalModelOptions(m);
+    fetchedModels[modelId] = list;
+    if (sel) sel.innerHTML = multimodalModelOptions(currentM);
     if (status) { status.textContent = `已获取 ${list.length} 个模型，请下拉选择`; status.className = 'model-status ok'; }
   } catch (e) {
-    delete fetchedModels[m.id];
+    delete fetchedModels[modelId];
     if (sel) sel.innerHTML = multimodalModelOptions(m);
     if (status) { status.textContent = '获取失败：' + e.message; status.className = 'model-status err'; }
   }
@@ -647,6 +649,8 @@ function loadConversation(id) {
     content: m.role === 'user' ? stripKbPrefix(m.content) : m.content,
     ...(m.attachments ? { attachments: m.attachments.map(a => ({ ...a })) } : {}),
     ...(m.media ? { media: { type: m.media.type, url: m.media.url, name: m.media.name || null } } : {}),
+    // 恢复工具调用结构化信息，确保历史会话重新打开后仍以工具卡片渲染
+    ...(m.tool ? { tool: { name: m.tool.name, args: m.tool.args, ok: m.tool.ok, summary: m.tool.summary || null, error: m.tool.error || null } } : {}),
   }));
   chatScroll.innerHTML = '';
   if (!messages.length) {
@@ -1087,6 +1091,32 @@ function sendAutomateOnce(name, args, timeoutMs = 60000) {
   });
 }
 
+/**
+ * 多模型协作（规划/执行分离）：征询各「规划顾问」模型对当前网页操作下一步的建议。
+ * - collaborators：其它启用的推理模型（不含执行模型与视觉模型）。
+ * - observation：用户任务 + 当前页面观察（pageCtx + 已发生的操作步骤，均为文本）。
+ * - 并行征询；单个模型失败/超限不影响主流程（其建议被跳过）。仅返回文本建议，绝不操作页面。
+ */
+async function consultCollaborators(collaborators, observation, models, backupModels) {
+  if (!collaborators || !collaborators.length) return [];
+  const advices = [];
+  await Promise.all(collaborators.map(async (m) => {
+    try {
+      const msgs = [
+        { role: 'system', content: '你是网页自动化任务的规划顾问。你不能直接操作网页，只能基于给定的「用户任务」与「当前页面观察」，用简洁的中文给出下一步操作的建议及理由。不要输出 toolcall / 函数调用，只输出建议文字。' },
+        { role: 'user', content: observation },
+      ];
+      let text = '';
+      for await (const chunk of chatStream({ models, backupModels }, msgs, { mode: 'single', selectedId: m.id })) {
+        if (chunk.delta) text += chunk.delta;
+      }
+      text = (text || '').trim();
+      if (text) advices.push(`【${m.name || m.id}】${text}`);
+    } catch (_) { /* 单个协作模型失败不影响主流程 */ }
+  }));
+  return advices;
+}
+
 /** 瞬时性错误（SW 重启 / 端口断开 / 扩展上下文失效）：可被重试自愈 */
 const TRANSIENT_ERR = /port closed before a response|receiving end does not exist|extension context invalidated|cannot establish|message port|back\/forward cache|bfcache/i;
 
@@ -1186,19 +1216,23 @@ async function runAutomation(userText) {
   let lastToolFailed = false;
 
   // 模型可用性检查（与 send() 一致）
-  // 网页操作的 ReAct 工具循环必须由单一模型驱动页面变更：
-  // 多个模型分别操作同一页面会互相干扰、破坏页面状态。因此选中“多模型协作”时，
-  // 降级为「仅主模型」单模型执行（即安全形态的“主模型操作网页”），不进入 chatStream 的整合分支
-  // （整合分支会把 AI 的 toolcall 意图替换成自然语言总结，导致网页实际不被操作）。
-  let autoMode, autoSelectedId;
+  // 网页操作的 ReAct 工具循环必须由单一模型（执行模型）驱动页面变更：
+  // 多个模型分别操作同一页面会互相干扰、破坏页面状态；且协作整合分支会把子模型的
+  // toolcall 意图替换成自然语言总结，导致网页实际不被操作。因此仍由单一模型执行 DOM 操作。
+  // 但在「多模型协作」模式下采用「规划/执行分离」：执行模型（主模型）操作页面，其余启用的
+  // 推理模型作为规划顾问，在每个操作步骤前被征询建议并回灌给执行模型，实现“多脑决策、单手操作”。
+  let autoMode, autoSelectedId, collaborators = [];
   if (chatModelId === '__collab__') {
-    const primary = models.filter(m => m.enabled !== false).find(m => m.isPrimary);
+    const enabledModels = models.filter(m => m.enabled !== false);
+    const primary = enabledModels.find(m => m.isPrimary);
     if (!primary) {
       alert('请在模型配置页面选择主模型后再进行网页操作');
       return;
     }
     autoMode = 'single';
     autoSelectedId = primary.id;
+    // 规划顾问：其它启用的推理模型（排除执行模型本身与仅用于读图的视觉模型）
+    collaborators = enabledModels.filter(m => m.id !== primary.id && !m.supportsVision);
   } else {
     if (!models.some(m => m.id === chatModelId)) {
       alert('请先在设置中添加模型');
@@ -1207,6 +1241,10 @@ async function runAutomation(userText) {
     autoMode = 'single';
     autoSelectedId = chatModelId;
   }
+  let latestCollabAdvice = '';   // 最近一次协作模型建议，回灌给执行模型作参考（每轮重发，文本量小）
+  if (collaborators.length) {
+    sysMsg.content += '\n\n（多模型协作模式：其它模型作为规划顾问提供的[协作模型建议]会随上下文出现，供你参考决定下一步操作；最终由你执行具体操作。）';
+  }
   const ref = currentRefModel();
   const ts = (ref && ref.supportsThinking) ? thinkingStrength : undefined;
   // 是否存在支持看图的模型：决定是否在工具执行后回灌截图（用于读取图表/图片中的目标数据）
@@ -1214,6 +1252,7 @@ async function runAutomation(userText) {
 
   let a = null;
   let acc = '';
+  let pendingShot = null;   // 待回灌给「下一轮」模型的截图：仅发送一次，避免大图被每轮重复回灌导致 token 暴涨 / 触发模型 API 限流
   streaming = true; sendBtn.disabled = true; setStatus('思考中…');
   try {
     let iter = 0;
@@ -1225,7 +1264,24 @@ async function runAutomation(userText) {
       a.setText('');
       let started = false;
       setStatus('思考中…');
+      // 多模型协作：征询规划顾问建议（仅文本，不操作页面），回灌给执行模型作参考
+      if (collaborators.length) {
+        const observation = (pageCtx || '') + '\n\n【已发生的操作步骤】\n' +
+          (loop.length ? loop.map(m => m.content).join('\n---\n') : '（尚无操作步骤）') +
+          '\n\n请基于以上用户任务与页面观察，给出下一步操作的建议（只输出建议文字，不要调用工具）。';
+        const advices = await consultCollaborators(collaborators, observation, models, backupModels);
+        if (advices.length) latestCollabAdvice = advices.join('\n');
+      }
       const apiMessages = [sysMsg, ...messages, ...loop];
+      // 仅把最近一次截图回灌给「下一轮」模型（不进 loop，避免每轮都重复发送同一张大图；
+      // 尤其整页截图极易因重复回灌撑爆 token / 触发模型 API 频率限制）。模型如需再看可重新截图。
+      if (pendingShot) {
+        apiMessages.push({ role: 'user', content: '[页面截图，请直接读取图片内容提取目标数据]', attachments: [{ type: 'image', data: pendingShot }] });
+        pendingShot = null;
+      }
+      if (latestCollabAdvice) {
+        apiMessages.push({ role: 'user', content: '[协作模型建议，供你参考决定下一步操作]\n' + latestCollabAdvice });
+      }
       for await (const chunk of chatStream({ models, backupModels }, apiMessages, {
         mode: autoMode,
         selectedId: autoSelectedId,
@@ -1292,7 +1348,8 @@ async function runAutomation(userText) {
               '\n请基于以上结果继续操作，或直接给出最终回答。' +
               (shotUrl ? '\n（已附上当前页面截图，若目标数据以图表/图片形式呈现，请直接读取截图内容提取。）' : ''),
           };
-          if (shotUrl) loopMsg.attachments = [{ type: 'image', data: shotUrl }];
+          // 截图不放入 loop（避免被后续每轮重复回灌）；改为仅回灌给下一轮模型一次（见 apiMessages 处 pendingShot）。
+          if (shotUrl) pendingShot = shotUrl;
           loop.push(loopMsg);
         }
         a = null; // 下一轮新建气泡（继续让 AI 决定后续动作，直到给出最终回答）

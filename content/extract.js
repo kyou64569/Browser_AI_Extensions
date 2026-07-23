@@ -5,6 +5,8 @@
 // 关键说明：网页自动化工具（click/type/get_text…）在本内容脚本内直接执行，
 // 因为内容脚本对宿主页面拥有完整 DOM 权限（manifest 的 content_scripts.matches
 // 为 <all_urls> 且常驻注入），不依赖 activeTab 是否被用户交互激活。
+// ⚠️ 本文件 pageTool 与 background/web-tools.js 的 pageTool 是两份重复实现（内容脚本
+//    无法 import 模块），两边 handlers 必须同步；新增 DOM 工具请同时改这两个文件。
 // 这能规避在侧边栏 / 未先点击扩展图标的场景下，background 用
 // chrome.scripting.executeScript 注入被浏览器以“权限不足”拒绝的问题。
 
@@ -63,6 +65,23 @@ async function pageTool(tool, args) {
       };
       tick();
     });
+  }
+
+  /** 把按键名映射为 keyCode（兼容仍读取 keyCode 的旧站） */
+  function keyCodeFor(key) {
+    const map = { Enter: 13, Escape: 27, Tab: 9, Backspace: 8, Delete: 46, ArrowUp: 38, ArrowDown: 40, ArrowLeft: 37, ArrowRight: 39, Space: 32, Return: 13 };
+    if (key in map) return map[key];
+    if (key.length === 1) return key.toUpperCase().charCodeAt(0);
+    return 0;
+  }
+
+  /** 从参数里挑出定位键（selector/xpath/text），忽略未定义的键 */
+  function locate(a) {
+    const r = {};
+    if (a.selector) r.selector = a.selector;
+    if (a.xpath) r.xpath = a.xpath;
+    if (a.text) r.text = a.text;
+    return r;
   }
 
   const handlers = {
@@ -140,6 +159,100 @@ async function pageTool(tool, args) {
       else history.back();
       return { direction: dir };
     },
+    press_key(a) {
+      let el = document.activeElement;
+      if (a.selector || a.xpath || a.text) {
+        const els = resolveEl(a);
+        if (els.length) el = els[Math.max(0, Math.min(a.index || 0, els.length - 1))];
+      }
+      if (!el || el === document.documentElement) el = document.body;
+      const key = a.key || 'Enter';
+      const mods = { ctrlKey: !!a.ctrl, altKey: !!a.alt, shiftKey: !!a.shift, metaKey: !!a.meta };
+      const code = ({ Enter: 'Enter', Escape: 'Escape', Tab: 'Tab', Backspace: 'Backspace', Delete: 'Delete', Space: 'Space', ArrowUp: 'ArrowUp', ArrowDown: 'ArrowDown', ArrowLeft: 'ArrowLeft', ArrowRight: 'ArrowRight' })[key]
+        || (/^[a-z]$/i.test(key) ? 'Key' + key.toUpperCase() : key);
+      const kc = keyCodeFor(key);
+      const fire = (type) => {
+        const ev = new KeyboardEvent(type, {
+          key, code, keyCode: kc, charCode: type === 'keypress' ? kc : 0, which: kc,
+          bubbles: true, cancelable: true, view: window,
+          ctrlKey: mods.ctrlKey, altKey: mods.altKey, shiftKey: mods.shiftKey, metaKey: mods.metaKey,
+        });
+        try { Object.defineProperty(ev, 'keyCode', { get: () => kc }); Object.defineProperty(ev, 'which', { get: () => kc }); } catch (_) {}
+        el.dispatchEvent(ev);
+      };
+      try { el.focus(); } catch (_) {}
+      fire('keydown'); fire('keypress'); fire('keyup');
+      return { key, code, modifiers: mods, target: el.tagName || 'body' };
+    },
+    hover(a) {
+      const els = resolveEl(a);
+      if (!els.length) throw new Error('未找到可悬停元素（selector/xpath/text 无匹配）');
+      const el = els[Math.max(0, Math.min(a.index || 0, els.length - 1))];
+      const r = el.getBoundingClientRect();
+      const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+      const opts = { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy };
+      for (const t of ['mouseover', 'mouseenter', 'mousemove', 'pointerover', 'pointerenter', 'pointermove']) {
+        el.dispatchEvent(new MouseEvent(t, opts));
+      }
+      return { hovered: true, tag: el.tagName, text: (el.textContent || '').trim().slice(0, 80) };
+    },
+    get_attribute(a) {
+      const els = resolveEl(a);
+      if (!els.length) throw new Error('未找到目标元素（selector/xpath/text 无匹配）');
+      const el = els[Math.max(0, Math.min(a.index || 0, els.length - 1))];
+      const attr = a.attr;
+      if (attr) {
+        if (attr === 'value') return { attr, value: (el.value !== undefined ? el.value : (el.getAttribute('value') || '')) };
+        if (attr === 'text') return { attr, value: (el.innerText || el.textContent || '').trim() };
+        if (attr === 'html') return { attr, value: el.innerHTML };
+        return { attr, value: el.getAttribute(attr) };
+      }
+      const out = { tag: el.tagName, value: el.value, text: (el.innerText || el.textContent || '').trim().slice(0, 200) };
+      for (const n of ['href', 'src', 'title', 'alt', 'id', 'name', 'type', 'placeholder']) {
+        if (el.hasAttribute(n)) out[n] = el.getAttribute(n);
+      }
+      for (const at of el.attributes) {
+        if (at.name.startsWith('data-') && !(at.name in out)) out[at.name] = at.value;
+      }
+      return { attrs: out };
+    },
+    double_click(a) {
+      const els = resolveEl(a);
+      if (!els.length) throw new Error('未找到目标元素（selector/xpath/text 无匹配）');
+      const el = els[Math.max(0, Math.min(a.index || 0, els.length - 1))];
+      el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      el.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true, view: window }));
+      return { count: els.length, tag: el.tagName, text: (el.textContent || '').trim().slice(0, 80) };
+    },
+    right_click(a) {
+      const els = resolveEl(a);
+      if (!els.length) throw new Error('未找到目标元素（selector/xpath/text 无匹配）');
+      const el = els[Math.max(0, Math.min(a.index || 0, els.length - 1))];
+      const r = el.getBoundingClientRect();
+      el.dispatchEvent(new MouseEvent('contextmenu', {
+        bubbles: true, cancelable: true, view: window, button: 2,
+        clientX: r.left + r.width / 2, clientY: r.top + r.height / 2,
+      }));
+      return { tag: el.tagName, text: (el.textContent || '').trim().slice(0, 80) };
+    },
+    drag_and_drop(a) {
+      const srcs = resolveEl(locate({ selector: a.source_selector, xpath: a.source_xpath, text: a.source_text }));
+      const tgts = resolveEl(locate({ selector: a.target_selector, xpath: a.target_xpath, text: a.target_text }));
+      if (!srcs.length) throw new Error('未找到拖拽源（source_selector/xpath/text 无匹配）');
+      if (!tgts.length) throw new Error('未找到拖拽目标（target_selector/xpath/text 无匹配）');
+      const src = srcs[0], tgt = tgts[0];
+      const s = src.getBoundingClientRect(), t = tgt.getBoundingClientRect();
+      const sx = s.left + s.width / 2, sy = s.top + s.height / 2, tx = t.left + t.width / 2, ty = t.top + t.height / 2;
+      const dt = (typeof DataTransfer !== 'undefined') ? new DataTransfer() : null;
+      const dnd = (el, type) => { try { el.dispatchEvent(new DragEvent(type, { bubbles: true, cancelable: true, view: window, dataTransfer: dt, clientX: tx, clientY: ty })); } catch (_) {} };
+      const mse = (el, type, x, y) => el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button: 0 }));
+      dnd(src, 'dragstart');
+      dnd(tgt, 'dragenter'); dnd(tgt, 'dragover'); dnd(tgt, 'drop'); dnd(src, 'dragend');
+      mse(src, 'mousedown', sx, sy);
+      document.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: (sx + tx) / 2, clientY: (sy + ty) / 2, view: window }));
+      mse(tgt, 'mousemove', tx, ty); mse(tgt, 'mouseup', tx, ty);
+      return { dragged: true, from: src.tagName, to: tgt.tagName };
+    },
   };
 
   function toggleCheck(a, desired) {
@@ -172,6 +285,13 @@ async function pageTool(tool, args) {
 }
 
 (function () {
+  // 扩展更新/重载后会重新注入本脚本；若已存在旧 listener，先移除，
+  // 避免旧内容脚本的 EXECUTE_TOOL 响应抢占并返回“未知工具”。
+  if (window.__aiAssistantExtractListener) {
+    try { chrome.runtime.onMessage.removeListener(window.__aiAssistantExtractListener); } catch (_) {}
+  }
+  window.__aiAssistantExtractInjected = true;
+
   /** 简单正文提取：优先 article/main，否则 body 文本 */
   function extractMainText() {
     const root =
@@ -187,8 +307,8 @@ async function pageTool(tool, args) {
     return text;
   }
 
-  // 暴露给 background 调用
-  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  // 暴露给 background 调用（把 listener 存到全局，便于扩展重载时先 remove 旧的）
+  function extractMessageListener(msg, sender, sendResponse) {
     if (msg.type === 'EXTRACT_PAGE') {
       try {
         sendResponse({ title: document.title, text: extractMainText(), url: location.href });
@@ -211,15 +331,17 @@ async function pageTool(tool, args) {
       (async () => {
         try {
           const out = await pageTool(msg.tool, msg.args || {});
-          sendResponse(out);
+          try { sendResponse(out); } catch (_) { /* 消息通道已关闭，忽略 */ }
         } catch (e) {
-          sendResponse({ ok: false, error: (e && e.message) ? e.message : String(e) });
+          try { sendResponse({ ok: false, error: (e && e.message) ? e.message : String(e) }); } catch (_) { /* 消息通道已关闭，忽略 */ }
         }
       })();
       return true; // 异步 sendResponse
     }
     return false;
-  });
+  }
+  window.__aiAssistantExtractListener = extractMessageListener;
+  chrome.runtime.onMessage.addListener(extractMessageListener);
 
   // TODO: 划词快捷操作浮层（翻译/解释/追问），后续在此挂载 UI，调用 features/selection。
 })();

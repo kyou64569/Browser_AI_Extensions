@@ -99,8 +99,13 @@ export const TOOLS = [
   },
   {
     name: 'screenshot',
-    desc: '对当前可视区域截图（结果会显示在对话中）。',
-    params: [],
+    desc: '对网页截图（结果会显示在对话中）。默认截取当前可视区域；mode=full 截取整页（按垂直滚动拼接）；mode=element 截取某个元素（需配合 selector/xpath/text 定位）。',
+    params: [
+      { name: 'mode', desc: "截图范围：'visible'（默认，当前可视区域）/ 'full'（整页，按垂直滚动拼合）/ 'element'（指定元素）", required: false },
+      { name: 'selector', desc: 'element 模式：CSS 选择器定位要截图的元素', required: false },
+      { name: 'xpath', desc: 'element 模式：XPath 定位要截图的元素', required: false },
+      { name: 'text', desc: 'element 模式：按可见文本包含匹配元素', required: false },
+    ],
   },
   {
     name: 'navigate',
@@ -109,9 +114,94 @@ export const TOOLS = [
       { name: 'direction', desc: " 'back'（后退，默认）/ 'forward'（前进）/ 'reload'（刷新）", required: false },
     ],
   },
+  {
+    name: 'open_url',
+    desc: '跳转到用户明确指定的网址（在当前标签页打开；可选 newTab 在新标签打开）。',
+    params: [
+      { name: 'url', desc: '目标网址，如 https://aistudio.google.com/ 或 aistudio.google.com（自动补 https://）', required: true },
+      { name: 'newTab', desc: "是否在新标签打开（true 新开标签并激活；省略或 false 则在当前标签跳转）", required: false },
+    ],
+  },
+  {
+    name: 'press_key',
+    desc: '向当前聚焦元素（或指定元素）发送键盘按键，如 Enter 提交、Escape 关闭弹窗、Tab 切换焦点、Ctrl+V 粘贴等。',
+    params: [
+      { name: 'key', desc: "按键名：'Enter' / 'Escape' / 'Tab' / 'Backspace' / 'Delete' / 'ArrowUp' 等；字母用 'a'..'z'", required: true },
+      { name: 'selector', desc: '可选，先聚焦该元素再发键', required: false },
+      { name: 'xpath', desc: '可选，按 XPath 聚焦元素', required: false },
+      { name: 'text', desc: '可选，按文本聚焦元素', required: false },
+      { name: 'ctrl', desc: '是否带 Ctrl（布尔）', required: false },
+      { name: 'alt', desc: '是否带 Alt（布尔）', required: false },
+      { name: 'shift', desc: '是否带 Shift（布尔）', required: false },
+      { name: 'meta', desc: '是否带 Meta/Win/Cmd（布尔）', required: false },
+    ],
+  },
+  {
+    name: 'hover',
+    desc: '鼠标悬停到元素上，以展开下拉菜单、悬浮按钮、tooltip 等只在 hover 时出现的 UI。',
+    params: [
+      { name: 'selector', desc: 'CSS 选择器', required: false },
+      { name: 'xpath', desc: 'XPath', required: false },
+      { name: 'text', desc: '按可见文本匹配', required: false },
+      { name: 'index', desc: '多个匹配时取第几个，默认 0', required: false },
+    ],
+  },
+  {
+    name: 'get_attribute',
+    desc: "读取元素的属性值（href/src/value/title/alt/data-* 等），或 value/text/html。",
+    params: [
+      { name: 'selector', desc: 'CSS 选择器', required: false },
+      { name: 'xpath', desc: 'XPath', required: false },
+      { name: 'text', desc: '按可见文本匹配', required: false },
+      { name: 'attr', desc: "要读取的属性：'value'（输入框值）/ 'text'（文本）/ 'html' / 或属性名如 'href'、'src'、'data-id'；省略则返回常用属性集合", required: false },
+      { name: 'index', desc: '多个匹配时取第几个，默认 0', required: false },
+    ],
+  },
+  {
+    name: 'double_click',
+    desc: '双击元素（触发 dblclick 事件）。',
+    params: [
+      { name: 'selector', desc: 'CSS 选择器', required: false },
+      { name: 'xpath', desc: 'XPath', required: false },
+      { name: 'text', desc: '按可见文本匹配', required: false },
+      { name: 'index', desc: '多个匹配时取第几个，默认 0', required: false },
+    ],
+  },
+  {
+    name: 'right_click',
+    desc: '右键点击元素（触发 contextmenu 事件，可用于触发右键菜单的处理逻辑）。',
+    params: [
+      { name: 'selector', desc: 'CSS 选择器', required: false },
+      { name: 'xpath', desc: 'XPath', required: false },
+      { name: 'text', desc: '按可见文本匹配', required: false },
+      { name: 'index', desc: '多个匹配时取第几个，默认 0', required: false },
+    ],
+  },
+  {
+    name: 'drag_and_drop',
+    desc: '把拖拽源元素拖到目标元素（best-effort 模拟 HTML5 拖拽与鼠标拖拽）。',
+    params: [
+      { name: 'source_selector', desc: '拖拽源的 CSS 选择器', required: false },
+      { name: 'source_xpath', desc: '拖拽源的 XPath', required: false },
+      { name: 'source_text', desc: '拖拽源按文本匹配', required: false },
+      { name: 'target_selector', desc: '拖拽目标的 CSS 选择器', required: false },
+      { name: 'target_xpath', desc: '拖拽目标的 XPath', required: false },
+      { name: 'target_text', desc: '拖拽目标按文本匹配', required: false },
+    ],
+  },
+  {
+    name: 'close_tab',
+    desc: '关闭指定标签页（按 tabId/index/title；或 current:true 关闭当前活动标签）。',
+    params: [
+      { name: 'tabId', desc: '要关闭的标签 id', required: false },
+      { name: 'index', desc: '标签序号（从 0 开始）', required: false },
+      { name: 'title', desc: '标题或 URL 包含的子串', required: false },
+      { name: 'current', desc: 'true 则关闭当前活动标签', required: false },
+    ],
+  },
 ];
 
-const INTRO = `你是一个可以控制浏览器的网页自动化助手。当用户要求你操作“当前网页”（点击、输入、选择、勾选、滚动、切换标签、等待元素、获取文本、截图、前进/后退等）时，你可以使用下面列出的工具来完成，并在操作完成后用自然语言向用户汇报结果。
+const INTRO = `你是一个可以控制浏览器的网页自动化助手。当用户要求你操作“当前网页”（点击、输入、选择、勾选、滚动、切换标签、等待元素、获取文本、截图、前进/后退、键盘按键、悬停、读取属性、关闭标签等）时，你可以使用下面列出的工具来完成，并在操作完成后用自然语言向用户汇报结果。
 
 【多步任务（重要）】
 - 如果用户的请求包含多个步骤（例如：先点击某个标签/按钮 → 再读取页面内容 → 再从中提取并汇报某项数据），你必须按顺序逐步调用多个工具，直到完成用户要求的全部操作，最后才给出最终回答。
@@ -126,6 +216,7 @@ const INTRO = `你是一个可以控制浏览器的网页自动化助手。当�
 - 你可以（也应该）在一次回复中连续输出多个 toolcall 块来规划接下来的若干步骤；系统会按顺序逐一执行它们，并把每一步的结果反馈给你。
 - 系统执行工具后，会把结果作为下一条消息返回给你。根据结果继续调用工具，直到任务完成，再直接给出最终的自然语言回答（不要再输出 toolcall 块）。
 - 定位元素优先使用稳定且唯一的 CSS 选择器；也可用 "xpath" 或 "text"（按可见文本包含匹配）。若不确定元素，可先调用 get_text 或 screenshot 观察页面。
+- screenshot 截图有三档：默认 mode=visible 截当前视口；mode=full 截整页（页面很长时会按屏滚动拼合，页面过长（>120 屏）会失败，请改用 element/visible）；mode=element 截取单个元素（须用 selector/xpath/text 之一定位元素，如 \`\`\`toolcall\n{"name":"screenshot","args":{"mode":"element","selector":"#price"}}\n\`\`\`）。
 - 工具调用格式并不唯一：你可以用 \`\`\`toolcall 代码块，也可以直接写 toolcall{...}、toolcall[...]、tool_call{...} 等形式，只要其中是合法的 JSON（含 name 与 args）即可被系统识别执行。你也可以用中文“调用工具：name”的形式（name 须为上方列出的工具名），同样会被系统识别。
 - 系统会在每次工具执行后，把当前页面的截图作为图片一并反馈给你。若目标数据以图表、示意图、图片等形式呈现（而非纯文本），请直接读取截图内容来提取数据。
 - 若工具返回错误（ok:false），请据此调整选择器或换一种方式重试，不要反复用完全相同的错误参数。
@@ -133,12 +224,12 @@ const INTRO = `你是一个可以控制浏览器的网页自动化助手。当�
 【第一步必须先观察当前页面（重要）】
 - 系统在任务开始时已经把“当前网页”的标题、网址和首屏正文作为上下文提供给你。**开局请勿凭空假设页面长什么样**。
 - 你的第一步应当是先确认当前页面状态：要么根据已提供的页面摘要判断，要么调用 get_text / screenshot 看清页面上有哪些可操作元素（搜索框、按钮、标签页、筛选器等），再决定动作。
-- 不要假设页面上一定存在某个按钮（例如“搜索按钮”）；若页面上找不到，应先观察、改用回车提交或定位真实元素，而不是反复尝试同一个不存在的目标而耗尽步数。
+- 不要假设页面上一定存在某个按钮（例如“搜索按钮”）；若页面上找不到，应先观察、改用回车提交或定位真实元素，而不是反复尝试同一个不存在的目标而耗尽步数。提示：输入文本后若要“回车提交”表单，请先 type 写入，再调用 press_key（key:'Enter'）——type 仅写入值并派发 input/change，不会自动触发回车提交。
 
-【只操作当前已打开的页面（硬性约束）】
-- 你**只能操作当前正在浏览的这个标签页**，不要新开标签页、不要导航/跳转到用户未明确指定的网址。
-- 原因：当前环境没有“打开新网址”的工具，且新打开的页面可能无法被自动化（工具会持续报错）。任何“新开标签 / 跳转到未知站点”的尝试都会失败并浪费步数。
-- 如果用户的需求能在“当前页面”内完成（点击站内筛选/排序、在已有搜索框输入并回车等），就在当前页完成；若确实必须离开当前页，请先在回复中向用户说明限制，而不是擅自跳转。
+【可在当前页操作，也可跳转到用户明确指定的网址】
+- 默认在用户当前浏览的标签页内操作（点击、输入、选择、滚动、切换标签、前进/后退等）。
+- 当用户明确要求打开 / 跳转某个具体网址（例如“打开 aistudio.google.com”）时，可以调用 open_url 工具跳转到该网址；跳转后请先用 get_text / wait_for 确认页面已加载完成，再继续后续操作。
+- 安全约束：只跳转到用户**明确指定**的网址；不要擅自打开用户未提及的陌生站点，也不要一次性连开大量标签。若需求能在“当前页面”内完成（站内搜索、筛选、回车提交等），优先在当前页完成，不必跳转。
 
 【任务结束的硬性约定（非常重要）】
 - 严禁在没有 100% 完成用户全部要求的情况下，用自然语言“总结/汇报”式地提前结束。
@@ -261,7 +352,8 @@ function extractCalls(text) {
         end = e + 1;
       }
     }
-    if (TOOLS.some(t => t.name === name)) push({ name, args }, cn.index, end);
+    // 使用大小写不敏感匹配，避免模型输出 "Screenshot" 而非 "screenshot" 时被忽略
+    if (TOOLS.some(t => t.name.toLowerCase() === name.toLowerCase())) push({ name, args }, cn.index, end);
   }
 
   // 3) 兜底：整段中任何含 name 的 JSON 对象（仅在前两步无果时启用，避免误伤普通文本）
