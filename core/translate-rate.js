@@ -128,6 +128,8 @@ export class RateGate {
     this.tokenLog = []; // {t, n}
     this.reqLog = [];   // {t}  （每项 n=1）
     this._floor = 2000; // tpm 自适应下限，防止瞬态误判把额度压到 0
+    this._origTpm = this.tpm; // 记录原始配置上限，用于限流下调后的回弹封顶
+    this._limitedAt = 0;      // 上次触发 TPM 限流的时间戳
   }
 
   _clean(now) {
@@ -158,6 +160,7 @@ export class RateGate {
     for (;;) {
       const now = Date.now();
       this._clean(now);
+      this._maybeRecover(now);
       const tokUsed = this.tokenLog.reduce((s, x) => s + x.n, 0);
       const reqUsed = this.reqLog.length;
       const tokNeed = this.tpm === Infinity ? 0 : this.tpm - tokens;
@@ -193,7 +196,16 @@ export class RateGate {
     const used = this.tokenLog.reduce((s, x) => s + x.n, 0);
     const observed = used || (typeof this.tpm === 'number' ? this.tpm : 0);
     this.tpm = Math.max(this._floor, Math.floor((observed || 1) * 0.8));
+    this._limitedAt = now;
     console.warn(`[rate] 检测到 TPM 限流，自适应下调限速上限至 ${this.tpm} tokens/min`);
+  }
+
+  /** 距上次限流已超过一个窗口、且尚未回到原始上限时，缓慢回弹 tpm（每次 ×1.2，封顶原始配置值），避免一次瞬态 429 永久限速 */
+  _maybeRecover(now) {
+    if (this._origTpm === Infinity) return;
+    if (this.tpm >= this._origTpm) return;
+    if (this._limitedAt && now - this._limitedAt < this.windowMs) return;
+    this.tpm = Math.min(this._origTpm, Math.floor(this.tpm * 1.2) || this._origTpm);
   }
 
   /** 当前配额占用快照（用于监控/日志）。 */

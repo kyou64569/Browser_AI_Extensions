@@ -67,6 +67,11 @@ export class FallbackManager {
         for await (const chunk of client.chat(req)) {
           text += chunk.delta;
         }
+        if (!text.trim()) {
+          // 空响应（弱模型偶发）不应当作成功，记录失败并走降级路径
+          this._recordFailure(cfg.id, 'empty response');
+          throw new Error('模型返回空响应');
+        }
         if (i > 0) this.onFallback(i, cfg, '自动降级');
         return { text, used, tried: i + 1 };
       } catch (e) {

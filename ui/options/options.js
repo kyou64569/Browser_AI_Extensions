@@ -57,19 +57,25 @@ function showResFlag(cfg) {
   return cfg.supportsThinking && cfg.vendor !== 'anthropic';
 }
 
+function escapeHtml(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
 function cardHtml(cfg, idx) {
   return `
   <div class="model-card" data-idx="${idx}">
-    <label>名称 <input data-f="name" value="${cfg.name || ''}"></label>
+    <label>名称 <input data-f="name" value="${escapeHtml(cfg.name)}"></label>
     <label>厂商
       <select data-f="vendor">
         ${['openai', 'anthropic', 'gemini', 'ollama'].map(v =>
           `<option value="${v}" ${cfg.vendor === v ? 'selected' : ''}>${v}</option>`).join('')}
       </select>
     </label>
-    <label>API Base <input data-f="apiBase" value="${cfg.apiBase || ''}"></label>
-    <label>API Key <input data-f="apiKey" type="password" value="${cfg.apiKey || ''}"></label>
-    <label>Model <input data-f="model" value="${cfg.model || ''}"></label>
+    <label>API Base <input data-f="apiBase" value="${escapeHtml(cfg.apiBase)}"></label>
+    <label>API Key <input data-f="apiKey" type="password" value="${escapeHtml(cfg.apiKey)}"></label>
+    <label>Model <input data-f="model" value="${escapeHtml(cfg.model)}"></label>
     <label>超时(ms) <input data-f="timeoutMs" type="number" value="${cfg.timeoutMs || 60000}"></label>
     <label>TPM上限 <input data-f="tpm" type="number" min="0" step="1000" placeholder="留空=自适应" value="${cfg.tpm != null ? cfg.tpm : ''}"></label>
     <label>RPM上限 <input data-f="rpm" type="number" min="0" step="1" placeholder="留空=自适应" value="${cfg.rpm != null ? cfg.rpm : ''}"></label>

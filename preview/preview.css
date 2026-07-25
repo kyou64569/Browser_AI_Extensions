@@ -780,3 +780,25 @@ button.mini { padding: 4px 10px; font-size: 12px; }
 .kb-provider-tab.active { background: var(--accent); color: #fff; border-color: var(--accent); }
 .kb-provider-tab.placeholder { opacity: .55; cursor: not-allowed; }
 .kb-picker-head .kb-providers-inline { justify-content: flex-end; }
+
+/* —— 实时字幕：字幕管理 / 总结管理 列表 —— */
+.cc-manage { margin-top:14px; border-top:1px solid rgba(128,128,128,.22); padding-top:12px; }
+.cc-manage-title { margin:0 0 4px; font-size:13px; }
+.cc-toolbar { display:flex; gap:8px; align-items:center; margin-bottom:8px; flex-wrap:wrap; }
+.cc-check-all { display:flex; align-items:center; gap:4px; font-size:12px; color:var(--muted,#9aa3b2); cursor:pointer; }
+.cc-btn-sm { font-size:12px; padding:3px 10px; border-radius:6px; border:1px solid rgba(128,128,128,.35); background:transparent; color:inherit; cursor:pointer; }
+.cc-btn-sm:hover { background:rgba(128,128,128,.12); }
+.cc-list { display:flex; flex-direction:column; gap:8px; max-height:340px; overflow-y:auto; }
+.cc-empty { font-size:12px; color:var(--muted,#9aa3b2); padding:8px 0; }
+.cc-item { display:flex; gap:8px; align-items:flex-start; background:rgba(128,128,128,.08); border:1px solid rgba(128,128,128,.18); border-radius:8px; padding:8px; }
+.cc-item-check { margin-top:6px; flex:none; }
+.cc-item-main { flex:1; min-width:0; }
+.cc-item-row { display:flex; align-items:center; gap:8px; }
+.cc-item-name { flex:1; min-width:0; font-size:13px; font-weight:600; background:transparent; border:1px solid transparent; border-radius:4px; color:inherit; padding:2px 4px; }
+.cc-item-name:hover, .cc-item-name:focus { border-color:rgba(128,128,128,.4); background:rgba(255,255,255,.04); outline:none; }
+.cc-item-meta { font-size:11px; color:var(--muted,#9aa3b2); white-space:nowrap; }
+.cc-item-toggle { font-size:12px; padding:2px 8px; border-radius:6px; border:1px solid rgba(128,128,128,.3); background:transparent; color:inherit; cursor:pointer; flex:none; }
+.cc-item-toggle:hover { background:rgba(128,128,128,.12); }
+.cc-item-del { font-size:13px; padding:2px 6px; border-radius:6px; border:1px solid rgba(128,128,128,.3); background:transparent; color:inherit; cursor:pointer; flex:none; }
+.cc-item-del:hover { background:rgba(220,80,80,.18); border-color:rgba(220,80,80,.5); }
+.cc-item-content { margin-top:6px; white-space:pre-wrap; word-break:break-word; font-size:12px; line-height:1.5; color:#c8ccd0; max-height:240px; overflow-y:auto; background:rgba(0,0,0,.18); border-radius:6px; padding:8px; }

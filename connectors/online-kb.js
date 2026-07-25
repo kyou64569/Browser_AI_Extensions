@@ -51,11 +51,23 @@ export class OnlineKbConnector extends KnowledgeBaseConnector {
 
   async _post(path, body) {
     const url = IMA_BASE + path;
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: this._headers(),
-      body: JSON.stringify(body || {}),
-    });
+    const timeoutMs = (this.cfg && this.cfg.timeoutMs) ? this.cfg.timeoutMs : 15000;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    let res;
+    try {
+      res = await fetch(url, {
+        method: 'POST',
+        headers: this._headers(),
+        body: JSON.stringify(body || {}),
+        signal: ctrl.signal,
+      });
+    } catch (e) {
+      clearTimeout(timer);
+      if (e && e.name === 'AbortError') throw new Error(`ima 接口请求超时（${timeoutMs}ms）`);
+      throw e;
+    }
+    clearTimeout(timer);
     let json = {};
     try {
       json = await res.json();

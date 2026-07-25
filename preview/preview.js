@@ -3352,6 +3352,7 @@ const CC_SOURCE_LANGS = [
   '俄语', '葡萄牙语', '意大利语', '泰语', '越南语',
 ];
 
+let ccStatusEl = null;   // 实时字幕卡片状态元素（供 chrome.storage 跨上下文同步）
 function initLiveCaption() {
   const modelSel = $('#cc-model');
   const langSel = $('#cc-lang');
@@ -3362,6 +3363,79 @@ function initLiveCaption() {
   const prefetchCb = $('#cc-prefetch');
   const bilingualCb = $('#cc-bilingual');
   const statusEl = $('#cc-status');
+  ccStatusEl = statusEl;
+  const summaryModelSel = $('#cc-summary-model');
+  const summaryInstrEl = $('#cc-summary-instruction');
+  const summaryBtn = $('#cc-summary-btn');
+  const summaryDownloadEl = $('#cc-summary-download');
+  const summaryResultEl = $('#cc-summary-result');
+  const summaryStatusEl = $('#cc-summary-status');
+  const subtitleStatusEl = document.createElement('div');
+  subtitleStatusEl.id = 'cc-subtitle-status';
+  subtitleStatusEl.style.cssText = 'margin-top:6px;color:#6b7280;font-size:12px;min-height:16px;';
+  const ccManageSection = document.querySelector('.cc-manage');
+  if (ccManageSection) ccManageSection.appendChild(subtitleStatusEl);
+  // —— 字幕 / 总结 列表：UI 局部状态（选中、展开）与存储助手 ——
+  const selectedSubIds = new Set();
+  const expandedSubIds = new Set();
+  const selectedSumIds = new Set();
+  const expandedSumIds = new Set();
+  function getStore(key, def) {
+    return new Promise((resolve) => {
+      try {
+        const p = chrome.storage.local.get(key);
+        if (p && typeof p.then === 'function') p.then(v => resolve(v && v[key] !== undefined ? v[key] : def)).catch(() => resolve(def));
+        else resolve(def);
+      } catch (_) { resolve(def); }
+    });
+  }
+  function setStore(key, val) {
+    return new Promise((resolve) => {
+      try {
+        const p = chrome.storage.local.set({ [key]: val });
+        if (p && typeof p.then === 'function') p.then(() => resolve(true)).catch(() => resolve(false));
+        else resolve(true);
+      } catch (_) { resolve(false); }
+    });
+  }
+  function buildSubtitlesText(items) {
+    const blocks = (items || []).map(it => {
+      const head = '【字幕片段】' + (it.name || '未命名');
+      const seg = (it.lines || []).map(ln => {
+        const t = (ln.translation || '').trim();
+        const o = (ln.original || '').trim();
+        if (t && o && t !== o) return t + '\n（原文：' + o + '）';
+        return t || o;
+      }).filter(Boolean);
+      return head + '\n' + seg.join('\n\n');
+    });
+    return blocks.join('\n\n---\n\n');
+  }
+  async function createSummaryItem(name, content, subtitleIds, modelId) {
+    const item = {
+      id: 'sum_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8),
+      name: name || '字幕总结',
+      content: content || '',
+      subtitleIds: Array.isArray(subtitleIds) ? subtitleIds : [],
+      modelId: modelId || '',
+      createdAt: Date.now(),
+    };
+    const arr = await getStore('summaries', []);
+    arr.unshift(item);
+    await setStore('summaries', arr);
+    return item;
+  }
+  // 初始化时同步一次已在运行的字幕状态（如刷新侧边栏时字幕仍在进行）
+  if (hasChromeStorage()) {
+    try {
+      chrome.storage.local.get('captionRunning', (v) => {
+        const st = v && v.captionRunning;
+        if (st && st.active && ccStatusEl) {
+          ccStatusEl.textContent = `已开启实时字幕（${st.targetLang || '原文'}）`;
+        }
+      });
+    } catch (_) {}
+  }
   if (!modelSel) return;  // 卡片尚未挂载
 
   // 目标语言（复用网页翻译的语言集）/ 源语言
@@ -3384,6 +3458,24 @@ function initLiveCaption() {
     else modelSel.value = primary.id;
   }
   popModelSelect();
+
+  // 总结模型下拉：与翻译模型同一份“非视觉”模型列表，默认取偏好 summaryModelId
+  function popSummaryModelSelect() {
+    if (!summaryModelSel) return;
+    const enabled = (models || []).filter(m => !m.supportsVision);
+    if (!enabled.length) {
+      summaryModelSel.innerHTML = '<option value="">（请先在设置添加模型）</option>';
+      return;
+    }
+    const primary = enabled.find(m => m.isPrimary) || enabled[0];
+    summaryModelSel.innerHTML = enabled.map(m =>
+      `<option value="${m.id}">${escapeHtml(m.name || m.model || m.vendor)}</option>`
+    ).join('');
+    const p = LS.get('preview.captionPrefs', {});
+    if (p.summaryModelId && enabled.some(m => m.id === p.summaryModelId)) summaryModelSel.value = p.summaryModelId;
+    else summaryModelSel.value = primary.id;
+  }
+  popSummaryModelSelect();
 
   // ---- Whisper 模型多选列表（从已配置的 Whisper 模型里勾选）----
   // 选中状态存入 captionPrefs.whisperModelIds；若未选则回退为“全部已配置模型”。
@@ -3421,6 +3513,7 @@ function initLiveCaption() {
       : [];
     LS.set('preview.captionPrefs', {
       modelId: modelSel.value,
+      summaryModelId: summaryModelSel ? summaryModelSel.value : '',
       targetLang: langSel.value,
       sourceLang: srcSel.value,
       sourceMode: srcModeSel.value,
@@ -3440,6 +3533,7 @@ function initLiveCaption() {
   renderModels = function () {
     origRender();
     popModelSelect();
+    popSummaryModelSelect();
   };
 
   // Whisper 多选列表仅在需要语音识别时才有意义：切换来源时给出提示
@@ -3518,6 +3612,307 @@ function initLiveCaption() {
       statusEl.textContent = '通信失败：' + (e && e.message ? e.message : e);
     }
   };
+
+  // ---------- 字幕总结：基于已识别字幕生成报告，可下载到本地 ----------
+  let summaryBusy = false;
+  let lastSummaryText = '';
+  function describeModel(id) {
+    const m = (models || []).find(x => x.id === id);
+    return m ? (m.name || m.model || m.vendor) : (id || '未知模型');
+  }
+  if (summaryBtn) {
+    summaryBtn.onclick = async () => {
+      if (summaryBusy) return;
+      const modelId = summaryModelSel ? summaryModelSel.value : '';
+      if (!modelId) { summaryStatusEl.textContent = '请先在设置中添加模型'; return; }
+
+      // 勾选了字幕列表条目 → 批量总结这些条目；否则回退为总结当前实时字幕
+      let items = [];
+      if (selectedSubIds.size) {
+        const all = await getStore('subtitles', []);
+        items = (all || []).filter(it => selectedSubIds.has(it.id));
+      }
+
+      let text, title;
+      if (items.length) {
+        text = buildSubtitlesText(items);
+        title = `字幕总结（${items.length} 条）`;
+      } else {
+        const tabId = await getActiveTabId();
+        if (!tabId) { summaryStatusEl.textContent = '未找到活动标签页'; return; }
+        let lines;
+        try {
+          const resp = await chrome.tabs.sendMessage(tabId, { type: 'LIVE_CAPTION_GET_TRANSCRIPT' });
+          if (!resp || !resp.ok) { summaryStatusEl.textContent = '未获取到字幕：请先在视频页开启实时字幕，或在下方勾选已保存的字幕'; return; }
+          lines = resp.lines || [];
+        } catch (e) {
+          summaryStatusEl.textContent = '获取字幕失败：请确认当前视频页已开启过实时字幕，或在下方勾选已保存的字幕'; return;
+        }
+        if (!lines.length) { summaryStatusEl.textContent = '还没有可总结的字幕，请先开启字幕并识别若干句，或勾选下方已保存的字幕'; return; }
+        text = buildSubtitlesText([{ name: '当前实时字幕', lines }]);
+        title = '实时字幕总结';
+      }
+
+      const page = { title, text };
+      const userInstr = summaryInstrEl ? summaryInstrEl.value.trim() : '';
+      const baseInstr = '请根据以下实时字幕（含译文与原文）生成一份结构清晰的总结报告：先用一两句话概括核心内容，再列出关键要点（可按分点 / 章节 / 时间线组织），最后给出结论或行动建议。用中文输出，保持条理。';
+      const instruction = userInstr ? `${baseInstr}\n\n额外要求：${userInstr}` : baseInstr;
+
+      summaryBusy = true;
+      summaryBtn.disabled = true;
+      if (summaryDownloadEl) summaryDownloadEl.disabled = true;
+      if (summaryResultEl) summaryResultEl.textContent = '';
+      lastSummaryText = '';
+      summaryStatusEl.textContent = `正在生成总结（${describeModel(modelId)}）…`;
+
+      try {
+        for await (const chunk of summarizeStream({ models: prepareModels() }, page, {
+          modelId,
+          instruction,
+          onFallback: (i, cfg, reason) => { summaryStatusEl.textContent = `已切换到备用模型：${cfg.name}（${reason}）`; },
+        })) {
+          lastSummaryText += chunk.delta;
+          if (summaryResultEl) {
+            summaryResultEl.textContent = lastSummaryText;
+            summaryResultEl.scrollTop = summaryResultEl.scrollHeight;
+          }
+        }
+        const subIds = items.map(it => it.id);
+        const sumName = items.length === 1 ? `总结：${(items[0].name || '字幕')}` : `字幕总结（${items.length} 条）`;
+        await createSummaryItem(sumName, lastSummaryText, subIds, modelId);
+        summaryStatusEl.textContent = `总结完成（使用模型：${describeModel(modelId)}）`;
+        if (summaryDownloadEl) summaryDownloadEl.disabled = false;
+      } catch (e) {
+        if (summaryResultEl) summaryResultEl.textContent = '生成失败：' + (e && e.message ? e.message : String(e));
+        summaryStatusEl.textContent = '总结失败';
+      } finally {
+        summaryBusy = false;
+        summaryBtn.disabled = false;
+      }
+    };
+  }
+
+  if (summaryDownloadEl) {
+    summaryDownloadEl.onclick = () => {
+      if (!lastSummaryText) return;
+      const blob = new Blob([lastSummaryText], { type: 'text/markdown;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+      a.href = url;
+      a.download = `字幕总结_${stamp}.md`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => { try { URL.revokeObjectURL(url); } catch (_) {} }, 1000);
+    };
+  }
+
+  // ============ 字幕列表 / 总结列表 管理（仅真实扩展侧边栏，依赖 chrome.storage）============
+  if (hasChromeStorage()) {
+    const subtitleListEl = document.getElementById('cc-subtitle-list');
+    const summaryListEl = document.getElementById('cc-summary-list');
+    const subAllEl = document.getElementById('cc-sub-all');
+    const sumAllEl = document.getElementById('cc-sum-all');
+    const subDelEl = document.getElementById('cc-sub-del');
+    const sumDelEl = document.getElementById('cc-sum-del');
+    const sumDlEl = document.getElementById('cc-sum-dl');
+
+    function fmtTime(ts) {
+      try { return new Date(ts).toLocaleString('zh-CN', { hour12: false }); } catch (_) { return ''; }
+    }
+    function subtitleFullText(it) {
+      return (it.lines || []).map(ln => {
+        const t = (ln.translation || '').trim();
+        const o = (ln.original || '').trim();
+        if (t && o && t !== o) return t + '\n（原文：' + o + '）';
+        return t || o;
+      }).filter(Boolean).join('\n\n') || '（空）';
+    }
+
+    function renderSubtitleList() {
+      if (!subtitleListEl) return;
+      getStore('subtitles', []).then(subs => {
+        const arr = Array.isArray(subs) ? subs : [];
+        if (!arr.length) {
+          subtitleListEl.innerHTML = '<div class="cc-empty">暂无字幕。开启实时字幕并点击「关闭」后，这里会生成一条记录；也可勾选后批量总结。</div>';
+          if (subAllEl) subAllEl.checked = false;
+          return;
+        }
+        subtitleListEl.innerHTML = arr.map(it => {
+          const id = escapeHtml(it.id);
+          const checked = selectedSubIds.has(it.id) ? 'checked' : '';
+          const expanded = expandedSubIds.has(it.id);
+          const cnt = (it.lines || []).length;
+          return '<div class="cc-item" data-id="' + id + '">'
+            + '<input type="checkbox" class="cc-item-check" ' + checked + ' />'
+            + '<div class="cc-item-main">'
+            + '<div class="cc-item-row">'
+            + '<input class="cc-item-name" type="text" value="' + escapeHtml(it.name || '') + '" />'
+            + '<span class="cc-item-meta">' + cnt + ' 行 · ' + fmtTime(it.createdAt) + '</span>'
+            + '<button class="cc-item-toggle" type="button">' + (expanded ? '收起 ▴' : '展开 ▾') + '</button>'
+            + '<button class="cc-item-del" type="button" title="删除该字幕">🗑</button>'
+            + '</div>'
+            + '<div class="cc-item-content" style="' + (expanded ? '' : 'display:none;') + '">' + escapeHtml(subtitleFullText(it)) + '</div>'
+            + '</div></div>';
+        }).join('');
+        if (subAllEl) subAllEl.checked = arr.length > 0 && arr.every(it => selectedSubIds.has(it.id));
+      });
+    }
+
+    function renderSummaryList() {
+      if (!summaryListEl) return;
+      getStore('summaries', []).then(sums => {
+        const arr = Array.isArray(sums) ? sums : [];
+        if (!arr.length) {
+          summaryListEl.innerHTML = '<div class="cc-empty">暂无总结。选择字幕并点「总结字幕」后，结果会显示在这里；可勾选多条批量下载。</div>';
+          if (sumAllEl) sumAllEl.checked = false;
+          return;
+        }
+        summaryListEl.innerHTML = arr.map(it => {
+          const id = escapeHtml(it.id);
+          const checked = selectedSumIds.has(it.id) ? 'checked' : '';
+          const expanded = expandedSumIds.has(it.id);
+          return '<div class="cc-item" data-id="' + id + '">'
+            + '<input type="checkbox" class="cc-item-check" ' + checked + ' />'
+            + '<div class="cc-item-main">'
+            + '<div class="cc-item-row">'
+            + '<input class="cc-item-name" type="text" value="' + escapeHtml(it.name || '') + '" />'
+            + '<span class="cc-item-meta">' + fmtTime(it.createdAt) + '</span>'
+            + '<button class="cc-item-toggle" type="button">' + (expanded ? '收起 ▴' : '展开 ▾') + '</button>'
+            + '<button class="cc-item-del" type="button" title="删除该总结">🗑</button>'
+            + '</div>'
+            + '<div class="cc-item-content" style="' + (expanded ? '' : 'display:none;') + '">' + escapeHtml(it.content || '（空）') + '</div>'
+            + '</div></div>';
+        }).join('');
+        if (sumAllEl) sumAllEl.checked = arr.length > 0 && arr.every(it => selectedSumIds.has(it.id));
+      });
+    }
+
+    if (subtitleListEl) {
+      subtitleListEl.addEventListener('click', async (e) => {
+        const itemEl = e.target.closest('.cc-item'); if (!itemEl) return;
+        const id = itemEl.dataset.id;
+        if (e.target.closest('.cc-item-del')) {
+          const arr = await getStore('subtitles', []);
+          const next = (arr || []).filter(x => x.id !== id);
+          await setStore('subtitles', next);
+          selectedSubIds.delete(id); expandedSubIds.delete(id);
+          return;
+        }
+        if (e.target.closest('.cc-item-name') || e.target.classList.contains('cc-item-check')) return;
+        if (expandedSubIds.has(id)) expandedSubIds.delete(id); else expandedSubIds.add(id);
+        renderSubtitleList();
+      });
+      subtitleListEl.addEventListener('change', async (e) => {
+        const itemEl = e.target.closest('.cc-item'); if (!itemEl) return;
+        const id = itemEl.dataset.id;
+        if (e.target.classList.contains('cc-item-check')) {
+          if (e.target.checked) selectedSubIds.add(id); else selectedSubIds.delete(id);
+          const arr = await getStore('subtitles', []);
+          if (subAllEl) subAllEl.checked = (arr || []).length > 0 && (arr || []).every(x => selectedSubIds.has(x.id));
+        } else if (e.target.classList.contains('cc-item-name')) {
+          const name = e.target.value.trim() || '未命名字幕';
+          const arr = await getStore('subtitles', []);
+          const next = (arr || []).map(x => x.id === id ? { ...x, name } : x);
+          await setStore('subtitles', next);
+        }
+      });
+    }
+
+    if (summaryListEl) {
+      summaryListEl.addEventListener('click', async (e) => {
+        const itemEl = e.target.closest('.cc-item'); if (!itemEl) return;
+        const id = itemEl.dataset.id;
+        if (e.target.closest('.cc-item-del')) {
+          const arr = await getStore('summaries', []);
+          const next = (arr || []).filter(x => x.id !== id);
+          await setStore('summaries', next);
+          selectedSumIds.delete(id); expandedSumIds.delete(id);
+          return;
+        }
+        if (e.target.closest('.cc-item-name') || e.target.classList.contains('cc-item-check')) return;
+        if (expandedSumIds.has(id)) expandedSumIds.delete(id); else expandedSumIds.add(id);
+        renderSummaryList();
+      });
+      summaryListEl.addEventListener('change', async (e) => {
+        const itemEl = e.target.closest('.cc-item'); if (!itemEl) return;
+        const id = itemEl.dataset.id;
+        if (e.target.classList.contains('cc-item-check')) {
+          if (e.target.checked) selectedSumIds.add(id); else selectedSumIds.delete(id);
+          const arr = await getStore('summaries', []);
+          if (sumAllEl) sumAllEl.checked = (arr || []).length > 0 && (arr || []).every(x => selectedSumIds.has(x.id));
+        } else if (e.target.classList.contains('cc-item-name')) {
+          const name = e.target.value.trim() || '未命名总结';
+          const arr = await getStore('summaries', []);
+          const next = (arr || []).map(x => x.id === id ? { ...x, name } : x);
+          await setStore('summaries', next);
+        }
+      });
+    }
+
+    if (subAllEl) subAllEl.addEventListener('change', async () => {
+      const arr = await getStore('subtitles', []);
+      if (subAllEl.checked) (arr || []).forEach(x => selectedSubIds.add(x.id));
+      else selectedSubIds.clear();
+      renderSubtitleList();
+    });
+    if (subDelEl) subDelEl.addEventListener('click', async () => {
+      if (!selectedSubIds.size) { subtitleStatusEl.textContent = '请先勾选要删除的字幕'; return; }
+      if (!confirm('确定删除选中的 ' + selectedSubIds.size + ' 条字幕？')) return;
+      const arr = await getStore('subtitles', []);
+      const next = (arr || []).filter(x => !selectedSubIds.has(x.id));
+      await setStore('subtitles', next);
+      selectedSubIds.clear();
+      subtitleStatusEl.textContent = '已删除 ' + next.length + ' 条字幕';
+      setTimeout(() => { subtitleStatusEl.textContent = ''; }, 2000);
+      renderSubtitleList();
+    });
+
+    if (sumAllEl) sumAllEl.addEventListener('change', async () => {
+      const arr = await getStore('summaries', []);
+      if (sumAllEl.checked) (arr || []).forEach(x => selectedSumIds.add(x.id));
+      else selectedSumIds.clear();
+      renderSummaryList();
+    });
+    if (sumDelEl) sumDelEl.addEventListener('click', async () => {
+      if (!selectedSumIds.size) { summaryStatusEl.textContent = '请先勾选要删除的总结'; return; }
+      if (!confirm('确定删除选中的 ' + selectedSumIds.size + ' 条总结？')) return;
+      const arr = await getStore('summaries', []);
+      const next = (arr || []).filter(x => !selectedSumIds.has(x.id));
+      await setStore('summaries', next);
+      selectedSumIds.clear();
+      renderSummaryList();
+    });
+    if (sumDlEl) sumDlEl.addEventListener('click', async () => {
+      if (!selectedSumIds.size) { summaryStatusEl.textContent = '请先勾选要下载的总结'; return; }
+      const arr = await getStore('summaries', []);
+      const sel = (arr || []).filter(x => selectedSumIds.has(x.id));
+      if (!sel.length) return;
+      const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+      let md;
+      if (sel.length === 1) md = sel[0].content || '';
+      else md = sel.map(s => '## ' + (s.name || '字幕总结') + '\n\n' + (s.content || '')).join('\n\n---\n\n');
+      const blob = new Blob([md], { type: 'text/markdown;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = sel.length === 1 ? ('字幕总结_' + stamp + '.md') : ('字幕总结_合并' + sel.length + '条_' + stamp + '.md');
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => { try { URL.revokeObjectURL(url); } catch (_) {} }, 1000);
+    });
+
+    // 内容脚本提交字幕 / 别处增删 → 实时刷新列表
+    try {
+      chrome.storage.onChanged.addListener((changes, area) => {
+        if (area !== 'local') return;
+        if (changes.subtitles) renderSubtitleList();
+        if (changes.summaries) renderSummaryList();
+      });
+    } catch (_) {}
+    renderSubtitleList();
+    renderSummaryList();
+  }
 }
 
 // ---------- 主题切换 ----------
@@ -3572,6 +3967,16 @@ if (hasChromeStorage()) {
       renderWhisperModels();
     }
     if (changes.kb) { kbState = normalizeKbState(changes.kb.newValue || kbState); LS.set('preview.kb', kbState); }
+    if (changes.captionRunning) {
+      // 实时字幕浮层关闭/开启后，同步卡片底部状态（修复“关闭后卡片仍显示已开启”）
+      const v = changes.captionRunning.newValue;
+      const isActive = !!(v && v.active);
+      if (ccStatusEl) {
+        ccStatusEl.textContent = isActive
+          ? `已开启实时字幕（${v.targetLang || '原文'}）`
+          : '已关闭实时字幕';
+      }
+    }
     if (changes.conversations) {
       // 会话数据被其他来源修改（如跨实例同步）：以存储为权威源刷新内存与界面，
       // 确保主页面会话列表准确过滤已删除项，避免缓存/未刷新导致的残留显示。

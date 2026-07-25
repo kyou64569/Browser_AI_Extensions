@@ -4,8 +4,6 @@
 
 import { getModels, getKbConfig, getKbState, getWhisperModels } from '../shared/storage.js';
 import { summarizePage } from '../features/summarize.js';
-import { LocalKbConnector } from '../connectors/local-kb.js';
-import { OnlineKbConnector } from '../connectors/online-kb.js';
 import { createKbConnector, getKbProviderDef } from '../connectors/kb-registry.js';
 import { execTool } from './web-tools.js';
 import { createClient } from '../core/model-client.js';
@@ -56,7 +54,7 @@ async function getActiveTab() {
   try {
     const tabs = await chrome.tabs.query({ active: true });
     if (tabs && tabs.length > 0) {
-      const normalTab = tabs.find(t => t.url && !t.url.startsWith('chrome') && !t.url.startsWith('about'));
+      const normalTab = tabs.find(t => t.url && !isChromeInternalPage(t.url));
       if (normalTab) return normalTab;
       return tabs[0];
     }
@@ -67,30 +65,50 @@ async function getActiveTab() {
 
 /** 延迟聚合流式输出，通过 port 推给侧边栏 */
 async function runSummarize(port) {
-  const models = await getModels();
-  if (!models.length) {
-    port?.postMessage({ type: 'ERROR', message: '请先在设置页添加模型' });
-    return;
-  }
-  const kbCfg = await getKbConfig();
-  let kb = null;
-  if (kbCfg.type === 'local') kb = new LocalKbConnector(kbCfg.cfg || {});
-  else if (kbCfg.type === 'online') kb = new OnlineKbConnector(kbCfg.cfg || {});
-
-  // 取当前标签页正文
-  const tab = await getActiveTab();
-  if (!tab || !tab.id) {
-    port?.postMessage({ type: 'ERROR', message: '无法获取当前标签页' });
-    return;
-  }
-  const page = await chrome.tabs.sendMessage(tab.id, { type: 'EXTRACT_PAGE' });
-
-  // 收集完整文本（流式默认，但先聚合便于简单展示）
-  const onFallback = (i, cfg, reason) => {
-    port?.postMessage({ type: 'FALLBACK', index: i, name: cfg.name, reason });
-  };
-
   try {
+    const models = await getModels();
+    if (!models.length) {
+      port?.postMessage({ type: 'ERROR', message: '请先在设置页添加模型' });
+      return;
+    }
+    const kbCfg = await getKbConfig();
+    // 用注册表统一实例化（默认激活的 ima 也走 OnlineKbConnector），避免 type 未覆盖导致 KB 增强静默失效
+    let kb = createKbConnector(kbCfg.type, kbCfg.cfg || {});
+    if (!kb) console.warn('[summarize] 未知的知识库类型，跳过知识库增强：', kbCfg.type);
+
+    // 取当前标签页正文
+    const tab = await getActiveTab();
+    if (!tab || !tab.id) {
+      port?.postMessage({ type: 'ERROR', message: '无法获取当前标签页' });
+      return;
+    }
+    let page;
+    try {
+      page = await chrome.tabs.sendMessage(tab.id, { type: 'EXTRACT_PAGE' });
+    } catch (e) {
+      // 内容脚本未注入（扩展重载后的旧标签页）时，回退到 scripting 直接抽取正文，避免主链路静默失败
+      try {
+        const [res] = await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          func: () => {
+            const root = document.querySelector('article') || document.querySelector('main') || document.body;
+            const clone = root.cloneNode(true);
+            clone.querySelectorAll('script,style,noscript,nav,header,footer,aside').forEach(el => el.remove());
+            return (clone.innerText || clone.textContent || '').replace(/\s+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+          },
+        });
+        page = { title: tab.title || '', text: (res && res.result) || '', url: tab.url || '' };
+      } catch (e2) {
+        port?.postMessage({ type: 'ERROR', message: '无法获取页面正文：' + (e2 && e2.message ? e2.message : e2) });
+        return;
+      }
+    }
+
+    // 收集完整文本（流式默认，但先聚合便于简单展示）
+    const onFallback = (i, cfg, reason) => {
+      port?.postMessage({ type: 'FALLBACK', index: i, name: cfg.name, reason });
+    };
+
     const result = await summarizePage(
       { models },
       page,
@@ -98,7 +116,7 @@ async function runSummarize(port) {
     );
     port?.postMessage({ type: 'RESULT', text: result.text, used: result.used.name, tried: result.tried });
   } catch (e) {
-    port?.postMessage({ type: 'ERROR', message: e.message });
+    port?.postMessage({ type: 'ERROR', message: (e && e.message) ? e.message : String(e) });
   }
 }
 
@@ -271,14 +289,15 @@ function parseTranslateResponse(text, count) {
 // 即可在流式翻译过程中做“句子单元级”进度插值（慢模型在整批返回前也能持续向前推进）。
 function countClosedUnits(raw, fromIdx = 0) {
   if (!raw) return 0;
-  let count = fromIdx, idx = fromIdx;
+  let count = fromIdx, idx = fromIdx, pos = 0;
   while (true) {
-    const open = raw.indexOf('[' + idx + ']', count ? 0 : 0);
+    const open = raw.indexOf('[' + idx + ']', pos);
     if (open === -1) break;
     const close = raw.indexOf('[/' + idx + ']', open);
     if (close === -1) break;
     count++;
     idx++;
+    pos = close + 1; // 从上一处闭合之后继续搜索，避免每次都从 0 搜（原死三元 count?0:0 的本意）
   }
   return count;
 }

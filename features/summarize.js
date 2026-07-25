@@ -126,7 +126,15 @@ async function* simulateSummaryStream(page, instruction = '') {
  */
 export async function* summarizeStream(ctx, page, opts = {}) {
   const router = new Router(ctx.models);
-  const candidates = router.selectModel('summarize', { stream: true });
+  // 若调用方明确指定了模型（如“字幕总结”里用户在下拉里挑选的模型），优先使用该模型；
+  // 找不到再回退到默认的路由选择。
+  let candidates;
+  if (opts.modelId) {
+    const forced = ctx.models.filter(m => m.id === opts.modelId);
+    candidates = forced.length ? forced : router.selectModel('summarize', { stream: true });
+  } else {
+    candidates = router.selectModel('summarize', { stream: true });
+  }
   if (!candidates.length) throw new Error('没有可用的总结模型，请检查设置');
   if (!candidates.some(hasCred)) {
     yield* simulateSummaryStream(page, opts.instruction);

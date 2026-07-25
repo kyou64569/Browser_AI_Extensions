@@ -29,6 +29,7 @@
   let cfg = null;            // 当前配置（来自 LIVE_CAPTION_START）
   let overlay = null;
   let boxHeader = null, historyEl = null, draftEl = null;
+  let bodyEl = null, collapseBtnEl = null, compactEl = null, collapsed = false;
 
   // 平台字幕抓取
   let captionObserver = null;
@@ -75,8 +76,8 @@
   let refineQueue = [];             // 待整理的句子快照（按序处理，避免串句）
   let refineRunning = false;        // refine 泵是否在运行（防重入）
   const historyLines = [];          // 已定稿字幕：{ original, translation }
-  const HISTORY_MAX_LINES = 12;     // 历史最大行数，超过则清空开始下一轮
-  const HISTORY_MAX_CHARS = 1200;   // 历史最大字符数，超过则清空
+  const HISTORY_MAX_LINES = 300;    // 历史保留行数上限（FIFO 丢最旧，避免无限增长）；折叠时只显示最新一行，无需整轮清空
+  const HISTORY_MAX_CHARS = 50000;  // 历史保留字符数上限（防止长字幕占用过多内存）
 
   // ---------- 缓存 ----------
   function setCache(k, v) {
@@ -101,39 +102,68 @@
       'backdrop-filter:blur(3px);' +
       'font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;';
 
-    // 顶部拖拽条（唯一可交互区域，避免遮挡播放器控件）
+    // 顶部拖拽条：可拖动移动；右侧两个按钮 —— 折叠（收起正文，不停止识别）/ 关闭（停止）
     boxHeader = document.createElement('div');
     boxHeader.style.cssText =
       'pointer-events:auto;cursor:move;user-select:none;' +
-      'display:flex;align-items:center;justify-content:space-between;' +
+      'display:flex;align-items:center;justify-content:space-between;gap:6px;' +
       'padding:4px 10px;background:rgba(255,255,255,.10);color:rgba(255,255,255,.75);font-size:12px;';
     const title = document.createElement('span');
     title.textContent = '实时字幕 · 拖动可移动';
+    title.style.cssText = 'flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+
+    const btnWrap = document.createElement('span');
+    btnWrap.style.cssText = 'display:flex;align-items:center;gap:2px;pointer-events:auto;';
+
+    // 折叠：仅隐藏正文，识别仍在后台进行（解决“字幕栏挡住画面”）
+    collapseBtnEl = document.createElement('span');
+    collapseBtnEl.textContent = '▾';            // ▾ 收起 / ▴ 展开
+    collapseBtnEl.title = '收起 / 展开字幕（不停止识别）';
+    collapseBtnEl.style.cssText = 'cursor:pointer;padding:0 6px;font-size:13px;';
+    collapseBtnEl.addEventListener('mousedown', (e) => e.stopPropagation()); // 不触发拖动
+    collapseBtnEl.addEventListener('click', (e) => { e.stopPropagation(); toggleCollapse(); });
+
     const closeBtn = document.createElement('span');
     closeBtn.textContent = '✕';
-    closeBtn.style.cssText = 'cursor:pointer;padding:0 4px;font-size:13px;';
-    closeBtn.addEventListener('click', () => {
+    closeBtn.title = '关闭实时字幕';
+    closeBtn.style.cssText = 'cursor:pointer;padding:0 6px;font-size:13px;';
+    closeBtn.addEventListener('mousedown', (e) => e.stopPropagation());
+    closeBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
       try { chrome.runtime.sendMessage({ type: 'LIVE_CAPTION_STOP_CAPTURE' }); } catch (_) {}
       stop();
     });
-    boxHeader.appendChild(title);
-    boxHeader.appendChild(closeBtn);
 
-    // 正文：历史区（可滚动）+ 草稿区
-    const body = document.createElement('div');
-    body.style.cssText = 'pointer-events:none;padding:8px 14px;max-height:30vh;overflow-y:auto;';
+    btnWrap.appendChild(collapseBtnEl);
+    btnWrap.appendChild(closeBtn);
+    boxHeader.appendChild(title);
+    boxHeader.appendChild(btnWrap);
+
+    // 正文：历史区（可滚动）+ 草稿区。pointer-events:auto 让滚动条/滚轮可交互
+    // （此前为 none 导致字幕溢出后无法向上滚动）。
+    bodyEl = document.createElement('div');
+    bodyEl.style.cssText = 'pointer-events:auto;padding:8px 14px;max-height:30vh;overflow-y:auto;';
     historyEl = document.createElement('div');
     historyEl.style.cssText = 'display:flex;flex-direction:column;gap:6px;';
     draftEl = document.createElement('div');
     draftEl.style.cssText =
       'margin-top:6px;color:rgba(255,255,255,.55);font-size:15px;font-style:italic;' +
       'min-height:1em;white-space:pre-wrap;word-break:break-word;';
-    body.appendChild(historyEl);
-    body.appendChild(draftEl);
+    bodyEl.appendChild(historyEl);
+    bodyEl.appendChild(draftEl);
 
     overlay.appendChild(boxHeader);
-    overlay.appendChild(body);
+    overlay.appendChild(bodyEl);
+    // 折叠态紧凑视图：仅显示最新一行（原文+译文）+ 实时草稿，不滚动、不占大面积
+    compactEl = document.createElement('div');
+    compactEl.style.cssText = 'pointer-events:auto;padding:8px 14px;display:none;';
+    overlay.appendChild(compactEl);
     document.documentElement.appendChild(overlay);
+
+    // 恢复折叠状态（跨刷新/重开保留）
+    try {
+      if (sessionStorage.getItem('__aiSubtitleCollapsed') === '1') applyCollapse(true);
+    } catch (_) {}
 
     restoreBoxPosition();
     enableDrag();
@@ -189,6 +219,49 @@
     } catch (_) {}
   }
 
+  // 折叠 / 展开：折叠时只显示最新一行紧凑视图，识别继续（解决“字幕栏挡住画面”）。
+  function applyCollapse(c) {
+    collapsed = c;
+    if (bodyEl) bodyEl.style.display = collapsed ? 'none' : '';
+    if (compactEl) compactEl.style.display = collapsed ? '' : 'none';
+    if (collapseBtnEl) collapseBtnEl.textContent = collapsed ? '▴' : '▾';
+    if (collapsed) renderCompact();   // 立即渲染一次最新行
+  }
+
+  // 折叠态渲染：仅最新一行（译文大 + 原文小，双语时）+ 实时草稿，便于边看画面边看实时翻译。
+  function renderCompact() {
+    if (!compactEl) return;
+    compactEl.textContent = '';
+    const last = historyLines[historyLines.length - 1];
+    if (last) {
+      const tr = document.createElement('div');
+      tr.textContent = last.translation || last.original || '';
+      tr.style.cssText = 'color:#fff;font-size:18px;font-weight:600;line-height:1.3;text-shadow:0 1px 2px rgba(0,0,0,.6);';
+      compactEl.appendChild(tr);
+      if (cfg && cfg.bilingual && last.original && last.translation) {
+        const og = document.createElement('div');
+        og.textContent = last.original;
+        og.style.cssText = 'color:rgba(255,255,255,.7);font-size:12px;line-height:1.25;';
+        compactEl.appendChild(og);
+      }
+    }
+    const raw = (committedDraft + (livePartial ? ' ' + livePartial : '')).trim();
+    if (raw || liveTrans) {
+      const d = document.createElement('div');
+      let s = '✍ ' + (raw || '…');
+      if (liveTrans) s += '\n→ ' + liveTrans;
+      d.textContent = s;
+      d.style.cssText = 'margin-top:4px;color:rgba(255,255,255,.55);font-size:14px;font-style:italic;white-space:pre-wrap;word-break:break-word;';
+      compactEl.appendChild(d);
+    }
+  }
+  function toggleCollapse() {
+    if (!overlay) return;
+    const next = !collapsed;
+    applyCollapse(next);
+    try { sessionStorage.setItem('__aiSubtitleCollapsed', next ? '1' : '0'); } catch (_) {}
+  }
+
   // 渲染历史区：逐行「译文（大）+ 原文（小，双语时）」
   function renderHistory() {
     if (!historyEl) return;
@@ -210,22 +283,35 @@
     }
     const body = historyEl.parentNode;
     if (body) body.scrollTop = body.scrollHeight; // 始终滚到最新
+    if (collapsed) renderCompact();               // 折叠态同步最新一行
   }
 
   // 渲染草稿区：当前句还未定稿的原始识别文本（碎词 + 流式 partial）+ 实时译文
   function renderDraft() {
     if (!draftEl) return;
     const raw = (committedDraft + (livePartial ? ' ' + livePartial : '')).trim();
-    if (!raw && !liveTrans) { draftEl.textContent = ''; return; }
+    if (!raw && !liveTrans) { draftEl.textContent = ''; if (collapsed) renderCompact(); return; }
     let s = '✍ ' + (raw || '…');
     if (liveTrans) s += '\n→ ' + liveTrans;
     draftEl.textContent = s;
+    if (collapsed) renderCompact();   // 折叠态同步实时草稿
   }
 
   // 错误提示：保持盒子挂载可见，让用户知道为何没有字幕
   function showError(text) {
     ensureOverlay();
     if (draftEl) draftEl.textContent = '⚠ ' + text;
+  }
+
+  // 向功能页（侧边栏）同步“实时字幕是否运行中”的状态，修复“关闭字幕栏后
+  // 功能页卡片仍显示已开启”的问题。通过 chrome.storage 跨上下文广播，
+  // 功能页监听 chrome.storage.onChanged 更新卡片状态。
+  function setCaptionRunning(active, targetLang) {
+    try {
+      chrome.storage.local.set({
+        captionRunning: { active: !!active, targetLang: targetLang || '', ts: Date.now() },
+      });
+    } catch (_) {}
   }
 
   // ---------- 累积 → 成句 → 整理翻译 流水线 ----------
@@ -321,14 +407,19 @@
     pumpRefine();
   }
 
-  // 追加一行历史；满了则清空开始下一轮（保留最新这行，保证观感连续）。
+  // 追加一行历史；仅按上限做 FIFO 丢弃最旧行（不整轮清空），
+  // 这样展开后可回看历史、折叠时只显示最新一行，无需删除清空。
   function appendHistory(line) {
     historyLines.push(line);
-    const chars = historyLines.reduce((n, l) => n + (l.translation || l.original || '').length, 0);
-    if (historyLines.length > HISTORY_MAX_LINES || chars > HISTORY_MAX_CHARS) {
-      const keep = historyLines[historyLines.length - 1];
-      historyLines.length = 0;
-      historyLines.push(keep);
+    // 按行数限制 FIFO 丢弃
+    if (historyLines.length > HISTORY_MAX_LINES) {
+      historyLines.splice(0, historyLines.length - HISTORY_MAX_LINES);
+    }
+    // 按字符数限制 FIFO 丢弃（防止长字幕占用过多内存）
+    let totalChars = historyLines.reduce((sum, l) => sum + (l.original || '').length + (l.translation || '').length, 0);
+    while (totalChars > HISTORY_MAX_CHARS && historyLines.length > 10) {
+      const removed = historyLines.shift();
+      totalChars -= (removed.original || '').length + (removed.translation || '').length;
     }
     renderHistory();
   }
@@ -621,6 +712,16 @@
       sendResponse({ ok: true });
       return true;
     }
+    // 侧边栏“总结字幕”：返回当前累积的字幕转录（{original,translation}）。
+    // 即便字幕已停止（active=false），只要本页会话仍累积过字幕即可返回，方便事后总结。
+    if (msg.type === 'LIVE_CAPTION_GET_TRANSCRIPT') {
+      try {
+        sendResponse({ ok: true, active, lines: historyLines.slice() });
+      } catch (_) {
+        sendResponse({ ok: false, error: '字幕转录读取失败' });
+      }
+      return;
+    }
     // Offscreen 文档捕获到的音频片段（base64 字符串）→ 送 Whisper 转写
     if (msg.type === 'LIVE_CAPTION_AUDIO') {
       enqueueWhisper(msg.audioB64, msg.mime);
@@ -643,6 +744,7 @@
 
   async function start(msg) {
     if (active) stop();   // 重新开始：先清理旧状态，避免叠加/卡死
+    historyLines.length = 0;   // 新会话：清空上一轮累积的字幕（停止字幕不再清空，便于事后总结）
     cfg = {
       modelId: msg.modelId,
       targetLang: msg.targetLang,
@@ -654,6 +756,7 @@
     };
     active = true;
     ensureOverlay();
+    setCaptionRunning(true, cfg.targetLang);
 
     const video = document.querySelector('video');
     const mode = cfg.sourceMode;
@@ -680,8 +783,30 @@
     return false;
   }
 
+  // 将当前累积的字幕作为一条记录提交到 chrome.storage.local.subtitles（供“字幕管理”列表展示 / 批量总结）。
+  function commitCurrentSubtitle() {
+    if (!historyLines.length) return;
+    const first = historyLines[0];
+    const defaultName = ((first.translation || first.original || '').trim() || '未命名字幕').slice(0, 40);
+    const item = {
+      id: 'sub_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8),
+      name: defaultName,
+      lines: historyLines.map(l => ({ original: l.original || '', translation: l.translation || '' })),
+      createdAt: Date.now(),
+      source: 'live',
+    };
+    try {
+      chrome.storage.local.get('subtitles', (v) => {
+        const arr = Array.isArray(v && v.subtitles) ? v.subtitles : [];
+        arr.unshift(item);
+        try { chrome.storage.local.set({ subtitles: arr }); } catch (_) {}
+      });
+    } catch (_) {}
+  }
+
   function stop() {
     active = false;
+    setCaptionRunning(false);   // 通知功能页：字幕已停止
     // 先断开所有活跃的 Whisper 端口，阻止后续回调访问已销毁的 DOM
     whisperPorts.forEach((p) => { try { p.disconnect(); } catch (_) {} });
     whisperPorts.clear();
@@ -701,7 +826,10 @@
     committedDraft = ''; livePartial = '';
     liveTrans = ''; liveTransRaw = '';
     if (liveTransTimer) { clearTimeout(liveTransTimer); liveTransTimer = null; }
-    historyLines.length = 0; cacheKeys.length = 0; translationCache.clear();
+    cacheKeys.length = 0; translationCache.clear();
+    // 本次字幕会话结束：将累积字幕作为一条记录存入“字幕管理”列表（持久化），随后清空内存中的 live 转录
+    commitCurrentSubtitle();
+    historyLines.length = 0;
     if (overlay && overlay.parentNode) overlay.parentNode.removeChild(overlay);
     overlay = null; boxHeader = null; historyEl = null; draftEl = null; captionWindow = null;
   }

@@ -547,6 +547,12 @@ async function openUrl(tab, a) {
   let url = (a && a.url || '').trim();
   if (!url) return { ok: false, error: '缺少参数 url' };
   if (!/^[a-z]+:\/\//i.test(url)) url = 'https://' + url.replace(/^\/+/, '');
+  // 协议白名单：仅允许 http/https，拦截 file:/chrome:/chrome-extension:/javascript: 等敏感协议，
+  // 避免自动化（含网页文本诱导的 prompt injection）把当前标签导航到本地文件或受保护地址。
+  const proto = (() => { try { return new URL(url).protocol; } catch (_) { return ''; } })();
+  if (proto !== 'http:' && proto !== 'https:') {
+    return { ok: false, error: `不支持的跳转协议：${proto || '无效地址'}（仅允许 http/https）` };
+  }
   if (a && a.newTab) {
     const t = await chrome.tabs.create({ url, active: true });
     return { ok: true, result: { opened: 'newTab', tabId: t.id, url: t.url } };

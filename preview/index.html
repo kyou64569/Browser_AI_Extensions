@@ -160,6 +160,43 @@
             <button type="button" class="primary" id="cc-start" style="flex:1;">开启字幕</button>
             <button type="button" id="cc-stop" style="flex:1;">关闭</button>
           </div>
+
+          <div class="cc-summary" style="margin-top:14px;border-top:1px solid rgba(128,128,128,.22);padding-top:12px;">
+            <h4 style="margin:0 0 6px;font-size:13px;">📝 字幕总结</h4>
+            <p class="card-note">点「总结字幕」可基于下方勾选的字幕批量总结（未勾选则总结当前实时字幕），结果可在“总结管理”中批量下载。</p>
+            <label class="field">总结模型 <select id="cc-summary-model"></select></label>
+            <label class="field" style="margin-top:6px;">额外要求（可选）
+              <input type="text" id="cc-summary-instruction" placeholder="例如：用时间线梳理 / 只总结技术要点" style="width:100%;box-sizing:border-box;" />
+            </label>
+            <div style="display:flex;gap:8px;margin-top:8px;">
+              <button type="button" id="cc-summary-btn" style="flex:1;">总结字幕</button>
+              <button type="button" id="cc-summary-download" style="flex:1;" disabled>下载报告</button>
+            </div>
+            <div id="cc-summary-result" style="margin-top:10px;max-height:260px;overflow-y:auto;white-space:pre-wrap;word-break:break-word;background:rgba(128,128,128,.08);border-radius:8px;padding:10px;font-size:13px;line-height:1.55;min-height:20px;"></div>
+            <div id="cc-summary-status" style="margin-top:6px;color:#6b7280;font-size:12px;min-height:16px;"></div>
+          </div>
+
+          <div class="cc-manage">
+            <h4 class="cc-manage-title">💬 字幕管理</h4>
+            <p class="card-note">关闭字幕后会自动生成一条记录；可改名、展开查看完整内容，勾选多条可批量总结，也可单条删除。</p>
+            <div class="cc-toolbar">
+              <label class="cc-check-all"><input type="checkbox" id="cc-sub-all" /> 全选</label>
+              <button type="button" class="cc-btn-sm" id="cc-sub-del">批量删除</button>
+            </div>
+            <div id="cc-subtitle-list" class="cc-list"></div>
+          </div>
+
+          <div class="cc-manage">
+            <h4 class="cc-manage-title">📋 总结管理</h4>
+            <p class="card-note">总结结果按条展示；可改名、展开查看，勾选多条可批量下载，也可单条删除。</p>
+            <div class="cc-toolbar">
+              <label class="cc-check-all"><input type="checkbox" id="cc-sum-all" /> 全选</label>
+              <button type="button" class="cc-btn-sm" id="cc-sum-dl">批量下载</button>
+              <button type="button" class="cc-btn-sm" id="cc-sum-del">批量删除</button>
+            </div>
+            <div id="cc-summary-list" class="cc-list"></div>
+          </div>
+
           <div id="cc-status" style="margin-top:6px;color:#6b7280;font-size:12px;min-height:16px;"></div>
         </div>
 

@@ -39,7 +39,11 @@ export class LocalKbConnector extends KnowledgeBaseConnector {
       if (!['http:', 'https:'].includes(parsed.protocol)) return false;
       const h = parsed.hostname;
       if (h === 'localhost' || h === '127.0.0.1') return true;
-      if (h.startsWith('192.168.') || h.startsWith('10.') || h.startsWith('172.')) return true;
+      if (h.startsWith('192.168.')) return true;
+      if (h.startsWith('10.')) return true;
+      // 仅放行 RFC1918 私有网段 172.16.0.0/12（即 172.16.x–172.31.x）。
+      // 原 startsWith('172.') 会误放行 172.0/1/200 等公网地址 → SSRF 过滤绕过。
+      if (/^172\.(1[6-9]|2[0-9]|3[01])\./.test(h)) return true;
       return false;
     } catch {
       return false;
