@@ -170,6 +170,7 @@
   }
 
   // 拖拽：仅 header 触发；拖动时固定 left/top，移除居中 transform。
+  let _dragCleanup = null; // enableDrag/disableDrag 清理引用
   function enableDrag() {
     let dragging = false, sx = 0, sy = 0, ox = 0, oy = 0;
     const onMove = (e) => {
@@ -186,7 +187,7 @@
       document.removeEventListener('mouseup', onUp);
       saveBoxPosition();
     };
-    boxHeader.addEventListener('mousedown', (e) => {
+    const handler = (e) => {
       dragging = true;
       const r = overlay.getBoundingClientRect();
       ox = r.left; oy = r.top; sx = e.clientX; sy = e.clientY;
@@ -197,7 +198,16 @@
       document.addEventListener('mousemove', onMove);
       document.addEventListener('mouseup', onUp);
       e.preventDefault();
-    });
+    };
+    boxHeader.addEventListener('mousedown', handler);
+    _dragCleanup = () => {
+      boxHeader.removeEventListener('mousedown', handler);
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+    };
+  }
+  function disableDrag() {
+    if (_dragCleanup) { _dragCleanup(); _dragCleanup = null; }
   }
   function saveBoxPosition() {
     try {
@@ -452,13 +462,17 @@
             sourceLang: cfg.sourceLang,
             fragments: [raw],
           });
+          if (!active) continue; // await 期间用户可能已停止字幕，跳过 DOM 操作
           if (resp && resp.ok) {
             placeholder.original = (resp.original && resp.original.trim()) || raw;
             const t = (resp.translation && resp.translation.trim()) || '';
             if (t) placeholder.translation = t;   // 仅当 refine 给出非空译文才覆盖（保留携带的实时译文）
             setCache(raw, { original: placeholder.original, translation: placeholder.translation });
           }
-        } catch (_) { /* 整理失败：保留草稿区携带的实时译文，不阻塞后续 */ }
+        } catch (e) { 
+          if (!active) { console.debug('[refine] 已停止，跳过异常处理'); continue; }
+          console.warn('[refine] 整理失败：', e && e.message);
+        }
         renderHistory();
         // 每次循环后检查 active 状态，避免用户停止后继续处理队列
         if (!active) break;
@@ -810,6 +824,7 @@
     // 先断开所有活跃的 Whisper 端口，阻止后续回调访问已销毁的 DOM
     whisperPorts.forEach((p) => { try { p.disconnect(); } catch (_) {} });
     whisperPorts.clear();
+    disableDrag(); // 清理拖拽事件监听器，解除闭包引用
     if (captionObserver) { captionObserver.disconnect(); captionObserver = null; }
     if (captionPoller) { clearInterval(captionPoller); captionPoller = null; }
     if (trackWatch) { try { trackWatch.track.removeEventListener('cuechange', trackWatch.onCue); } catch (_) {} trackWatch = null; }

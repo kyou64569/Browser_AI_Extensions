@@ -5,8 +5,10 @@
 // 关键说明：网页自动化工具（click/type/get_text…）在本内容脚本内直接执行，
 // 因为内容脚本对宿主页面拥有完整 DOM 权限（manifest 的 content_scripts.matches
 // 为 <all_urls> 且常驻注入），不依赖 activeTab 是否被用户交互激活。
-// ⚠️ 本文件 pageTool 与 background/web-tools.js 的 pageTool 是两份重复实现（内容脚本
-//    无法 import 模块），两边 handlers 必须同步；新增 DOM 工具请同时改这两个文件。
+// ⚠️ 与 background/web-tools.js 的 pageTool 是两份重复实现（内容脚本无法 import 模块），
+//    两边 handlers 必须同步修改。两文件头部应包含相同的 SYNC_MARKER 以便自动化检测。
+//    SYNC_MARKER:v1-DOM_TOOLS:click,type,select_option,check,uncheck,scroll,wait_for,get_text,navigate,press_key,hover,get_attribute,double_click,right_click,drag_and_drop
+//    新增 DOM 工具请同时改这两个文件。
 // 这能规避在侧边栏 / 未先点击扩展图标的场景下，background 用
 // chrome.scripting.executeScript 注入被浏览器以“权限不足”拒绝的问题。
 

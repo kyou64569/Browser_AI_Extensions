@@ -332,20 +332,36 @@ async function persistTranslateCache() {
       const k = _cacheMem.keys().next().value;
       _cacheMem.delete(k);
     }
-    // 按字节大小预检，避免超出 chrome.storage.local 配额（~5MB，与全扩展共享）
-    const payload = JSON.stringify(Object.fromEntries(_cacheMem));
+    // 按字节大小预检：用一次 JSON.stringify 生成最终存储对象，
+    // 无需反复序列化。若超出配额则按条目淘汰后重新序列化一次（而非每轮都 JSON.stringify）。
+    let obj = Object.fromEntries(_cacheMem);
+    let payload = JSON.stringify(obj);
     if (payload.length > 4_500_000) {
-      // 超出配额时按字节淘汰最老项直到安全线
+      // 超出配额时按 FIFO 淘汰整个条目（一次性批量淘汰，避免迭代中反复 stringify）
+      const OVERHEAD = 50; // 每轮 JSON.stringify 的固定开销约 50 字节
       const entries = [..._cacheMem.entries()];
-      _cacheMem.clear();
-      for (const [k, v] of entries) {
-        const next = JSON.stringify({ ...Object.fromEntries(_cacheMem), [k]: v });
-        if (next.length > 4_000_000) break;
-        _cacheMem.set(k, v);
+      let bytes = 0;
+      // 估算每条的近似字节贡献（key + ":" + value + 引号/逗号/花括号开销）
+      const perEntry = entries.map(([k, v]) => ({
+        k, v, est: k.length + v.length + OVERHEAD,
+      }));
+      let total = perEntry.reduce((s, e) => s + e.est, 0);
+      // 从最老的条目开始淘汰，直到总量低于配额安全线
+      const evictTarget = total - 4_000_000;
+      let evictedBytes = 0;
+      let evictedCount = 0;
+      for (const e of perEntry) {
+        if (evictedBytes >= evictTarget) break;
+        _cacheMem.delete(e.k);
+        total -= e.est;
+        evictedBytes += e.est;
+        evictedCount++;
       }
-      console.warn('[cache] 超出存储配额，已按字节淘汰部分缓存（当前约 ' + Math.round(JSON.stringify(Object.fromEntries(_cacheMem)).length / 1024) + ' KB）');
+      obj = Object.fromEntries(_cacheMem);
+      payload = JSON.stringify(obj);
+      console.warn('[cache] 超出存储配额，已按字节淘汰 ' + evictedCount + ' 条（剩余 ' + _cacheMem.size + ' 条，当前约 ' + Math.round(payload.length / 1024) + ' KB）');
     }
-    await chrome.storage.local.set({ [TRANSLATE_CACHE_KEY]: Object.fromEntries(_cacheMem) });
+    await chrome.storage.local.set({ [TRANSLATE_CACHE_KEY]: obj });
     _cacheDirty = false;  // 仅在写入成功后清除脏标记
   } catch (e) {
     console.warn('[cache] 持久化失败，下次重试：', e && e.message);

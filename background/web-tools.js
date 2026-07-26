@@ -6,7 +6,9 @@
 //    press_key/hover/get_attribute/double_click/right_click/drag_and_drop）
 //    通过 chrome.scripting.executeScript 注入 pageTool 在目标页面主世界执行。
 // ⚠️ 与 content/extract.js 中的 pageTool 为两份重复实现（内容脚本无法 import 模块），
-//    两边 handlers 必须同步修改，新增 DOM 工具请同时改这两个文件。
+//    两边 handlers 必须同步修改。两文件头部应包含相同的 SYNC_MARKER 以便自动化检测。
+//    SYNC_MARKER:v1-DOM_TOOLS:click,type,select_option,check,uncheck,scroll,wait_for,get_text,navigate,press_key,hover,get_attribute,double_click,right_click,drag_and_drop
+//    新增 DOM 工具请同时改这两个文件。
 // 2) 浏览器级工具截图(screenshot)/切换标签(switch_tab) 在 service-worker 内直接调用 chrome.* API。
 // 3) 所有工具统一返回 { ok:true, result } 或 { ok:false, error }，便于上层（侧边栏）统一处理。
 

@@ -383,6 +383,10 @@
   }
   window.addEventListener('load', () => { curHost = location.hostname; });
   const _ps = history.pushState, _rs = history.replaceState;
+  // 覆写 pushState/replaceState 以拦截 SPA 站内导航（如 React Router / Vue Router 的
+  // pushState 调用）。由于本脚本在 document_idle 注入（页面脚本已执行完毕），
+  // _ps / _rs 捕获的是 SPA 框架的 patched 版本（若有），apply 调用时走回 SPA 逻辑，
+  // 保证 onUrlChange 在 URL 更新后触发，不破坏 SPA 路由行为。
   history.pushState = function () { const r = _ps.apply(this, arguments); onUrlChange(); return r; };
   history.replaceState = function () { const r = _rs.apply(this, arguments); onUrlChange(); return r; };
   window.addEventListener('popstate', onUrlChange);
