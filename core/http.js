@@ -71,12 +71,14 @@ export async function fetchWithTimeout(url, init = {}, timeoutMs = 0) {
  * @param {object} body
  * @param {object} headers
  * @param {number} [timeoutMs]
+ * @param {AbortSignal} [signal]
  */
-export async function postJson(url, body, headers = {}, timeoutMs = 0) {
+export async function postJson(url, body, headers = {}, timeoutMs = 0, signal) {
   const res = await fetchWithTimeout(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...headers },
     body: JSON.stringify(body),
+    signal,
   }, timeoutMs);
   try {
     return await res.json();

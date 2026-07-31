@@ -3,12 +3,13 @@
 // 注意：Gemini 把角色归并为 user/model，system  Instruction 单独字段。
 
 import { ModelClient } from '../model-base.js';
-import { postJson, fetchWithTimeout } from '../http.js';
+import { postJson, fetchWithTimeout, HttpError } from '../http.js';
+import { normalizeApiBase } from '../../shared/utils.js';
 
 export class GeminiAdapter extends ModelClient {
   /** 流式与非流式 endpoint 不同（流式加 ?alt=sse） */
   _endpoint(stream) {
-    const base = this.config.apiBase.replace(/\/$/, '');
+    const base = normalizeApiBase(this.config.apiBase);
     const key = `?key=${this.config.apiKey}`;
     return `${base}/models/${this.config.model}:${stream ? 'streamGenerateContent' : 'generateContent'}${key}`;
   }
@@ -85,7 +86,7 @@ export class GeminiAdapter extends ModelClient {
       ...(top_p != null ? { topP: top_p } : {}),
     };
     if (Object.keys(generationConfig).length) body.generationConfig = generationConfig;
-    const json = await postJson(this._endpoint(false), body, {}, this.config.timeoutMs);
+    const json = await postJson(this._endpoint(false), body, {}, this.config.timeoutMs, signal);
     const candidate = json.candidates?.[0];
     if (!candidate?.content?.parts) {
       yield { delta: '', done: true, meta: { raw: json } };
@@ -97,10 +98,18 @@ export class GeminiAdapter extends ModelClient {
 
   async *chat(req) {
     const signal = req.signal;
-    if (req.stream && this.config.supportsStream) {
-      yield* this._stream(req, signal);
-    } else {
-      yield* this._nonStream(req, signal);
+    try {
+      if (req.stream && this.config.supportsStream) {
+        yield* this._stream(req, signal);
+      } else {
+        yield* this._nonStream(req, signal);
+      }
+    } catch (e) {
+      const urlTip = `（请求地址：${this._endpoint(!!(req.stream && this.config.supportsStream))}）`;
+      if (e instanceof HttpError && (e.status === 404 || e.kind === 'network')) {
+        throw new HttpError(e.kind, (e.message || '请求失败') + ' ' + urlTip, e.status);
+      }
+      throw e;
     }
   }
 }

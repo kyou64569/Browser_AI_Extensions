@@ -1,14 +1,14 @@
 // core/adapters/openai.js
 // OpenAI 兼容格式 adapter。适用于 OpenAI、OpenRouter 及各类国产兼容接口。
-// 输入：统一 ChatRequest -> 输出：厂商 /v1/chat/completions -> 转回 ChatResponseChunk
+// 输入：统一 ChatRequest -> 输���：厂�� /v1/chat/completions -> 转回 ChatResponseChunk
 
 import { ModelClient } from '../model-base.js';
 import { postJson, fetchWithTimeout, HttpError } from '../http.js';
+import { normalizeApiBase } from '../../shared/utils.js';
 
 export class OpenAIAdapter extends ModelClient {
   get endpoint() {
-    // 兼容末尾带 / 或不带
-    return this.config.apiBase.replace(/\/$/, '') + '/chat/completions';
+    return normalizeApiBase(this.config.apiBase) + '/chat/completions';
   }
 
   /** 统一消息 -> OpenAI messages */
@@ -92,7 +92,8 @@ export class OpenAIAdapter extends ModelClient {
     const json = await postJson(
       this.endpoint, body,
       { Authorization: `Bearer ${this.config.apiKey}` },
-      this.config.timeoutMs
+      this.config.timeoutMs,
+      signal
     );
     const text = json.choices?.[0]?.message?.content || '';
     yield { delta: text, done: true, meta: { raw: json } };
@@ -100,10 +101,19 @@ export class OpenAIAdapter extends ModelClient {
 
   async *chat(req) {
     const signal = req.signal;
-    if (req.stream && this.config.supportsStream) {
-      yield* this._stream(req, signal);
-    } else {
-      yield* this._nonStream(req, signal);
+    try {
+      if (req.stream && this.config.supportsStream) {
+        yield* this._stream(req, signal);
+      } else {
+        yield* this._nonStream(req, signal);
+      }
+    } catch (e) {
+      // 附加请求 URL 到错误信息，方便定位"apiBase 配置是否正确"
+      const urlTip = `（请求地址：${this.endpoint}）`;
+      if (e instanceof HttpError && (e.status === 404 || e.kind === 'network')) {
+        throw new HttpError(e.kind, (e.message || '请求失败') + ' ' + urlTip, e.status);
+      }
+      throw e;
     }
   }
 }

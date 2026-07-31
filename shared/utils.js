@@ -2,6 +2,28 @@
 // 共享工具函数
 
 /**
+ * 清洗 API Base URL：去空白 / BOM / 行尾斜杠 / 已含路径后缀。
+ * 防范因 copy-paste 带入的不可见字符（空格、BOM、换行等）导致 URL 编码后 HTTP 404；
+ * 同时处理用户粘贴完整接口地址（如 .../v1/chat/completions）到 apiBase 的常见误用。
+ * @param {string} raw
+ * @returns {string} 已清洗、去除尾部斜杠、不包含已知子路径的纯 Base URL
+ */
+export function normalizeApiBase(raw) {
+  if (typeof raw !== 'string') return '';
+  let s = raw
+    .replace(/^\uFEFF/, '')   // 去 BOM（Windows 保存的 UTF-8 BOM）
+    .trim();
+  // 去掉尾部斜杠
+  s = s.replace(/\/+$/, '');
+  // 去掉用户误填的已知子路径（避免双叠成 /chat/completions/chat/completions）
+  s = s.replace(/\/chat\/completions\/?$/, '');
+  s = s.replace(/\/messages\/?$/, '');
+  s = s.replace(/\/api\/chat\/?$/, '');
+  s = s.replace(/\/models\/?$/, '');
+  return s;
+}
+
+/**
  * 检查模型配置是否有有效凭证
  * @param {import('../core/model-config.js').ModelConfig} m
  * @returns {boolean}

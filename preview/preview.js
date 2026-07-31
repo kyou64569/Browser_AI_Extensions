@@ -1976,23 +1976,43 @@ async function runWebSearchInChat(query) {
   pushUser(query);
   const a = newAssistant();
   streaming = true; sendBtn.disabled = true;
-  setStatus('正在联网搜索…');
+  setStatus('正在联网搜索...');
 
-  // 1) 抓取搜索结果（由 background 跨域 fetch，规避页面 CORS）
+  // 清洗查询：去掉"请搜索/帮我查/查一下"等对AI的指令词，提取纯搜索关键词；
+  // 这些指令词对搜索引擎是噪声，会降低匹配精度。
+  let searchQuery = query
+    .replace(/^(请|帮我|给我|来)(搜索|查|搜|找|检索)(一下|一下啊)?[，,。.]?\s*/i, '')
+    .replace(/^(搜索|查|搜|找)(一下|一下啊)?[，,。.]?\s*/i, '')
+    .trim() || query;
+
+  // 搜索词增强：自动补上"最新 + 当前月份"，避免过于宽泛的查询仅返回聚合器首页
+  const now = new Date();
+  const today = now.toLocaleDateString('zh-CN');
+  const monthLabel = now.getFullYear() + '年' + (now.getMonth() + 1) + '月';
+  const boosted = searchQuery + ' 最新 ' + monthLabel;
+  const hasTimeQualifier = /最新|\d{4}年/.test(searchQuery);
+  const queries = hasTimeQualifier ? [searchQuery] : [boosted, searchQuery];
+
+  // 1) 搜索：原词 + 增强词两轮查询，合并去重
+  const MAX_SEARCH_RESULTS = 10;
   let results = [];
   try {
     if (typeof chrome === 'undefined' || !chrome.runtime || !chrome.runtime.id) {
       throw new Error('联网搜索需在扩展环境中使用');
     }
-    // 添加超时包装，避免消息无响应时永久挂起
     const timeoutMs = 30000;
-    const resp = await Promise.race([
-      chrome.runtime.sendMessage({ type: 'WEB_SEARCH', query, maxResults: 6 }),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('联网搜索超时')), timeoutMs))
-    ]);
-    if (!resp) throw new Error('联网搜索无响应');
-    if (resp.error) throw new Error(resp.error);
-    results = resp.results || [];
+    const seenUrls = new Set();
+    for (const q of queries) {
+      if (results.length >= MAX_SEARCH_RESULTS) break;
+      const resp = await Promise.race([
+        chrome.runtime.sendMessage({ type: 'WEB_SEARCH', query: q, maxResults: 6 }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('联网搜索超时')), timeoutMs))
+      ]);
+      if (!resp || resp.error) continue;
+      const items = (resp.results || []).filter(r => r && r.url && !seenUrls.has(r.url));
+      items.forEach(r => seenUrls.add(r.url));
+      results.push(...items);
+    }
     if (!results.length) throw new Error('未获取到搜索结果');
   } catch (e) {
     a.stopTyping();
@@ -2003,15 +2023,18 @@ async function runWebSearchInChat(query) {
     return;
   }
 
-  // 2) 构造带搜索结果的上下文，交给当前模型作答
-  const today = new Date().toLocaleDateString('zh-CN');
+  // 2) 构造上下文并交给模型作答
   const refs = results
     .map((r, i) => `[${i + 1}] ${r.title}\n${r.snippet || '（无摘要）'}\n来源：${r.url}`)
     .join('\n\n');
   const prompt =
-    `你是联网搜索助手。以下是针对用户问题的实时联网搜索结果（来自 DuckDuckGo，当前日期 ${today}）。` +
-    `请综合这些结果用中文回答用户问题，回答要准确、简洁；若结果相互矛盾或不足以回答，请如实说明。` +
-    `回答末尾用“参考来源”列出你实际引用的条目编号与对应链接。\n\n` +
+    `你是联网搜索助手。以下是针对用户问题的实时搜索结果（当前日期 ${today}）。` +
+    `请综合所有结果的标题和摘要，提取其中提到的具体信息来回答用户问题。` +
+    `注意：搜索结果可能包含行业预测、第三方盘点、或聚合整理，而非官方公告。` +
+    `当信息来源于行业分析/预测类文章时，请用"据行业预测""有分析认为"等措辞标注，` +
+    `不要把推测性内容当作已确认事实来陈述。若搜索结果之间对同一事件说法不一致，请指出分歧。` +
+    `回答中使用序号时保持全局连续编号，不要在每个分类下重新从1开始。` +
+    `回答末尾用"参考来源"列出你实际引用的条目编号与对应链接。\n\n` +
     `用户问题：${query}\n\n搜索结果：\n${refs}`;
 
   const apiMessages = [...messages, { role: 'user', content: prompt }];

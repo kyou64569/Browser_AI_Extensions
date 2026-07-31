@@ -1,6 +1,7 @@
 // core/list-models.js
 // 根据厂商配置拉取可用模型列表，供配置界面自动填充下拉框。
 import { fetchWithTimeout, HttpError } from './http.js';
+import { normalizeApiBase } from '../shared/utils.js';
 
 // Anthropic 不提供公开的“列出模型”接口，使用已知可用模型兜底。
 const ANTHROPIC_FALLBACK = [
@@ -18,7 +19,7 @@ const ANTHROPIC_FALLBACK = [
 export async function listModels(cfg) {
   const vendor = cfg.vendor;
   const key = (cfg.apiKey || '').trim();
-  const base = (cfg.apiBase || '').trim().replace(/\/$/, '') ||
+  const base = normalizeApiBase(cfg.apiBase) ||
     (vendor === 'ollama' ? 'http://localhost:11434' : '');
   const timeout = cfg.timeoutMs || 15000;
 
@@ -32,6 +33,7 @@ export async function listModels(cfg) {
 
   if (vendor === 'gemini') {
     if (!key) throw new HttpError('auth', '请填写 API Key');
+    if (!base) throw new HttpError('unknown', '请填写 API Base');
     const url = base + '/models?key=' + encodeURIComponent(key);
     const res = await fetchWithTimeout(url, { method: 'GET' }, timeout);
     const json = await res.json();

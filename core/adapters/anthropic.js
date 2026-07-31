@@ -3,7 +3,8 @@
 // 注意：Anthropic 要求 system 单独成字段，且图片以 base64 source 表达。
 
 import { ModelClient } from '../model-base.js';
-import { postJson, fetchWithTimeout } from '../http.js';
+import { postJson, fetchWithTimeout, HttpError } from '../http.js';
+import { normalizeApiBase } from '../../shared/utils.js';
 
 /** Anthropic 思考预算（tokens）档位映射 */
 const ANTHROPIC_THINKING_BUDGET = { low: 2000, medium: 8000, high: 16000 };
@@ -18,7 +19,7 @@ function mapAnthropicThinking(strength) {
 
 export class AnthropicAdapter extends ModelClient {
   get endpoint() {
-    return this.config.apiBase.replace(/\/$/, '') + '/messages';
+    return normalizeApiBase(this.config.apiBase) + '/messages';
   }
 
   _toVendor(req) {
@@ -120,7 +121,8 @@ export class AnthropicAdapter extends ModelClient {
     const json = await postJson(
       this.endpoint, body,
       { 'x-api-key': this.config.apiKey, 'anthropic-version': '2023-06-01' },
-      this.config.timeoutMs
+      this.config.timeoutMs,
+      signal
     );
     const text = (json.content || []).map(c => c.text || '').join('');
     yield { delta: text, done: true, meta: { raw: json } };
@@ -128,10 +130,18 @@ export class AnthropicAdapter extends ModelClient {
 
   async *chat(req) {
     const signal = req.signal;
-    if (req.stream && this.config.supportsStream) {
-      yield* this._stream(req, signal);
-    } else {
-      yield* this._nonStream(req, signal);
+    try {
+      if (req.stream && this.config.supportsStream) {
+        yield* this._stream(req, signal);
+      } else {
+        yield* this._nonStream(req, signal);
+      }
+    } catch (e) {
+      const urlTip = `（请求地址：${this.endpoint}）`;
+      if (e instanceof HttpError && (e.status === 404 || e.kind === 'network')) {
+        throw new HttpError(e.kind, (e.message || '请求失败') + ' ' + urlTip, e.status);
+      }
+      throw e;
     }
   }
 }

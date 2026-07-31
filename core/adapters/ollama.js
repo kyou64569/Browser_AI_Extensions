@@ -3,12 +3,13 @@
 // 本地模型通常无 apiKey，config.apiKey 可为空。
 
 import { ModelClient } from '../model-base.js';
-import { postJson, fetchWithTimeout } from '../http.js';
+import { postJson, fetchWithTimeout, HttpError } from '../http.js';
+import { normalizeApiBase } from '../../shared/utils.js';
 
 export class OllamaAdapter extends ModelClient {
   get endpoint() {
     // 优先用用户填的 apiBase，否则默认本地
-    const base = (this.config.apiBase || 'http://localhost:11434').replace(/\/$/, '');
+    const base = normalizeApiBase(this.config.apiBase) || 'http://localhost:11434';
     return base + '/api/chat';
   }
 
@@ -69,16 +70,24 @@ export class OllamaAdapter extends ModelClient {
   async *_nonStream(req, signal) {
     const { maxTokens, thinkingStrength, ...otherOptions } = req.options || {};
     const body = { model: this.config.model, messages: this._toVendor(req), stream: false, ...(maxTokens != null ? { max_tokens: maxTokens } : {}), ...otherOptions };
-    const json = await postJson(this.endpoint, body, {}, this.config.timeoutMs);
+    const json = await postJson(this.endpoint, body, {}, this.config.timeoutMs, signal);
     yield { delta: json.message?.content || '', done: true, meta: { raw: json } };
   }
 
   async *chat(req) {
     const signal = req.signal;
-    if (req.stream && this.config.supportsStream) {
-      yield* this._stream(req, signal);
-    } else {
-      yield* this._nonStream(req, signal);
+    try {
+      if (req.stream && this.config.supportsStream) {
+        yield* this._stream(req, signal);
+      } else {
+        yield* this._nonStream(req, signal);
+      }
+    } catch (e) {
+      const urlTip = `（请求地址：${this.endpoint}）`;
+      if (e instanceof HttpError && (e.status === 404 || e.kind === 'network')) {
+        throw new HttpError(e.kind, (e.message || '请求失败') + ' ' + urlTip, e.status);
+      }
+      throw e;
     }
   }
 }
