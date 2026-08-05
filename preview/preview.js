@@ -3,7 +3,7 @@
 // 三个视图：chat（主） / features / settings，单页切换，无整页刷新。
 
 import { chatStream, chatOnce } from '../features/chat.js';
-import { summarizePage, summarizeStream } from '../features/summarize.js';
+import { summarizePage, summarizeStream, buildKbSourcesFooter, kbChunkSource } from '../features/summarize.js';
 import { processSelection } from '../features/selection.js';
 import { buildToolSystemPrompt, parseToolCalls, parseToolCall, stripToolCall } from '../features/automation.js';
 import { listModels } from '../core/list-models.js';
@@ -118,7 +118,7 @@ function defaultModel() {
     vendor: 'openai', name: 'openai/gpt-4o-mini',
     apiBase: 'https://openrouter.ai/api/v1', apiKey: '',
     model: 'openai/gpt-4o-mini',
-    supportsVision: false, supportsStream: true, timeoutMs: 60000, enabled: true,
+    supportsVision: false, supportsStream: true, timeoutMs: 120000, enabled: true,
     isPrimary: false, supportsThinking: false, thinkingStrength: 'off', reasoningEffortSupported: false,
   };
 }
@@ -130,7 +130,7 @@ function defaultBackupModel() {
     vendor: 'openai', name: 'openai/gpt-4o-mini',
     apiBase: 'https://openrouter.ai/api/v1', apiKey: '',
     model: 'openai/gpt-4o-mini',
-    timeoutMs: 60000,
+    timeoutMs: 120000,
   };
 }
 
@@ -472,20 +472,10 @@ async function syncConfigFromStorage() {
   // 用已加载的状态刷新功能页知识库区（凭证/激活来源）
   renderKbProviderTabs();
   renderKbForms();
-  // 恢复常驻知识库（activeKb）
-  if (hasChromeStorage()) {
-    try {
-      const r = await chrome.storage.local.get('kbActive');
-      if (r.kbActive && r.kbActive.id) {
-        // 仅当来源仍有效时恢复（provider 仍存在于注册表 + 当前状态中）
-        const def = KB_PROVIDERS.find(p => p.id === r.kbActive.provider);
-        if (def && !def.placeholder && kbState.providers[r.kbActive.provider]) {
-          activeKb = r.kbActive;
-          renderKbTag();
-        }
-      }
-    } catch (_) { /* 忽略 */ }
-  }
+  // 注意：常驻知识库标签(activeKb)为纯内存状态，不跨会话/重载保留。
+  // 仅在用户选中后于当前会话持续显示，关闭或重载扩展后自动回到初始无标签状态。
+  // 清理旧版本写入的残留 kbActive，确保已安装用户重载后也是初始无标签状态。
+  try { chrome.storage.local.remove('kbActive'); } catch (_) {}
   const imgUp = await loadImgUploadFromStorage();
   if (imgUp && JSON.stringify(imgUp) !== JSON.stringify(imgUploadCfg)) {
     imgUploadCfg = imgUp;
@@ -772,7 +762,8 @@ function autosize() {
 input.addEventListener('input', () => { autosize(); updateSendState(); });
 
 function escapeHtml(s) {
-  return s.replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+  if (s === null || s === undefined) return '';
+  return String(s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
 }
 
 function pushUser(text, images) {
@@ -950,14 +941,46 @@ async function send() {
 
   // 常驻知识库检索增强（仅普通聊天路径注入；功能模式各自有上下文，不叠加 KB）
   let kbChunks = null;
+  let kbUsed = false; // 标记本轮是否使用了知识库（用于给模型额外指令 + 用户可见提示）
+  let kbSearchError = null; // 检索接口的真实错误原因（与"空结果"区分），用于提示用户
+  let kbMeta = null; // ima 原始响应诊断指标（code/命中条数/字段名等），用于 UI 内直接展示，不依赖控制台
+  let kbQuery = ''; // 实际送检索的 query（净化后），提升到外层便于 UI 展示，区分"query 问题"与"库ID问题"
   if (!funcMode && activeKb) {
+    kbQuery = deriveKbQuery(text);
+    console.log('[kb] 开始检索，activeKb=', JSON.stringify(activeKb), '原始问句=', text.substring(0, 60), '| 检索query=', kbQuery);
     setStatus('正在检索知识库…');
     try {
-      kbChunks = await searchKbInChat(text);
+      const kbRes = await searchKbInChat(kbQuery);
+      kbChunks = kbRes.chunks || [];
+      kbSearchError = kbRes.error || null;
+      kbMeta = kbRes.meta || null;
+      if (kbChunks.length) {
+        kbUsed = true;
+        console.log('[kb] 检索成功，收到', kbChunks.length, '条片段，首条预览:', (kbChunks[0].content || '').substring(0, 80));
+        setStatus('📚 已从「' + activeKb.name + '」检索到 ' + kbChunks.length + ' 条相关内容');
+      } else if (kbSearchError) {
+        console.warn('[kb] 检索接口报错：', kbSearchError);
+        setStatus('📚 知识库「' + activeKb.name + '」检索失败：' + kbSearchError + '（模型将基于自身知识回答）');
+      } else if (kbMeta && kbMeta.titleOnlyMatch) {
+        const ru = kbMeta.recallUsed && kbMeta.recallUsed.length ? kbMeta.recallUsed.join('、') : '';
+        console.log('[kb] 命中文档但无正文片段（titleOnlyMatch），命中', kbMeta.matchedDocs || 0, '个文档；内容召回=', ru || '未命中');
+        const recallNote = ru
+          ? '（已用「' + ru + '」做内容召回，但 ima 仍未返回正文片段）'
+          : '（已自动尝试内容召回，仍无正文片段）';
+        setStatus('📚 知识库「' + activeKb.name + '」命中 ' + (kbMeta.matchedDocs || 0) + ' 个文档但无正文片段' + recallNote);
+      } else {
+        console.log('[kb] 检索返回空结果（0条片段）');
+        setStatus('📚 知识库「' + activeKb.name + '」未检索到匹配内容（模型将基于自身知识回答）');
+      }
     } catch (e) {
-      console.warn('[kb] 检索失败，跳过知识库增强：', e.message);
+      console.warn('[kb] 检索异常，跳过知识库增强：', e.message);
+      setStatus('📚 知识库检索异常：' + e.message + '（模型将基于自身知识回答）');
       kbChunks = null;
     }
+  }
+  if (!funcMode && activeKb && !(kbChunks && kbChunks.length)) {
+    // 知识库已选但检索为空：不做注入
+    console.log('[kb] 知识库已选但本轮检索未命中，不注入 KB 系统消息');
   }
 
   // 翻译 / 解释 / OCR：把用户输入包上指令前缀；其余情况正常拼装（图片走多模态附件）
@@ -971,13 +994,25 @@ async function send() {
           : '请识别并提取图片中的所有文字内容，只输出识别出的纯文本，不要添加任何解释、注释或额外说明。' + (text ? '\n\n补充说明：' + text : ''))
     : buildContent(text, attachments);
 
-  // 常驻知识库检索增强（RAG）：仅注入到“发给模型的上下文”中，用户气泡只展示原本发送的内容，
-  // 避免气泡里出现一长串“【参考知识库：…】”检索片段。ima / 本地知识库统一走此逻辑。
-  let apiContent = content;
+  // 常驻知识库检索增强（RAG）：KB 指令以 system 消息注入（权重远高于混在 user 消息中），
+  // 用户气泡只展示原始发送内容，KB 材料对用户不可见但对模型强约束。
+  let kbSystemMsg = null; // 知识库 system 消息（提权为 system role）
   if (!funcMode && kbChunks && kbChunks.length) {
-    apiContent = '【参考知识库：「' + activeKb.name + '」中检索到的相关内容】\n' +
-      kbChunks.map((c, i) => `[${i + 1}] ${c.content}\n（来源：${c.source || '未知'}）`).join('\n\n') +
-      '\n\n' + content;
+    kbChunks.sort((a, b) => (typeof a.score === 'number' && typeof b.score === 'number') ? b.score - a.score : 0);
+    kbSystemMsg = {
+      role: 'system',
+      content:
+        '你正在使用知识库「' + activeKb.name + '」来回答用户问题。必须严格遵守以下规则：\n' +
+        '1. 你的回答必须严格基于下方「知识库检索结果」，不得凭空编造，也不得用训练数据中的同类内容替代知识库给出的信息。\n' +
+        '2. 当且仅当知识库中确实没有与问题相关的条目时，才可以结合你自身的知识补充；此类补充必须在句末用括号注明「（以下为模型自身知识，知识库未收录）」。\n' +
+        '3. 每个关键事实或结论都必须紧跟来源编号 [N]（与下方条目编号一致），禁止遗漏或张冠李戴。\n' +
+        '4. 不要在回答末尾自行罗列来源列表（系统会自动在末尾附上「数据来源」区块）。\n\n' +
+        '知识库检索结果：\n' +
+        kbChunks.map((c, i) => `[${i + 1}] ${(c.content || '').slice(0, 3000)}\n来源：${c.source || kbChunkSource(c, i, activeKb.name)}`).join('\n\n'),
+    };
+    console.log('[kb] 已构造 system 消息，总长度', kbSystemMsg.content.length, '字符，role=system，将注入 apiMessages');
+  } else if (!funcMode && activeKb) {
+    console.log('[kb] kbChunks 为空/长度0，跳过系统消息构造');
   }
   // 图片转为多模态附件（data URL），文本文件保留正文
   const imageAttachments = attachments
@@ -987,17 +1022,27 @@ async function send() {
   if (funcMode === 'ocr' && imageAttachments.length === 0) {
     setStatus('请先添加要识别的图片', 'err'); return;
   }
-  // 历史与气泡只存用户原文（content）；发给模型的上下文用 apiContent（含知识库检索片段）。
+  // 历史与气泡只存用户原文（content）；发给模型的上下文保留原始 user 消息 +
+  // KB 系统指令（system role），让模型将 KB 引用视为强制性规则而非可选建议。
   const userMsg = { role: 'user', content, ...(imageAttachments.length ? { attachments: imageAttachments } : {}) };
-  const apiUserMsg = (apiContent === content) ? userMsg : { ...userMsg, content: apiContent };
 
   input.value = ''; autosize();
   attachments = []; renderAttachments();
   pushUser(content, imageAttachments.map(a => a.data));
-  const apiMessages = [...messages, apiUserMsg];
+  const apiMessages = kbSystemMsg
+    ? [kbSystemMsg, ...messages, userMsg] // system 放最前：满足 OpenAI 兼容 API 对首条消息角色的约束，且强化"强制规则"权重
+    : [...messages, userMsg];
+  if (kbSystemMsg) {
+    console.log('[kb] apiMessages 已注入 system 消息（总消息数:', apiMessages.length, '），system 消息位于首条');
+    console.log('[kb] 最终 apiMessages 结构:', apiMessages.map(m => m.role).join(' -> '));
+  }
 
   // 决定模式与候选模型
   const mode = chatModelId === '__collab__' ? 'collab' : 'single';
+  if (kbUsed) {
+    const selectedModel = mode === 'single' ? (models.find(m => m.id === chatModelId) || models[0]) : models.find(m => m.isPrimary);
+    console.log('[kb] 当前使用模型:', selectedModel ? selectedModel.name : '未知', 'vendor:', selectedModel ? selectedModel.vendor : '?', 'mode:', mode);
+  }
   if (mode === 'collab') {
     // “多模型协作”：仅“已启用”模型参与，且必须指定一个“主模型”
     if (!models.filter(m => m.enabled !== false).some(m => m.isPrimary)) {
@@ -1009,12 +1054,14 @@ async function send() {
     return;
   }
 
-  // 思考强度：仅当选中参考模型开启“思考”时生效
+  // 思考强度：仅当选中参考模型开启"思考"时生效
   const ref = currentRefModel();
   const ts = (ref && ref.supportsThinking) ? thinkingStrength : undefined;
 
   const a = newAssistant();
   streaming = true; sendBtn.disabled = true;
+  // 知识库前缀：首个 token 到达时自动附加到回复顶部
+  const kbPrefix = kbUsed ? '📚 基于知识库「' + activeKb.name + '」回答（检索到 ' + kbChunks.length + ' 条片段）：\n\n' : '';
   setStatus(funcMode === 'ocr' ? '正在识别图片中的文字…' : '思考中…');
 
   let acc = '';
@@ -1032,11 +1079,73 @@ async function send() {
         setStatus('未选择主模型', 'err');
         return;
       }
-      if (!started) { started = true; a.stopTyping(); setStatus(funcMode === 'ocr' ? '正在返回识别结果…' : '正在回复…'); }
+      if (!started) { started = true; a.stopTyping(); setStatus(funcMode === 'ocr' ? '正在返回识别结果…' : kbUsed ? '📚 基于知识库回复中…' : '正在回复…'); }
       else a.stopTyping();
       acc += chunk.delta;
-      a.setText(acc);
+      a.setText((kbPrefix && !acc.startsWith(kbPrefix) ? kbPrefix : '') + acc);
       scrollBottom();
+    }
+    // 知识库：流式结束后确定性附上「数据来源」区块（不依赖模型是否自觉列出），便于核对模型是否真基于知识库作答
+    if (kbUsed && kbChunks && kbChunks.length) {
+      const footer = buildKbSourcesFooter(kbChunks, activeKb.name);
+      const alreadyListed = /数据来源|参考知识库条目|参考来源|引用来源/.test(acc);
+      if (footer && !alreadyListed) {
+        acc += footer;
+        a.setText((kbPrefix && !acc.startsWith(kbPrefix) ? kbPrefix : '') + acc);
+      }
+    } else if (activeKb && !(kbChunks && kbChunks.length)) {
+      // 已选知识库但本轮检索未命中：明确告知用户答案未引用知识库，避免"模型在瞎编"的困惑。
+      // 若检索接口本身报错（kbSearchError 非空），把真实原因一并透出，便于区分"库里没料"与"接口挂了"。
+      // 同时把 ima 原始响应诊断（code/命中条数/字段名）直接写进 UI，用户无需翻控制台即可判断根因。
+      const reason = kbSearchError ? `（检索失败：${kbSearchError}）` : '';
+      let diag = '';
+      if (kbMeta && !kbSearchError) {
+        const m = kbMeta;
+        const hit = m.matchedDocs || m.rawListLen || 0;
+        const valid = (m.withContent != null) ? m.withContent : (m.nonEmptyContent || 0);
+        if (m.titleOnlyMatch) {
+          // 命中了文档（标题），但 ima 没返回任何可引用的正文片段（highlight_content 为空）。
+          // 已逐篇调 get_media_info 按 media_type 分支取正文：笔记/URL 能取到，文件型(PDF/Word)取不到。
+          // 把 media_type 分布打到 UI，让用户一眼看出自己的文档到底是哪类、为何取不到全文。
+          const keys = (m.sampleItemKeys || []).slice(0, 10).join(', ');
+          const lens = m.sampleContentLens ? JSON.stringify(m.sampleContentLens) : '{}';
+          const mt = (m.mediaTypesSeen && Object.keys(m.mediaTypesSeen).length)
+            ? Object.entries(m.mediaTypesSeen).map(([k, v]) => `${k}×${v}`).join(', ')
+            : '未知';
+          const nb = m.noteFetched || 0, uf = m.urlFetched || 0, inac = m.inaccessible || 0, nf = m.nonFileUrl || 0;
+          // 逐篇取正文明细：让用户一眼看到「每篇什么类型、url 是什么、为什么没取到」，便于定位 mt=7 等未知类型
+          const pd = (m.perDoc && m.perDoc.length) ? m.perDoc : null;
+          const perDocText = pd ? '\n逐篇取正文情况：\n' + pd.map(d =>
+            `· ${d.source} [mt=${d.mt}/${d.kind}] → ${d.outcome}` +
+            (d.url ? ` url=${d.url}` : '') +
+            (d.reason ? ` (${d.reason})` : '')
+          ).join('\n') : '';
+          const recall = (m.recallUsed && m.recallUsed.length)
+            ? `已用「${m.recallUsed.join('、')}」做内容召回，仍只命中标题。`
+            : `已自动用核心词做内容召回，仍只命中标题。`;
+          if (inac > 0 && nb === 0 && uf === 0) {
+            // 全部是文件型：ima OpenAPI 不暴露全文，与提示词 Step3 一致
+            const nfNote = nf > 0 ? `其中 ${nf} 篇文件型文档的 get_media_info 返回的是「来源页 URL」而非文件直链（如原导入站点的域名根路径），无法取到正文，` : '';
+            diag = `（诊断：ima 返回 code=${m.code != null ? m.code : '?'}、命中 ${hit} 个相关文档，已逐篇调 get_media_info 取正文，media_type 分布=[${mt}]；${nfNote}其中 ${inac} 篇是「文件型文档（PDF/Word 等）」，ima OpenAPI 不暴露其全文（本扩展也不解析二进制文件），这是确认的限制，与原生 ima 的全文 RAG 无关。${recall}要让模型基于正文，请用能命中正文的关键词（如"微表情 如何识别谎言"），或把 ima 网页端命中的正文片段发我。${perDocText}）`;
+          } else {
+            diag = `（诊断：ima 返回 code=${m.code != null ? m.code : '?'}、命中 ${hit} 个相关文档，media_type 分布=[${mt}]，已取正文 笔记${nb}/网页${uf} 篇、API 不可访问${inac}篇。首条字段=[${keys}]；候选正文字段长度=${lens}。${recall}${perDocText}）`;
+          }
+        } else if (hit > 0 && valid === 0) {
+          // 命中但字段映射失败：极大概率是 ima 返回字段名与预期不一致（同 listKb 的旧坑）
+          const keys = (m.sampleItemKeys || []).slice(0, 8).join(', ');
+          diag = `（诊断：ima 接口返回命中 ${hit} 条，但字段无法映射为知识片段，疑似 ima 返回字段名与预期不一致；首条字段名=[${keys}]。请把这段发我即可定位）`;
+        } else {
+          diag = `（诊断：ima 返回 code=${m.code != null ? m.code : '?'}、命中 ${hit} 条原文、有效知识片段 ${valid} 条。若库内确有文档却搜不到，多半是子文件夹里的内容尚未被 ima 建索引完成——尤其是播客类音频需先转写再索引、耗时较长；请到 ima 网页端确认该知识库的索引状态。也可尝试用更短的关键词（如直接搜"认知偏差"）而非整句问句）`;
+        }
+      }
+      const dbg = '\n（调试：实际检索词「' + (kbQuery || text) + '」；库ID前8位 `' + (activeKb.id ? activeKb.id.slice(0, 8) : '?') + '`。若 ima 网页端用同名关键词能搜到，请把这两段发我即可定位是 query 还是库ID 作用域问题）';
+      // 完整诊断 note（含 diag/dbg 调试信息）仅用于 UI 展示，绝不写入 acc/历史，
+      // 否则调试文本、库ID、来源 URL 会在下一轮被原样发送给模型，污染模型上下文。
+      const displayNote = '\n\n---\n\nℹ️ 已在知识库「' + activeKb.name + '」中检索，但未找到与问题相关的内容' + reason + '，以下回答由模型自身知识生成（**未引用知识库**）。' + diag + dbg + '。可补充知识库材料，或换用更具体的提问。';
+      // 历史只保留不含调试信息的简短说明（模型下一轮可见，但无诊断噪声）
+      const historyNote = '\n\n---\n\nℹ️ 已在知识库「' + activeKb.name + '」中检索，但未找到与问题相关的内容' + reason + '，以下回答由模型自身知识生成（未引用知识库）。';
+      a.setText((kbPrefix && !acc.startsWith(kbPrefix) ? kbPrefix : '') + acc + displayNote);
+      acc += historyNote;
     }
     messages.push(userMsg);                 // 含图片附件，确保会话持久化保留原图数据
     messages.push({ role: 'assistant', content: acc });
@@ -1584,7 +1693,6 @@ function openKbPicker() {
           `<span class="kb-count">${kb.contentCount || 0} 条</span>`;
         item.onclick = () => {
           activeKb = { provider: providerId, id: kb.id, name: kb.name };
-          try { chrome.storage.local.set({ kbActive: activeKb }); } catch (_) {}
           picker.hidden = true;
           renderKbTag();
           input.focus();
@@ -1612,13 +1720,43 @@ function renderKbTag() {
 /** 关闭常驻知识库 */
 function closeKb() {
   activeKb = null;
-  try { chrome.storage.local.set({ kbActive: null }); } catch (_) {}
   renderKbTag();
 }
 
 // 弹层关闭交互
 if ($('#kbPickerClose')) $('#kbPickerClose').onclick = () => { $('#kbPicker').hidden = true; };
 if ($('#kbPickerMask')) $('#kbPickerMask').onclick = () => { $('#kbPicker').hidden = true; };
+
+/**
+ * 把用户的"指令式提问"净化为更适合知识库语义检索的 query。
+ * 例：「请总结三条心理学知识。」→ 「心理学知识」；「介绍一下认知偏差」→ 「认知偏差」。
+ * 检索召回差往往是因原问句带"请/总结/三条"等指令噪声，剥掉后命中率更高。
+ */
+function deriveKbQuery(text) {
+  let q = (text || '').trim();
+  // 书名号《》或中文引号「」『』内是最强检索意图，优先提取为检索核心词
+  // 例：「《微表情心理学》这本书讲了什么。」→「微表情心理学」（直接命中文档标题，与 ima 原生搜索一致）
+  const quoted = q.match(/[《「『"]([^》」』"]+)[》」』"]/);
+  let core = quoted ? quoted[1].trim() : '';
+  // 去掉"根据知识库/资料"等限定语
+  q = q.replace(/^(根据|结合|基于|从)\s*(知识库|资料|文档|库)\s*[，,:：]?\s*/i, '');
+  // 去掉常见指令前缀：请/帮我/可否 + 总结/归纳/介绍/讲解/列出/分析/查找…
+  q = q.replace(/^(请|帮我|能否|可以|麻烦|我想让你|麻烦你|请帮我)?\s*(总结|归纳|概述|概括|整理|列出|列举|讲讲|讲一讲|介绍|讲解|说明|解释|提取|梳理|给出|提供|写|生成|说说|分析|查一下|查找|搜索|搜一下|找一下|告诉我|说一下|说说看)\s*(一下|下|：|:)?\s*/i, '');
+  // 去掉开头/结尾的量词：三条/3条/几个/三则/5个…
+  q = q.replace(/^[一二三四五六七八九十\d]+\s*(条|个|则|点|篇|项|种|种知识)\s*/u, '');
+  q = q.replace(/\s*[一二三四五六七八九十\d]+\s*(条|个|则|点|篇|项|种|种知识)\s*$/u, '');
+  // 去掉句末语气词/标点
+  q = q.replace(/\s*(一下|吧|呢|啊|哦|呀|嘛|？|\?|。|\.|，|,)\s*$/u, '');
+  // 去掉结尾的"请各举N个例子/范例/示例"等指令
+  q = q.replace(/[，,]?\s*请[^？，。]*?(例子|范例|示例)[，。]?$/u, '');
+  // 去掉"这本/这篇/这个文档 讲了什么/主要内容/核心观点"等尾部语义噪声
+  q = q.replace(/(这本|这篇|这个|该)(书|文章|文档|报告|资料|笔记|网页|页面|链接|播客|视频|PPT|课件|论文)\s*(主要)?\s*(讲了什么|讲什么|的内容|主要内容|核心观点|的核心观点|主要内容是什么|大概讲什么|都讲了什么|相关的内容|方面的知识|知识点)/u, '');
+  q = q.replace(/(讲了什么|讲什么|的主要内容|主要内容|核心观点|的核心观点|主要内容是什么|大概讲什么|都讲了什么|相关的内容|方面的知识|知识点)/u, '');
+  q = q.replace(/[？?。\.，,、；;：:\s]+$/u, '').trim(); // 兜底清理"请各举…"等指令去掉后残留的尾部标点
+  // 若提取到书名号/引号内的核心词（≥2字），优先用它做检索（最精准，直接命中文档标题）
+  if (core && core.length >= 2) return core;
+  return q || (text || '').trim(); // 净化后为空则回退原句
+}
 
 /** 知识库检索（聊天常驻注入用）：经后台 KB_SEARCH 取片段，带超时保护 */
 async function searchKbInChat(query) {
@@ -1636,8 +1774,10 @@ async function searchKbInChat(query) {
     throw e;
   }
   if (!resp) throw new Error('知识库无响应');
-  if (resp.error) throw new Error(resp.error);
-  return resp.chunks || [];
+  // 检索失败不中断主流程：返回结构化结果（含真实错误原因），由调用方决定如何提示，
+  // 从而能区分"接口报错"与"检索为空"两种情况。
+  if (resp.error) return { chunks: [], error: resp.error, meta: resp.meta || null };
+  return { chunks: resp.chunks || [], error: null, meta: resp.meta || null };
 }
 
 /** 设置功能模式并渲染标签 */
@@ -1942,6 +2082,7 @@ async function runSummarizeInChat(instruction) {
   try {
     for await (const chunk of summarizeStream({ models: prepareModels() }, page, {
       kb: makeKb(),
+      kbName: activeKb ? activeKb.name : '',
       instruction: prompt,
       mode: sumMode,
       thinkingStrength: sumTs,
@@ -2752,7 +2893,7 @@ function defaultWhisperModel() {
     apiBase: 'https://api.openai.com/v1',
     apiKey: '',
     model: 'whisper-1',
-    timeoutMs: 60000,
+    timeoutMs: 120000,
   };
 }
 

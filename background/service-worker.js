@@ -1152,6 +1152,14 @@ async function webSearch(query, maxResults = 6) {
   return results;
 }
 
+// KB 列表缓存：避免每次打开选择器都反复调用 API 耗尽配额。
+// 缓存 5 分钟，按 provider 隔离；KB_SEARCH 不缓存（需要实时结果）。
+// 必须声明在模块顶层（onMessage 回调之外），否则每次消息到达都会新建空 Map、缓存永远失效。
+// 注：MV3 service worker 休眠后顶层变量会清空，属固有限制；存活期内缓存有效，远优于无缓存。
+const _kbListCache = new Map(); // providerId -> { list, ts }
+const _kbListPending = new Map(); // providerId -> Promise (去重并发请求)
+const KB_LIST_CACHE_MS = 5 * 60 * 1000;
+
 // content script / popup 的简单请求
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === 'WEB_SEARCH') {
@@ -1339,15 +1347,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // 知识库（多 provider 可切换）：连接测试 / 列出知识库 / 检索。
   // 凭证来自 getKbState()，按 msg.provider 取对应 provider 的配置并实例化连接器。
   // 后台发起请求配合 host_permissions <all_urls>，不受 CORS 限制。
+  // KB 列表缓存（_kbListCache / KB_LIST_CACHE_MS）声明于模块顶层，见文件上部。
+
   if (msg.type === 'KB_TEST' || msg.type === 'KB_LIST' || msg.type === 'KB_SEARCH') {
     let settled = false;
-    const SAFETY_MS = 55000; // 略小于发送端 60s 超时，确保发送端先收到明确的超时错误
+    const SAFETY_MS = 25000; // 兜底超时：前端 preview.js searchKbInChat 实际为 30s，此值设为 25s 确保前端先收到自己的超时提示
     const safety = setTimeout(() => {
       if (settled) return;
       settled = true;
       try { sendResponse({ error: '知识库请求超时' }); } catch (_) {}
     }, SAFETY_MS);
     (async () => {
+      let kb = null; // 在 catch 中也可读取 _lastMeta 诊断
       try {
         const state = await getKbState();
         const providerId = msg.provider || state.active;
@@ -1363,7 +1374,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           sendResponse({ error: `「${def.label}」尚未支持` });
           return;
         }
-        const kb = createKbConnector(provider.type, provider.cfg);
+        kb = createKbConnector(provider.type, provider.cfg);
         if (!kb) {
           if (!settled) { settled = true; clearTimeout(safety); }
           sendResponse({ error: `暂不支持的知识库类型：${provider.type}` });
@@ -1374,7 +1385,30 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           if (!settled) { settled = true; clearTimeout(safety); }
           sendResponse({ ok: true, info: r });
         } else if (msg.type === 'KB_LIST') {
-          const list = await kb.listKb({ limit: 100 });
+          // 缓存优先：5 分钟内不重复请求同一 provider 的 KB 列表
+          const cached = _kbListCache.get(providerId);
+          if (cached && Date.now() - cached.ts < KB_LIST_CACHE_MS) {
+            if (!settled) { settled = true; clearTimeout(safety); }
+            sendResponse({ ok: true, list: cached.list });
+            return;
+          }
+          // 去重并发请求：同一 provider 的多个并发请求共享同一个 Promise
+          if (_kbListPending.has(providerId)) {
+            const list = await _kbListPending.get(providerId);
+            if (!settled) { settled = true; clearTimeout(safety); }
+            sendResponse({ ok: true, list });
+            return;
+          }
+          const pending = kb.listKb({ limit: 100 }).then(list => {
+            _kbListCache.set(providerId, { list, ts: Date.now() });
+            _kbListPending.delete(providerId);
+            return list;
+          }).catch(err => {
+            _kbListPending.delete(providerId);
+            throw err;
+          });
+          _kbListPending.set(providerId, pending);
+          const list = await pending;
           if (!settled) { settled = true; clearTimeout(safety); }
           sendResponse({ ok: true, list });
         } else if (msg.type === 'KB_SEARCH') {
@@ -1382,11 +1416,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             knowledgeBaseId: msg.knowledgeBaseId || undefined,
           });
           if (!settled) { settled = true; clearTimeout(safety); }
-          sendResponse({ ok: true, chunks });
+          sendResponse({ ok: true, chunks, meta: kb._lastMeta || null });
         }
       } catch (e) {
         if (!settled) { settled = true; clearTimeout(safety); }
-        sendResponse({ error: e?.message || '知识库请求失败' });
+        sendResponse({ error: e?.message || '知识库请求失败', meta: kb ? kb._lastMeta || null : null });
       }
     })();
     return true; // 异步 sendResponse

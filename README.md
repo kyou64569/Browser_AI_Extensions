@@ -48,8 +48,6 @@ shared/
   storage.js                  chrome.storage.local 读写封装（密钥不写死）
   utils.js                    共享工具：凭证判断、采样参数提取等
 ui/
-  sidepanel/                  原生侧边栏（chrome.sidePanel）：触发总结、展示结果、备用模型提示
-  popup/                      工具栏弹窗：打开原生侧边栏 / 设置
   options/                    原生设置页（chrome.runtime.openOptionsPage）：聊天/总结模型列表 + 本地知识库地址。
                               （多模态模型在预览/注入侧边栏的「设置」preview.js 中配置）
 preview/
@@ -138,11 +136,10 @@ preview/
 ## 待你提供 / 待补项
 
 - `connectors/local-kb.js`：真实接口路径、请求/响应字段（当前按 `/retrieve`、`/add` 占位）。
-- `connectors/online-kb.js`：在线知识库接入方式需调研（官方 API/浏览器自动化）。
+- `connectors/online-kb.js`：在线知识库（ima）已接入多 provider 检索；官方全文 RAG 能力不通过开放 API 暴露（详见代码内诊断说明）。
 - `features/selection.js`：划词浮层 UI（已预留接口）。
-- `features/placeholders.js`：工作流、自主 Agent、Skill 系统、PPT 导出、网页自动化（仅接口占位）。
-- 原生侧边栏（`ui/sidepanel`）的流式展示当前由 service-worker 聚合后一次性返回；
-  `preview` 路径的聊天已支持逐 chunk 打字机效果，原生侧边栏路径后续可对齐。
+- `features/placeholders.js`：工作流、自主 Agent、Skill 系统、PPT 导出（仅接口占位）。
+- 侧边栏 UI 统一走 `preview/` 路径（`index.html` 为 sidePanel 默认页），聊天已支持逐 chunk 打字机效果。
 
 ---
 

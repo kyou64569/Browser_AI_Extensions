@@ -42,7 +42,7 @@ export function createModelConfig(overrides = {}) {
     model: overrides.model || '',
     supportsVision: overrides.supportsVision ?? false,
     supportsStream: overrides.supportsStream ?? true,
-    timeoutMs: overrides.timeoutMs || 60000,
+    timeoutMs: overrides.timeoutMs || 120000,
     enabled: overrides.enabled ?? true,
     isPrimary: overrides.isPrimary ?? false,
     supportsThinking: overrides.supportsThinking ?? false,

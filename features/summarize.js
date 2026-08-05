@@ -18,11 +18,50 @@ import { chatStream } from './chat.js';
  * @param {string} [instruction] 用户额外指令（如“用一句话概括”），为空时默认“请总结要点”
  * @returns {import('../core/message.js').Message[]}
  */
-function buildMessages(title, text, kbChunks = [], instruction = '') {
-  const sys = '你是一个网页内容总结助手，用中文输出结构清晰、要点明确的总结。';
+/**
+ * 取知识库片段的可读来源标签（优先 source/title，缺失则回退为内容片段）。
+ * 部分连接器（如本地知识库）可能不返回 source，此时用内容前若干字兜底，保证来源可见。
+ * @param {import('../connectors/knowledge-base.js').KbChunk} chunk
+ * @param {number} i 0-based 序号
+ * @param {string} [kbName]
+ * @returns {string}
+ */
+export function kbChunkSource(chunk, i, kbName = '') {
+  const source = chunk?.source || chunk?.title || '';
+  const content = (chunk && chunk.content) ? chunk.content.replace(/\s+/g, ' ').trim() : '';
+  const snippet = content ? content.slice(0, 120) + (content.length > 120 ? '…' : '') : '';
+  // 优先「来源 — 正文片段」，便于用户核对模型确实引用了知识库原文
+  if (source && snippet) return `${source} — ${snippet}`;
+  if (source) return source;
+  if (snippet) return kbName ? `《${kbName}》片段 ${i + 1}：${snippet}` : `片段 ${i + 1}：${snippet}`;
+  return kbName ? `《${kbName}》片段 ${i + 1}（无正文）` : `片段 ${i + 1}（无正文）`;
+}
+
+/**
+ * 生成「数据来源」区块文本（确定性：由检索结果直接拼出，不依赖模型是否自觉列出）。
+ * 用于回答/总结末尾强制附上数据来源，便于用户核对模型是否真的基于知识库作答。
+ * @param {import('../connectors/knowledge-base.js').KbChunk[]} chunks
+ * @param {string} [kbName]
+ * @returns {string}
+ */
+export function buildKbSourcesFooter(chunks, kbName = '') {
+  if (!chunks || !chunks.length) return '';
+  const lines = chunks.map((c, i) => `${i + 1}. ${kbChunkSource(c, i, kbName)}`);
+  const head = kbName ? `数据来源（知识库「${kbName}」检索到的 ${chunks.length} 条片段）` : `数据来源（检索到的 ${chunks.length} 条知识库片段）`;
+  return '\n\n---\n\n**📚 ' + head + '**\n' + lines.join('\n') +
+    '\n\n（回答中的 [N] 对应上述编号；未标注 [N] 的内容可能来自模型自身知识，而非知识库。）';
+}
+
+function buildMessages(title, text, kbChunks = [], instruction = '', kbName = '') {
+  let sys = '你是一个网页内容总结助手，用中文输出结构清晰、要点明确的总结。';
   let user = `网页标题：${title}\n\n正文：\n${text.slice(0, 12000)}`;
   if (kbChunks.length) {
-    user += '\n\n参考知识库片段：\n' + kbChunks.map((c, i) => `[${i + 1}] ${c.content}`).join('\n');
+    sys = '你是一个网页内容总结助手，用中文输出结构清晰、要点明确的总结。' +
+      '你正在使用知识库「' + (kbName || '已配置知识库') + '」辅助总结，必须严格遵守：' +
+      '1. 总结要点必须优先基于下方「知识库检索结果」，不得凭空编造，也不得用训练数据中的同类内容替代知识库给出的信息；' +
+      '2. 仅当知识库确实没有相关条目时，才可在句末注明「（以下为模型自身知识，知识库未收录）」补充；' +
+      '3. 每个要点必须紧跟来源编号 [N]（与下方条目编号一致）。';
+    user += '\n\n知识库检索结果：\n' + kbChunks.map((c, i) => `[${i + 1}] ${(c.content || '').slice(0, 3000)}\n来源：${c.source || kbChunkSource(c, i, kbName)}`).join('\n\n');
   }
   user += '\n\n' + (instruction && instruction.trim() ? instruction.trim() : '请总结要点。');
   return [
@@ -57,12 +96,14 @@ export async function summarizePage(ctx, page, opts = {}) {
 
   const fb = new FallbackManager({ onFallback: opts.onFallback });
   const req = {
-    messages: buildMessages(page.title, page.text, kbChunks),
+    messages: buildMessages(page.title, page.text, kbChunks, '', opts.kbName),
     stream: opts.stream ?? true,
     options: optionsFromModel(candidates[0]),
     ...(opts.signal ? { signal: opts.signal } : {}),
   };
-  return fb.call(candidates, req);
+  const res = await fb.call(candidates, req);
+  if (kbChunks.length) res.text = (res.text || '') + buildKbSourcesFooter(kbChunks, opts.kbName);
+  return res;
 }
 
 /**
@@ -146,8 +187,9 @@ export async function* summarizeStream(ctx, page, opts = {}) {
     try { kbChunks = await opts.kb.search(page.title || page.text.slice(0, 100)); }
     catch { kbChunks = []; }
   }
+  const sourcesFooter = kbChunks.length ? buildKbSourcesFooter(kbChunks, opts.kbName) : '';
 
-  const apiMessages = buildMessages(page.title, page.text, kbChunks, opts.instruction);
+  const apiMessages = buildMessages(page.title, page.text, kbChunks, opts.instruction, opts.kbName);
 
   // 多模型协作：交给 chatStream 的统一协作逻辑（子模型各自非流式回答，主模型整合流式输出）
   if (opts.mode === 'collab') {
@@ -156,6 +198,7 @@ export async function* summarizeStream(ctx, page, opts = {}) {
       thinkingStrength: opts.thinkingStrength,
       ...(opts.signal ? { signal: opts.signal } : {}),
     });
+    if (sourcesFooter) yield { delta: sourcesFooter };
     return;
   }
 
@@ -168,4 +211,5 @@ export async function* summarizeStream(ctx, page, opts = {}) {
     options,
     ...(opts.signal ? { signal: opts.signal } : {}),
   });
+  if (sourcesFooter) yield { delta: sourcesFooter };
 }
