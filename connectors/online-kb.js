@@ -322,8 +322,9 @@ export class OnlineKbConnector extends KnowledgeBaseConnector {
     let recallUsed = [];      // 实际命中的内容召回词（用于诊断）
     let recallAttempted = []; // 尝试过的召回词
     let urlFetched = 0;       // 通过 get_media_info 直接取到原文的 URL 数
-    // 把 ima 原始响应指标记下来，供前端在 UI 中直接展示诊断（不依赖控制台）。
-    this._lastMeta = { kbId, code: null, rawListLen: 0, parsedLen: 0, nonEmptyContent: 0, matchedDocs: 0, withContent: 0, titleOnlyMatch: false, topKeys: [], dataKeys: [], sampleItemKeys: [], sampleContentLens: {}, recallUsed: [], recallAttempted: [], urlFetched: 0, noteFetched: 0, inaccessible: 0, nonFileUrl: 0, mediaTypesSeen: {}, perDoc: [], lastFetch: null };
+    // 使用局部 meta 对象，避免并发请求互相覆盖 _lastMeta。
+    // 方法结束时赋值给 this._lastMeta 供外部诊断读取。
+    const meta = { kbId, code: null, rawListLen: 0, parsedLen: 0, nonEmptyContent: 0, matchedDocs: 0, withContent: 0, titleOnlyMatch: false, topKeys: [], dataKeys: [], sampleItemKeys: [], sampleContentLens: {}, recallUsed: [], recallAttempted: [], urlFetched: 0, noteFetched: 0, inaccessible: 0, nonFileUrl: 0, mediaTypesSeen: {}, perDoc: [], lastFetch: null };
     for (let page = 0; page < 3; page++) { // 3 页→最多 60 条候选，够用且省配额
       let json;
       try {
@@ -335,18 +336,19 @@ export class OnlineKbConnector extends KnowledgeBaseConnector {
       } catch (e) {
         // 检索失败：不再静默吞掉。抛出后由后台返回 { error }，前端才能区分
         // "检索接口报错"与"检索为空"——否则两者都显示成误导性的"未找到相关内容"。
-        this._lastMeta = { kbId, error: e.message };
+        meta.error = e.message;
+        this._lastMeta = meta;
         console.warn('[online-kb] 检索失败：', e.message);
         throw e;
       }
       const data = json.data || {};
       const list = data.info_list || [];
       // 累计诊断指标（多页聚合）
-      this._lastMeta.code = json.code;
-      this._lastMeta.rawListLen += list.length;
-      this._lastMeta.topKeys = Object.keys(json);
-      this._lastMeta.dataKeys = Object.keys(data);
-      if (list.length) this._lastMeta.sampleItemKeys = Object.keys(list[0]);
+      meta.code = json.code;
+      meta.rawListLen += list.length;
+      meta.topKeys = Object.keys(json);
+      meta.dataKeys = Object.keys(data);
+      if (list.length) meta.sampleItemKeys = Object.keys(list[0]);
       // 诊断日志（service worker 控制台；用户侧看不到，仅用于开发排查）
       console.log('[online-kb] search_knowledge 响应：code=', json.code, '| info_list长度=', list.length,
         '| is_end=', data.is_end, '| kbId=', kbId, '| query=', query);
@@ -417,8 +419,7 @@ export class OnlineKbConnector extends KnowledgeBaseConnector {
 
       // 单篇探查：get_media_info → 按 media_type 分支取正文。成功则 push 进 chunks 并立即返回
       //（对应原串行版的 continue 语义），失败继续尝试笔记分支，最终计入「不可访问」。
-      // 注意：并发下 _lastMeta.lastFetch 可能被其他任务覆盖（perDoc 的 reason 偶有交叉），
-      // 属诊断辅助的已知取舍——换取整体耗时从最坏 12×15s≈180s 降到 ≈(12/3)×15s。
+      // meta 为请求级局部对象，并发请求互不覆盖。
       const probeOne = async (c) => {
         if (chunks.length >= limit || probed.has(c.id)) return;
         probed.add(c.id);
@@ -439,14 +440,14 @@ export class OnlineKbConnector extends KnowledgeBaseConnector {
           let recorded = false;
           const rec = (outcome, reason) => {
             if (recorded) return;
-            this._lastMeta.perDoc.push({ source: c.source.slice(0, 36), mt: String(mt), kind, url: (info.url || '').slice(0, 120), outcome, reason });
+            meta.perDoc.push({ source: c.source.slice(0, 36), mt: String(mt), kind, url: (info.url || '').slice(0, 120), outcome, reason });
             recorded = true;
           };
           if (info.url) {
             // 文件型文档（PDF/Word 等二进制）：fetchUrlText 内部会直接判为不可访问，不会注入正文。
             // 文本型/md 与网页型：直接按文本/HTML 解码抓取。
-            const text = await this.fetchUrlText(info.url, info.headers, mt, isBinaryDoc);
-            const fr = this._lastMeta.lastFetch || {};
+            const text = await this.fetchUrlText(info.url, info.headers, mt, isBinaryDoc, meta);
+            const fr = meta.lastFetch || {};
             if (text && !isBinaryText(text) && !seen.has(c.id)) {
               if (chunks.length >= limit) { rec('skip', 'limit-reached'); return; }
               seen.add(c.id);
@@ -456,7 +457,7 @@ export class OnlineKbConnector extends KnowledgeBaseConnector {
               return;
             }
             // fetchUrlText 返回 null：文件/文本型文档拿不到可用正文（多为来源页 URL 或不可解析的二进制体）
-            if (isBinaryDoc || isTextDoc) this._lastMeta.nonFileUrl++;
+            if (isBinaryDoc || isTextDoc) meta.nonFileUrl++;
             rec('skip', fr.reason || 'no-content');
           } else {
             rec('no-url', 'get_media_info 无 url');
@@ -479,42 +480,41 @@ export class OnlineKbConnector extends KnowledgeBaseConnector {
         } catch (e) {
           console.warn('[online-kb] get_media_info/get_doc_content 失败：', c.id, e.message);
           inaccessible++;
-          this._lastMeta.perDoc.push({ source: (c.source || '').slice(0, 36), mt: '?', kind: '?', url: '', outcome: 'error', reason: String(e.message || '').slice(0, 60) });
+          meta.perDoc.push({ source: (c.source || '').slice(0, 36), mt: '?', kind: '?', url: '', outcome: 'error', reason: String(e.message || '').slice(0, 60) });
         }
       };
 
-      // 并发限流：最多探查 maxProbe 篇，每批 CONCURRENCY 个并行（串行 fetch 最坏 12×15s≈180s，
-      // 远超前端 30s 超时；并发 3 个把总耗时压到 1/3，同时保住配额控制）。
+      // 并发限流：最多探查 maxProbe 篇，每批 CONCURRENCY 个并行
       const probeList = allChunks.filter(c => c.id && !probed.has(c.id)).slice(0, maxProbe);
       const CONCURRENCY = 3;
       for (let p = 0; p < probeList.length; p += CONCURRENCY) {
         if (chunks.length >= limit) break;
         await Promise.all(probeList.slice(p, p + CONCURRENCY).map(probeOne));
       }
-      this._lastMeta.noteFetched = noteFetched;
-      this._lastMeta.inaccessible = inaccessible;
-      this._lastMeta.mediaTypesSeen = mediaTypesSeen;
+      meta.noteFetched = noteFetched;
+      meta.inaccessible = inaccessible;
+      meta.mediaTypesSeen = mediaTypesSeen;
     }
 
     // 诊断：区分「命中文档但无正文片段」(titleOnlyMatch) 与「完全没命中」，
     // 这样 UI 才能明确告诉用户是 query 问题还是索引问题，而不是一句误导性的"未找到"。
-    this._lastMeta.matchedDocs = allChunks.length;
-    this._lastMeta.withContent = chunks.length;
-    this._lastMeta.titleOnlyMatch = allChunks.length > 0 && chunks.length === 0;
-    this._lastMeta.parsedLen = chunks.length;
-    this._lastMeta.nonEmptyContent = chunks.length;
-    this._lastMeta.recallUsed = recallUsed;
-    this._lastMeta.recallAttempted = recallAttempted;
-    this._lastMeta.urlFetched = urlFetched;
+    meta.matchedDocs = allChunks.length;
+    meta.withContent = chunks.length;
+    meta.titleOnlyMatch = allChunks.length > 0 && chunks.length === 0;
+    meta.parsedLen = chunks.length;
+    meta.nonEmptyContent = chunks.length;
+    meta.recallUsed = recallUsed;
+    meta.recallAttempted = recallAttempted;
+    meta.urlFetched = urlFetched;
     if (firstRaw) {
-      // 首条候选文档各「正文片段」字段的长度——用于确认 ima 真实返回字段名（如 highlight_content 是否被改名）
       const lens = {};
       for (const f of CONTENT_FIELDS) {
         const v = firstRaw[f];
         if (v != null) lens[f] = (typeof v === 'string') ? v.length : String(v).length;
       }
-      this._lastMeta.sampleContentLens = lens;
+      meta.sampleContentLens = lens;
     }
+    this._lastMeta = meta;
     return chunks.slice(0, limit);
   }
 
@@ -550,10 +550,10 @@ export class OnlineKbConnector extends KnowledgeBaseConnector {
    *  - 文件型文档（PDF/Word/PPT 等二进制）：本扩展不解析其二进制，且 ima OpenAPI 也不暴露其原文，
    *    即使 get_media_info 返回的 url 能抓到内容，也多为来源页 HTML 或二进制文件体，无法作为正文注入 RAG，
    *    一律按不可访问处理。 */
-  async fetchUrlText(url, headers, mediaType, isBinaryDoc) {
+  async fetchUrlText(url, headers, mediaType, isBinaryDoc, meta) {
     if (typeof url !== 'string' || !url) return null;
     const fd = { url: url.slice(0, 120), reason: '', contentType: '', bodyPrefix: '' };
-    const mark = (reason, extra) => { Object.assign(fd, { reason }, extra || {}); this._lastMeta.lastFetch = fd; };
+    const mark = (reason, extra) => { Object.assign(fd, { reason }, extra || {}); if (meta) meta.lastFetch = fd; };
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 15000);
     try {

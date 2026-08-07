@@ -5,294 +5,30 @@
 // 关键说明：网页自动化工具（click/type/get_text…）在本内容脚本内直接执行，
 // 因为内容脚本对宿主页面拥有完整 DOM 权限（manifest 的 content_scripts.matches
 // 为 <all_urls> 且常驻注入），不依赖 activeTab 是否被用户交互激活。
-// ⚠️ 与 background/web-tools.js 的 pageTool 是两份重复实现（内容脚本无法 import 模块），
-//    两边 handlers 必须同步修改。两文件头部应包含相同的 SYNC_MARKER 以便自动化检测。
-//    SYNC_MARKER:v1-DOM_TOOLS:click,type,select_option,check,uncheck,scroll,wait_for,get_text,navigate,press_key,hover,get_attribute,double_click,right_click,drag_and_drop
-//    新增 DOM 工具请同时改这两个文件。
+// DOM 工具实现已统一到 shared/dom-tools.js，本文件通过 import 复用，避免重复实现。
 // 这能规避在侧边栏 / 未先点击扩展图标的场景下，background 用
 // chrome.scripting.executeScript 注入被浏览器以“权限不足”拒绝的问题。
 
-/** 在页面主世界执行 DOM 类工具。必须自包含（不引用外部作用域），以便被本脚本复用。 */
-async function pageTool(tool, args) {
-  args = args || {};
-
-  /** 按 selector / xpath / text 解析元素集合 */
-  function resolveEl(a) {
-    let els = [];
-    if (a.xpath) {
-      const xr = document.evaluate(a.xpath, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
-      for (let i = 0; i < xr.snapshotLength; i++) els.push(xr.snapshotItem(i));
-    } else if (a.selector) {
-      els = Array.from(document.querySelectorAll(a.selector));
-    } else if (a.text) {
-      const q = 'a,button,input,select,textarea,label,[role="button"],[role="checkbox"]';
-      const needle = String(a.text).trim().toLowerCase();
-      els = Array.from(document.querySelectorAll(q)).filter(e => {
-        const t = (e.textContent || '').trim().toLowerCase();
-        return t && t.includes(needle);
-      });
-    }
-    return els;
-  }
-
-  /** 用原生 setter 设置表单值并派发 input/change（兼容 React/Vue 等受控组件） */
-  function setNativeValue(el, value) {
-    if (el.isContentEditable || el.getAttribute('contenteditable') === 'true') {
-      el.textContent = value;
-      el.dispatchEvent(new InputEvent('input', { bubbles: true }));
-      el.dispatchEvent(new Event('change', { bubbles: true }));
-      return;
-    }
-    const proto = el instanceof HTMLTextAreaElement
-      ? HTMLTextAreaElement.prototype
-      : el instanceof HTMLSelectElement
-        ? HTMLSelectElement.prototype
-        : HTMLInputElement.prototype;
-    const desc = Object.getOwnPropertyDescriptor(proto, 'value');
-    if (desc && desc.set) desc.set.call(el, value);
-    else el.value = value; // 兜底
-    el.dispatchEvent(new Event('input', { bubbles: true }));
-    el.dispatchEvent(new Event('change', { bubbles: true }));
-  }
-
-  /** 等待元素出现（轮询），超时抛错 */
-  function waitFor(a, timeoutMs) {
-    return new Promise((resolve, reject) => {
-      const start = Date.now();
-      const tick = () => {
-        const els = resolveEl(a);
-        if (els.length) return resolve(els);
-        if (Date.now() - start > timeoutMs) return reject(new Error('等待超时：元素未出现（' + timeoutMs + 'ms）'));
-        setTimeout(tick, 200);
-      };
-      tick();
-    });
-  }
-
-  /** 把按键名映射为 keyCode（兼容仍读取 keyCode 的旧站） */
-  function keyCodeFor(key) {
-    const map = { Enter: 13, Escape: 27, Tab: 9, Backspace: 8, Delete: 46, ArrowUp: 38, ArrowDown: 40, ArrowLeft: 37, ArrowRight: 39, Space: 32, Return: 13 };
-    if (key in map) return map[key];
-    if (key.length === 1) return key.toUpperCase().charCodeAt(0);
-    return 0;
-  }
-
-  /** 从参数里挑出定位键（selector/xpath/text），忽略未定义的键 */
-  function locate(a) {
-    const r = {};
-    if (a.selector) r.selector = a.selector;
-    if (a.xpath) r.xpath = a.xpath;
-    if (a.text) r.text = a.text;
-    return r;
-  }
-
-  const handlers = {
-    click(a) {
-      const els = resolveEl(a);
-      if (!els.length) throw new Error('未找到可点击元素（selector/xpath/text 无匹配）');
-      const el = els[Math.max(0, Math.min(a.index || 0, els.length - 1))];
-      el.scrollIntoView({ block: 'center', behavior: 'smooth' });
-      el.click();
-      return { count: els.length, tag: el.tagName, text: (el.textContent || '').trim().slice(0, 80) };
-    },
-    type(a) {
-      if (a.value == null) throw new Error('缺少参数 value');
-      const els = resolveEl(a);
-      if (!els.length) throw new Error('未找到输入元素（selector/xpath/text 无匹配）');
-      const el = els[Math.max(0, Math.min(a.index || 0, els.length - 1))];
-      if (a.clear) setNativeValue(el, '');
-      const cur = (el.value || '');
-      setNativeValue(el, a.append ? cur + a.value : a.value);
-      return { count: els.length, value: el.value };
-    },
-    select_option(a) {
-      const els = resolveEl(a);
-      if (!els.length) throw new Error('未找到 <select> 元素（selector/xpath/text 无匹配）');
-      const el = els[Math.max(0, Math.min(a.index || 0, els.length - 1))];
-      if (a.value != null) el.value = a.value;
-      else if (a.label) {
-        const opt = Array.from(el.options).find(o =>
-          o.text.trim() === a.label || o.text.trim().toLowerCase().includes(String(a.label).toLowerCase()));
-        if (opt) el.value = opt.value;
-      }
-      if (!el.value && (a.value != null || a.label)) throw new Error('未能匹配到选项（value/label 不存在）');
-      el.dispatchEvent(new Event('change', { bubbles: true }));
-      return { count: els.length, selected: el.value, selectedText: el.options[el.selectedIndex] ? el.options[el.selectedIndex].text : '' };
-    },
-    check(a) { return toggleCheck(a, true); },
-    uncheck(a) { return toggleCheck(a, false); },
-    scroll(a) {
-      if (a.selector || a.xpath || a.text) {
-        const els = resolveEl(a);
-        if (!els.length) throw new Error('未找到可滚动元素（selector/xpath/text 无匹配）');
-        const el = els[Math.max(0, Math.min(a.index || 0, els.length - 1))];
-        if (a.position === 'top') el.scrollTop = 0;
-        else if (a.position === 'bottom') el.scrollTop = el.scrollHeight;
-        else el.scrollIntoView({ block: 'center', behavior: 'smooth' });
-        if (a.x || a.y) el.scrollBy(a.x || 0, a.y || 0);
-        return { scrolledElement: true };
-      }
-      if (a.position === 'top') window.scrollTo(0, 0);
-      else if (a.position === 'bottom') window.scrollTo(0, document.body.scrollHeight);
-      else window.scrollBy(a.x || 0, a.y || 0);
-      return { scrollX: window.scrollX, scrollY: window.scrollY };
-    },
-    wait_for(a) {
-      const timeout = Math.min(Math.max(Number(a.timeout) || 10000, 0), 30000);
-      return waitFor(a, timeout).then(els => ({ found: true, count: els.length }));
-    },
-    get_text(a) {
-      if (a.selector || a.xpath || a.text) {
-        const els = resolveEl(a);
-        if (!els.length) throw new Error('未找到匹配元素（selector/xpath/text 无匹配）');
-        const texts = els.map(e => (e.innerText || e.textContent || '').trim());
-        return { count: els.length, text: texts.join('\n---\n') };
-      }
-      const root = document.querySelector('article') || document.querySelector('main') || document.body;
-      const clone = root.cloneNode(true);
-      clone.querySelectorAll('script,style,noscript,nav,header,footer,aside').forEach(e => e.remove());
-      return { count: 1, text: (clone.innerText || clone.textContent || '').replace(/\s+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim() };
-    },
-    navigate(a) {
-      const dir = a.direction || 'back';
-      if (dir === 'back') history.back();
-      else if (dir === 'forward') history.forward();
-      else if (dir === 'reload') location.reload();
-      else history.back();
-      return { direction: dir };
-    },
-    press_key(a) {
-      let el = document.activeElement;
-      if (a.selector || a.xpath || a.text) {
-        const els = resolveEl(a);
-        if (els.length) el = els[Math.max(0, Math.min(a.index || 0, els.length - 1))];
-      }
-      if (!el || el === document.documentElement) el = document.body;
-      const key = a.key || 'Enter';
-      const mods = { ctrlKey: !!a.ctrl, altKey: !!a.alt, shiftKey: !!a.shift, metaKey: !!a.meta };
-      const code = ({ Enter: 'Enter', Escape: 'Escape', Tab: 'Tab', Backspace: 'Backspace', Delete: 'Delete', Space: 'Space', ArrowUp: 'ArrowUp', ArrowDown: 'ArrowDown', ArrowLeft: 'ArrowLeft', ArrowRight: 'ArrowRight' })[key]
-        || (/^[a-z]$/i.test(key) ? 'Key' + key.toUpperCase() : key);
-      const kc = keyCodeFor(key);
-      const fire = (type) => {
-        const ev = new KeyboardEvent(type, {
-          key, code, keyCode: kc, charCode: type === 'keypress' ? kc : 0, which: kc,
-          bubbles: true, cancelable: true, view: window,
-          ctrlKey: mods.ctrlKey, altKey: mods.altKey, shiftKey: mods.shiftKey, metaKey: mods.metaKey,
-        });
-        try { Object.defineProperty(ev, 'keyCode', { get: () => kc }); Object.defineProperty(ev, 'which', { get: () => kc }); } catch (_) {}
-        el.dispatchEvent(ev);
-      };
-      try { el.focus(); } catch (_) {}
-      fire('keydown'); fire('keypress'); fire('keyup');
-      return { key, code, modifiers: mods, target: el.tagName || 'body' };
-    },
-    hover(a) {
-      const els = resolveEl(a);
-      if (!els.length) throw new Error('未找到可悬停元素（selector/xpath/text 无匹配）');
-      const el = els[Math.max(0, Math.min(a.index || 0, els.length - 1))];
-      const r = el.getBoundingClientRect();
-      const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
-      const opts = { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy };
-      for (const t of ['mouseover', 'mouseenter', 'mousemove', 'pointerover', 'pointerenter', 'pointermove']) {
-        el.dispatchEvent(new MouseEvent(t, opts));
-      }
-      return { hovered: true, tag: el.tagName, text: (el.textContent || '').trim().slice(0, 80) };
-    },
-    get_attribute(a) {
-      const els = resolveEl(a);
-      if (!els.length) throw new Error('未找到目标元素（selector/xpath/text 无匹配）');
-      const el = els[Math.max(0, Math.min(a.index || 0, els.length - 1))];
-      const attr = a.attr;
-      if (attr) {
-        if (attr === 'value') return { attr, value: (el.value !== undefined ? el.value : (el.getAttribute('value') || '')) };
-        if (attr === 'text') return { attr, value: (el.innerText || el.textContent || '').trim() };
-        if (attr === 'html') return { attr, value: el.innerHTML };
-        return { attr, value: el.getAttribute(attr) };
-      }
-      const out = { tag: el.tagName, value: el.value, text: (el.innerText || el.textContent || '').trim().slice(0, 200) };
-      for (const n of ['href', 'src', 'title', 'alt', 'id', 'name', 'type', 'placeholder']) {
-        if (el.hasAttribute(n)) out[n] = el.getAttribute(n);
-      }
-      for (const at of el.attributes) {
-        if (at.name.startsWith('data-') && !(at.name in out)) out[at.name] = at.value;
-      }
-      return { attrs: out };
-    },
-    double_click(a) {
-      const els = resolveEl(a);
-      if (!els.length) throw new Error('未找到目标元素（selector/xpath/text 无匹配）');
-      const el = els[Math.max(0, Math.min(a.index || 0, els.length - 1))];
-      el.scrollIntoView({ block: 'center', behavior: 'smooth' });
-      el.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true, view: window }));
-      return { count: els.length, tag: el.tagName, text: (el.textContent || '').trim().slice(0, 80) };
-    },
-    right_click(a) {
-      const els = resolveEl(a);
-      if (!els.length) throw new Error('未找到目标元素（selector/xpath/text 无匹配）');
-      const el = els[Math.max(0, Math.min(a.index || 0, els.length - 1))];
-      const r = el.getBoundingClientRect();
-      el.dispatchEvent(new MouseEvent('contextmenu', {
-        bubbles: true, cancelable: true, view: window, button: 2,
-        clientX: r.left + r.width / 2, clientY: r.top + r.height / 2,
-      }));
-      return { tag: el.tagName, text: (el.textContent || '').trim().slice(0, 80) };
-    },
-    drag_and_drop(a) {
-      const srcs = resolveEl(locate({ selector: a.source_selector, xpath: a.source_xpath, text: a.source_text }));
-      const tgts = resolveEl(locate({ selector: a.target_selector, xpath: a.target_xpath, text: a.target_text }));
-      if (!srcs.length) throw new Error('未找到拖拽源（source_selector/xpath/text 无匹配）');
-      if (!tgts.length) throw new Error('未找到拖拽目标（target_selector/xpath/text 无匹配）');
-      const src = srcs[0], tgt = tgts[0];
-      const s = src.getBoundingClientRect(), t = tgt.getBoundingClientRect();
-      const sx = s.left + s.width / 2, sy = s.top + s.height / 2, tx = t.left + t.width / 2, ty = t.top + t.height / 2;
-      const dt = (typeof DataTransfer !== 'undefined') ? new DataTransfer() : null;
-      const dnd = (el, type) => { try { el.dispatchEvent(new DragEvent(type, { bubbles: true, cancelable: true, view: window, dataTransfer: dt, clientX: tx, clientY: ty })); } catch (_) {} };
-      const mse = (el, type, x, y) => el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button: 0 }));
-      dnd(src, 'dragstart');
-      dnd(tgt, 'dragenter'); dnd(tgt, 'dragover'); dnd(tgt, 'drop'); dnd(src, 'dragend');
-      mse(src, 'mousedown', sx, sy);
-      document.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: (sx + tx) / 2, clientY: (sy + ty) / 2, view: window }));
-      mse(tgt, 'mousemove', tx, ty); mse(tgt, 'mouseup', tx, ty);
-      return { dragged: true, from: src.tagName, to: tgt.tagName };
-    },
-  };
-
-  function toggleCheck(a, desired) {
-    const els = resolveEl(a);
-    if (!els.length) throw new Error('未找到复选框（selector/xpath/text 无匹配）');
-    const el = els[Math.max(0, Math.min(a.index || 0, els.length - 1))];
-    const isInput = el.tagName === 'INPUT';
-    const aria = el.getAttribute('role') === 'checkbox' || el.hasAttribute('aria-checked');
-    if (isInput) {
-      if (el.checked !== desired) el.click();
-      return { count: els.length, checked: el.checked };
-    }
-    if (aria) {
-      const cur = el.getAttribute('aria-checked') === 'true';
-      if (cur !== desired) el.click();
-      if (el.getAttribute('aria-checked') !== String(desired)) el.setAttribute('aria-checked', String(desired));
-      return { count: els.length, checked: el.getAttribute('aria-checked') === 'true' };
-    }
-    throw new Error('目标元素不是复选框（input[type=checkbox] 或 role=checkbox）');
-  }
-
-  const h = handlers[tool];
-  if (!h) return { ok: false, error: '未知工具：' + tool };
-  try {
-    const data = await h(args);
-    return { ok: true, result: data };
-  } catch (e) {
-    return { ok: false, error: (e && e.message) ? e.message : String(e) };
-  }
-}
-
 (function () {
   // 扩展更新/重载后会重新注入本脚本；若已存在旧 listener，先移除，
-  // 避免旧内容脚本的 EXECUTE_TOOL 响应抢占并返回“未知工具”。
+  // 避免旧内容脚本的 EXECUTE_TOOL 响应抢占并返回"未知工具"。
   if (window.__aiAssistantExtractListener) {
     try { chrome.runtime.onMessage.removeListener(window.__aiAssistantExtractListener); } catch (_) {}
   }
   window.__aiAssistantExtractInjected = true;
+
+  let pageTool = null;
+  let pageToolLoading = null;
+
+  function ensurePageTool() {
+    if (pageTool) return Promise.resolve(pageTool);
+    if (!pageToolLoading) {
+      pageToolLoading = import(chrome.runtime.getURL('shared/dom-tools.js'))
+        .then(mod => { pageTool = mod.pageTool; return pageTool; })
+        .catch(err => { pageToolLoading = null; throw err; });
+    }
+    return pageToolLoading;
+  }
 
   /** 简单正文提取：优先 article/main，否则 body 文本 */
   function extractMainText() {
@@ -328,22 +64,272 @@ async function pageTool(tool, args) {
       return true;
     }
     if (msg.type === 'EXECUTE_TOOL') {
-      // 网页自动化工具在内容脚本内直接执行（对宿主页面有完整 DOM 权限，
-      // 不依赖 background 的 scripting.executeScript，规避 activeTab 未激活时的权限拒绝）。
       (async () => {
         try {
-          const out = await pageTool(msg.tool, msg.args || {});
+          const tool = await ensurePageTool();
+          const out = await tool(msg.tool, msg.args || {});
           try { sendResponse(out); } catch (_) { /* 消息通道已关闭，忽略 */ }
         } catch (e) {
           try { sendResponse({ ok: false, error: (e && e.message) ? e.message : String(e) }); } catch (_) { /* 消息通道已关闭，忽略 */ }
         }
       })();
-      return true; // 异步 sendResponse
+      return true;
     }
     return false;
   }
   window.__aiAssistantExtractListener = extractMessageListener;
   chrome.runtime.onMessage.addListener(extractMessageListener);
 
-  // TODO: 划词快捷操作浮层（翻译/解释/追问），后续在此挂载 UI，调用 features/selection。
+  ensurePageTool();
+
+  const SELECTION_BAR = '__aiSelectionBar';
+  const SELECTION_RESULT = '__aiSelectionResult';
+  let selectionText = '';
+  let selectionHideTimer = null;
+  let selectionResultPort = null;
+
+  function getSelectionBar() {
+    return document.getElementById(SELECTION_BAR);
+  }
+
+  function getSelectionResult() {
+    return document.getElementById(SELECTION_RESULT);
+  }
+
+  function hideSelectionUI() {
+    const bar = getSelectionBar();
+    const result = getSelectionResult();
+    if (bar) bar.style.display = 'none';
+    if (result) result.style.display = 'none';
+    if (selectionResultPort) {
+      try { selectionResultPort.disconnect(); } catch (_) {}
+      selectionResultPort = null;
+    }
+  }
+
+  function getSelectionRect() {
+    const sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0) return null;
+    const range = sel.getRangeAt(0);
+    const rect = range.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) {
+      const span = document.createElement('span');
+      span.textContent = '\u200b';
+      range.insertNode(span);
+      const r = span.getBoundingClientRect();
+      span.remove();
+      return r;
+    }
+    return rect;
+  }
+
+  function showSelectionBar() {
+    if (selectionHideTimer) { clearTimeout(selectionHideTimer); selectionHideTimer = null; }
+
+    const rect = getSelectionRect();
+    if (!rect) return;
+
+    let bar = getSelectionBar();
+    if (!bar) {
+      bar = document.createElement('div');
+      bar.id = SELECTION_BAR;
+      bar.style.cssText = [
+        'position:fixed;z-index:2147483647;',
+        'display:flex;align-items:center;gap:2px;',
+        'padding:4px 6px;border-radius:8px;',
+        'background:rgba(30,30,30,.92);',
+        'box-shadow:0 4px 16px rgba(0,0,0,.25);',
+        'backdrop-filter:blur(6px);',
+        'font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;',
+        'font-size:13px;user-select:none;',
+      ].join('');
+      const actions = [
+        { id: 'translate', label: '翻译', icon: '译' },
+        { id: 'explain', label: '解释', icon: '释' },
+        { id: 'ask', label: '追问', icon: '问' },
+      ];
+      for (const a of actions) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.dataset.action = a.id;
+        btn.title = a.label;
+        btn.style.cssText = [
+          'display:flex;align-items:center;justify-content:center;',
+          'min-width:28px;height:28px;padding:0 8px;',
+          'border:none;border-radius:6px;',
+          'background:transparent;color:#fff;',
+          'cursor:pointer;font-size:13px;',
+          'transition:background .15s;',
+        ].join('');
+        btn.textContent = `${a.icon} ${a.label}`;
+        btn.addEventListener('mouseenter', () => { btn.style.background = 'rgba(255,255,255,.15)'; });
+        btn.addEventListener('mouseleave', () => { btn.style.background = 'transparent'; });
+        btn.addEventListener('mousedown', (e) => e.preventDefault());
+        btn.addEventListener('click', () => handleSelectionAction(a.id));
+        bar.appendChild(btn);
+      }
+      document.documentElement.appendChild(bar);
+    }
+
+    bar.style.display = 'flex';
+    const barW = bar.offsetWidth;
+    const barH = bar.offsetHeight;
+    let x = rect.left;
+    let y = rect.top - barH - 6;
+    if (y < 4) y = rect.bottom + 6;
+    if (x + barW > window.innerWidth - 4) x = window.innerWidth - barW - 4;
+    if (x < 4) x = 4;
+    bar.style.left = x + 'px';
+    bar.style.top = y + 'px';
+  }
+
+  function showSelectionResult(content) {
+    let result = getSelectionResult();
+    if (!result) {
+      result = document.createElement('div');
+      result.id = SELECTION_RESULT;
+      result.style.cssText = [
+        'position:fixed;z-index:2147483646;',
+        'width:360px;max-width:calc(100vw - 32px);',
+        'max-height:240px;overflow-y:auto;',
+        'padding:12px 14px;border-radius:10px;',
+        'background:rgba(30,30,30,.94);',
+        'box-shadow:0 6px 24px rgba(0,0,0,.3);',
+        'backdrop-filter:blur(6px);',
+        'color:#eee;font-size:14px;line-height:1.6;',
+        'font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;',
+        'white-space:pre-wrap;word-break:break-word;',
+      ].join('');
+      const closeBtn = document.createElement('span');
+      closeBtn.textContent = '✕';
+      closeBtn.style.cssText = 'position:absolute;top:8px;right:10px;cursor:pointer;color:rgba(255,255,255,.5);font-size:12px;';
+      closeBtn.addEventListener('click', hideSelectionUI);
+      result.style.position = 'fixed';
+      result.appendChild(closeBtn);
+      document.documentElement.appendChild(result);
+    }
+
+    result.style.display = 'block';
+    const bar = getSelectionBar();
+    let x = 4, y = 4;
+    if (bar && bar.style.display !== 'none') {
+      const barRect = bar.getBoundingClientRect();
+      x = barRect.left;
+      y = barRect.bottom + 6;
+    }
+    if (x + 360 > window.innerWidth - 4) x = window.innerWidth - 360 - 4;
+    if (y + 240 > window.innerHeight - 4) y = window.innerHeight - 240 - 4;
+    result.style.left = Math.max(4, x) + 'px';
+    result.style.top = Math.max(4, y) + 'px';
+
+    const closeBtn = result.querySelector('span');
+    result.innerHTML = '';
+    if (closeBtn) result.appendChild(closeBtn);
+    const contentEl = document.createElement('div');
+    contentEl.style.paddingRight = '20px';
+    contentEl.textContent = content;
+    result.appendChild(contentEl);
+  }
+
+  function isContextInvalidated() {
+    try { return !chrome.runtime?.id; } catch (_) { return true; }
+  }
+
+  function handleSelectionAction(action) {
+    hideResultPort();
+    if (isContextInvalidated()) {
+      showSelectionResult('扩展已更新，请刷新当前页面后重试');
+      return;
+    }
+    let receivedAnyChunk = false;
+    showSelectionResult('正在处理...');
+    try {
+      selectionResultPort = chrome.runtime.connect({ name: 'selection-result' });
+      selectionResultPort.onMessage.addListener((msg) => {
+        if (msg.type === 'chunk') {
+          if (!receivedAnyChunk) {
+            receivedAnyChunk = true;
+            clearResultContent();
+          }
+          appendResultText(msg.delta);
+        } else if (msg.type === 'done') {
+          if (!receivedAnyChunk) showSelectionResult('（无返回结果）');
+        } else if (msg.type === 'error') {
+          showSelectionResult('错误：' + msg.error);
+        }
+      });
+      selectionResultPort.onDisconnect.addListener(() => {
+        if (selectionResultPort && isContextInvalidated()) {
+          showSelectionResult('扩展已更新，请刷新当前页面后重试');
+          selectionResultPort = null;
+        }
+      });
+      selectionResultPort.postMessage({ type: action, text: selectionText });
+    } catch (e) {
+      const msg = String(e?.message || e);
+      if (/invalidated|context/i.test(msg)) {
+        showSelectionResult('扩展已更新，请刷新当前页面后重试');
+      } else {
+        showSelectionResult('连接失败：' + msg);
+      }
+    }
+  }
+
+  function hideResultPort() {
+    if (selectionResultPort) {
+      try { selectionResultPort.disconnect(); } catch (_) {}
+      selectionResultPort = null;
+    }
+  }
+
+  function clearResultContent() {
+    const result = getSelectionResult();
+    if (!result) return;
+    const contentEl = result.querySelector('div:last-child');
+    if (contentEl) contentEl.textContent = '';
+  }
+
+  function appendResultText(delta) {
+    const result = getSelectionResult();
+    if (!result) return;
+    const contentEl = result.querySelector('div:last-child');
+    if (contentEl) contentEl.textContent += delta;
+  }
+
+  function isSelectionInEditable() {
+    const ae = document.activeElement;
+    if (!ae || ae === document.body) return false;
+    if (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA') return true;
+    if (ae.isContentEditable || ae.getAttribute('contenteditable') === 'true') return true;
+    return false;
+  }
+
+  function onSelectionChange() {
+    if (selectionHideTimer) clearTimeout(selectionHideTimer);
+    if (isSelectionInEditable()) return;
+    selectionHideTimer = setTimeout(() => {
+      if (isSelectionInEditable()) return;
+      const text = window.getSelection().toString().trim();
+      if (text.length >= 2) {
+        selectionText = text;
+        showSelectionBar();
+      } else {
+        hideSelectionUI();
+      }
+    }, 250);
+  }
+
+  document.addEventListener('selectionchange', onSelectionChange);
+  document.addEventListener('mousedown', (e) => {
+    if (isSelectionInEditable()) return;
+    const bar = getSelectionBar();
+    const result = getSelectionResult();
+    if (bar && !bar.contains(e.target) && (!result || !result.contains(e.target))) {
+      if (!window.getSelection().toString().trim()) {
+        hideSelectionUI();
+      }
+    }
+  });
+  document.addEventListener('scroll', () => { hideSelectionUI(); }, true);
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') hideSelectionUI(); });
 })();

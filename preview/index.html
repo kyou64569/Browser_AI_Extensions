@@ -66,6 +66,9 @@
                   <button type="button" class="func-item" role="menuitem" data-act="summarize">
                     <span class="fi-ico">📄</span><span class="fi-label">总结网页</span>
                   </button>
+                  <button type="button" class="func-item" role="menuitem" data-act="web2ppt">
+                    <span class="fi-ico">📊</span><span class="fi-label">网页转PPT</span>
+                  </button>
                   <button type="button" class="func-item" role="menuitem" data-act="translate">
                     <span class="fi-ico">🌐</span><span class="fi-label">翻译</span>
                   </button>
@@ -81,6 +84,16 @@
                   <button type="button" class="func-item" role="menuitem" data-act="kb">
                     <span class="fi-ico">📚</span><span class="fi-label">知识库</span>
                   </button>
+                </div>
+                <!-- PPT 模板选择器 -->
+                <div class="ppt-theme-picker" id="pptThemePicker" role="menu" hidden>
+                  <div class="ptp-title">选择 PPT 模板</div>
+                  <div class="ptp-grid" id="ptpGrid"></div>
+                  <div class="ptp-upload">
+                    <button type="button" class="ptp-upload-btn" id="ptpUploadBtn">📁 上传我的模板</button>
+                    <button type="button" class="ptp-delete-btn" id="ptpDeleteBtn" hidden>🗑 删除我的模板</button>
+                    <input type="file" id="pptTplInput" accept=".pptx,application/vnd.openxmlformats-officedocument.presentationml.presentation" hidden />
+                  </div>
                 </div>
               </div>
               <select id="modelSelect" class="model-select" title="选择模型"></select>

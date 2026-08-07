@@ -1571,8 +1571,127 @@ funcMenu.querySelectorAll('.func-item').forEach(b => {
 // 点击菜单外部 / 按 Esc 关闭
 document.addEventListener('click', (e) => {
   if (!funcMenu.hidden && !plusWrap.contains(e.target)) closeFuncMenu();
+  if (!pptThemePicker.hidden && !plusWrap.contains(e.target)) closePptThemePicker();
 });
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !funcMenu.hidden) closeFuncMenu(); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !pptThemePicker.hidden) closePptThemePicker(); });
+
+// PPT 模板选择器
+const pptThemePicker = $('#pptThemePicker');
+const ptpGrid = $('#ptpGrid');
+const ptpUploadBtn = $('#ptpUploadBtn');
+const pptTplInput = $('#pptTplInput');
+const ptpDeleteBtn = $('#ptpDeleteBtn');
+let pptThemesCache = null;
+
+function closePptThemePicker() { pptThemePicker.hidden = true; }
+
+async function ensurePptThemes() {
+  if (pptThemesCache) return pptThemesCache;
+  return await new Promise((resolve) => {
+    chrome.runtime.sendMessage({ type: 'GET_PPT_THEMES' }, (r) => {
+      pptThemesCache = (r && r.ok) ? { themes: r.themes || [], custom: r.custom || null } : { themes: [], custom: null };
+      resolve(pptThemesCache);
+    });
+  });
+}
+
+async function openPptThemePicker() {
+  const data = await ensurePptThemes();
+  const themes = data.themes || [];
+  ptpGrid.innerHTML = '';
+  if (!themes.length) { runWebToPpt('classic-blue'); return; }
+  for (const t of themes) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'ptp-chip';
+    b.dataset.id = t.id;
+    b.innerHTML = `<span class="ptp-swatch sw-${t.id}"></span><span class="ptp-name">${t.label}</span>`;
+    b.onclick = (e) => {
+      e.stopPropagation();
+      closePptThemePicker();
+      closeFuncMenu();
+      runWebToPpt(t.id);
+    };
+    ptpGrid.appendChild(b);
+  }
+  // 已上传的自定义模板：作为可复用卡片
+  if (data.custom) {
+    const c = document.createElement('button');
+    c.type = 'button';
+    c.className = 'ptp-chip ptp-chip-custom';
+    c.dataset.id = '__custom__';
+    const pal = data.custom.palette || {};
+    const sw = pal.dk1 ? pal.dk1 : (pal.accent1 || '888888');
+    c.innerHTML = `<span class="ptp-swatch" style="background:linear-gradient(135deg, #${sw}, #${pal.lt1 || 'cccccc'})"></span><span class="ptp-name">📁 ${escapeHtml(data.custom.name || '我的模板')}<br><small>已设为默认</small></span>`;
+    c.onclick = (e) => {
+      e.stopPropagation();
+      closePptThemePicker();
+      closeFuncMenu();
+      runWebToPpt('__custom__');
+    };
+    ptpGrid.appendChild(c);
+  }
+  if (ptpDeleteBtn) ptpDeleteBtn.hidden = !data.custom; // 仅在有已上传模板时显示删除
+  pptThemePicker.hidden = false;
+}
+
+// 上传 .pptx 模板 → 解析并存为默认模板 → 立即用该模板生成当前网页 PPT
+if (ptpUploadBtn && pptTplInput) {
+  ptpUploadBtn.onclick = (e) => {
+    e.stopPropagation();
+    pptTplInput.click();
+  };
+  pptTplInput.onchange = async (e) => {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = '';
+    if (!file) return;
+    if (!/\.pptx$/i.test(file.name)) { setStatus('仅支持 .pptx 模板', 'err'); return; }
+    setStatus('正在解析模板…');
+    try {
+      const buf = await file.arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      let bin = '';
+      const chunk = 0x8000; // 分块避免 String.fromCharCode.apply 参数过多导致栈溢出
+      for (let i = 0; i < bytes.length; i += chunk) {
+        bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+      }
+      const b64 = btoa(bin);
+      const resp = await new Promise((resolve) => {
+        chrome.runtime.sendMessage({ type: 'PPT_IMPORT_TEMPLATE', name: file.name, data: b64 }, (r) => resolve(r || { ok: false, error: '无响应' }));
+      });
+      if (!resp || !resp.ok) { setStatus('模板解析失败：' + ((resp && resp.error) || '未知错误'), 'err'); return; }
+      pptThemesCache = null; // 清除缓存，下次打开刷新
+      closePptThemePicker();
+      closeFuncMenu();
+      runWebToPpt('__custom__');
+    } catch (err) {
+      setStatus('模板导入出错：' + (err?.message || err), 'err');
+    }
+  };
+}
+
+// 删除已上传的自定义模板（清空 storage，便于重新上传修复损坏模板）
+if (ptpDeleteBtn) {
+  ptpDeleteBtn.onclick = async (e) => {
+    e.stopPropagation();
+    if (typeof confirm === 'function' && !confirm('确定删除已上传的模板吗？删除后将改用内置模板，可随时重新上传。')) return;
+    setStatus('正在删除模板…');
+    try {
+      const resp = await new Promise((resolve) => {
+        chrome.runtime.sendMessage({ type: 'DELETE_PPT_TEMPLATE' }, (r) => resolve(r || { ok: false, error: '无响应' }));
+      });
+      if (!resp || !resp.ok) { setStatus('删除失败：' + ((resp && resp.error) || '未知错误'), 'err'); return; }
+      pptThemesCache = null; // 清除缓存，下次打开刷新
+      closePptThemePicker();
+      closeFuncMenu();
+      setStatus('已删除自定义模板，可重新上传', 'ok');
+    } catch (err) {
+      setStatus('删除出错：' + (err?.message || err), 'err');
+    }
+  };
+}
+
 
 /** 激活某个功能：设置模式、显示高亮标签、必要时立即执行 */
 function activateFunc(act) {
@@ -1588,6 +1707,10 @@ function activateFunc(act) {
     autosize();
     input.focus();
     updateSendState();
+    return;
+  }
+  if (act === 'web2ppt') {
+    openPptThemePicker();
     return;
   }
   if (act === 'websearch') {
@@ -2106,6 +2229,55 @@ async function runSummarizeInChat(instruction) {
     // 发送消息（或手动关闭）后功能标签消失；总结现已改为“手动发送”，故发送后清除标签
     clearFuncMode();
     persistActiveConversation();   // 总结网页会话同样自动保存
+  }
+}
+
+/** 一键把当前网页做成 PPT（走 summarize_to_ppt 工作流模板：网页正文 → 摘要 → 导出 PPT） */
+async function runWebToPpt(templateId = 'classic-blue') {
+  if (streaming) return;
+  closeFuncMenu();
+  setStatus('正在提取网页并生成 PPT…');
+  const welcome = document.getElementById('welcome');
+  if (welcome) welcome.remove();
+  pushUser('把当前网页做成 PPT（模板：' + templateId + '）');
+  const a = newAssistant();
+  streaming = true; sendBtn.disabled = true;
+  let acc = '';
+  const done = (text) => { a.stopTyping(); a.setText(text); acc = text; };
+  try {
+    const resp = await new Promise((resolve) => {
+      chrome.runtime.sendMessage({ type: 'WORKFLOW_RUN', templateId: 'summarize_to_ppt', template: templateId }, (r) => resolve(r || { ok: false, error: '无响应' }));
+    });
+    if (!resp || !resp.ok) {
+      done('❌ ' + ((resp && resp.error) || '工作流执行失败'));
+      setStatus('生成失败', 'err');
+      return;
+    }
+    const ppt = resp.results && resp.results.export_ppt;
+    if (!ppt || !ppt.dataUrl) {
+      done('⚠️ 已执行但缺少可下载的 PPT 数据' + (resp.errors && resp.errors.export_ppt ? '：' + JSON.stringify(resp.errors.export_ppt) : ''));
+      setStatus('生成异常', 'err');
+      return;
+    }
+    // 触发浏览器下载
+    const link = document.createElement('a');
+    link.href = ppt.dataUrl;
+    link.download = ppt.filename || '演示文稿.pptx';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    const fname = ppt.filename || '演示文稿.pptx';
+    done(`✅ PPT 已生成并开始下载：${fname}\n\n（由「网页正文 → 摘要 → 导出 PPT」工作流自动完成）`);
+    messages.push({ role: 'user', content: '把当前网页做成 PPT' });
+    messages.push({ role: 'assistant', content: acc });
+    setStatus('');
+  } catch (e) {
+    done('❌ 错误：' + e.message);
+    setStatus('错误：' + e.message, 'err');
+  } finally {
+    streaming = false; updateSendState(); scrollBottom();
+    clearFuncMode();
+    persistActiveConversation();
   }
 }
 

@@ -28,7 +28,8 @@
       "resources": [
         "preview/index.html",
         "preview/preview.css",
-        "preview/preview.js"
+        "preview/preview.js",
+        "shared/dom-tools.js"
       ],
       "matches": ["<all_urls>"]
     }

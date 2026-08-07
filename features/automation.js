@@ -199,6 +199,15 @@ export const TOOLS = [
       { name: 'current', desc: 'true 则关闭当前活动标签', required: false },
     ],
   },
+  {
+    name: 'export_ppt',
+    desc: '将结构化大纲导出为 .pptx 文件并自动下载。在收集完内容后调用此工具生成最终 PPT。',
+    params: [
+      { name: 'title', desc: 'PPT 标题（封面标题）', required: true },
+      { name: 'slides', desc: '幻灯片数组，每张包含 heading（标题）和 bullets（要点数组），可额外带 layout 字段："cover"（封面页）或 "content"（内容页）', required: true },
+      { name: 'template', desc: 'PPT 模板：classic-blue（商务蓝）/ dark-night（暗夜黑）/ vibrant-orange（活力橙）/ fresh-green（清新绿）/ minimal-white（极简白）/ dream-purple（梦幻紫）；若不传且用户已上传过自定义 .pptx 模板，则自动套用该模板；默认 classic-blue', required: false },
+    ],
+  },
 ];
 
 const INTRO = `你是一个可以控制浏览器的网页自动化助手。当用户要求你操作“当前网页”（点击、输入、选择、勾选、滚动、切换标签、等待元素、获取文本、截图、前进/后退、键盘按键、悬停、读取属性、关闭标签等）时，你可以使用下面列出的工具来完成，并在操作完成后用自然语言向用户汇报结果。
@@ -230,6 +239,12 @@ const INTRO = `你是一个可以控制浏览器的网页自动化助手。当�
 - 默认在用户当前浏览的标签页内操作（点击、输入、选择、滚动、切换标签、前进/后退等）。
 - 当用户明确要求打开 / 跳转某个具体网址（例如“打开 aistudio.google.com”）时，可以调用 open_url 工具跳转到该网址；跳转后请先用 get_text / wait_for 确认页面已加载完成，再继续后续操作。
 - 安全约束：只跳转到用户**明确指定**的网址；不要擅自打开用户未提及的陌生站点，也不要一次性连开大量标签。若需求能在“当前页面”内完成（站内搜索、筛选、回车提交等），优先在当前页完成，不必跳转。
+
+【导出 PPT（重要）】
+- 当用户要求生成 PPT、演示文稿、汇报材料时，先通过 get_text / screenshot 收集页面内容，整理成结构化大纲后，调用 export_ppt 工具导出。
+- export_ppt 的 args 格式：{"title": "PPT 标题", "slides": [{"heading": "页标题", "bullets": ["要点1", "要点2"], "layout": "content"}, ...]}。
+- 为每页规划 layout 语义标签，让系统精确匹配模板版式：cover（封面）/ toc（目录/议程）/ section（章节/分区）/ content（内容页，3-6 要点）/ closing（结尾/致谢）。第 1 页用 cover；若省略 layout 系统会按标题语义自动推断（标题含「目录」「第X章」「谢谢」等即匹配对应版式）。若启用了用户上传的自定义模板，背景/图片/配色会完整保留；模板只有「封面+节标题」类版式时，内容页会自动用干净的标题+内容版式，此时每页要点控制在 3-5 条、简练以免溢出。
+- 总页数建议 4-12 页（含封面/标题页），不要超过 20 页。
 
 【任务结束的硬性约定（非常重要）】
 - 严禁在没有 100% 完成用户全部要求的情况下，用自然语言“总结/汇报”式地提前结束。

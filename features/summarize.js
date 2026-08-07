@@ -96,7 +96,7 @@ export async function summarizePage(ctx, page, opts = {}) {
 
   const fb = new FallbackManager({ onFallback: opts.onFallback });
   const req = {
-    messages: buildMessages(page.title, page.text, kbChunks, '', opts.kbName),
+    messages: buildMessages(page.title, page.text, kbChunks, opts.instruction || '', opts.kbName),
     stream: opts.stream ?? true,
     options: optionsFromModel(candidates[0]),
     ...(opts.signal ? { signal: opts.signal } : {}),

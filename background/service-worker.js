@@ -9,6 +9,11 @@ import { execTool } from './web-tools.js';
 import { createClient } from '../core/model-client.js';
 import { chunkUnits, RateGate } from '../core/translate-rate.js';
 import { hasCred, optionsFromModel, normalizeApiBase } from '../shared/utils.js';
+import { Agent } from '../features/agent.js';
+import { createWorkflowEngine, WORKFLOW_TEMPLATES } from '../features/workflow.js';
+import { streamSelection, processSelection } from '../features/selection.js';
+import { PptExporter, parseMarkdownOutline, parseTemplate, PPT_THEMES } from '../features/ppt-exporter.js';
+import { FallbackManager } from '../core/fallback.js';
 
 /** Chrome 内部页面（无法注入 content script，也无法被 tabCapture 捕获音频） */
 const CHROME_PAGE_HINT =
@@ -935,6 +940,23 @@ chrome.runtime.onConnect.addListener((port) => {
       }
     });
   }
+  // 划词快捷操作：接收翻译/解释/请求，流式回传结果
+  if (port.name === 'selection-result') {
+    port.onMessage.addListener(async (msg) => {
+      if (!msg || !msg.type || !msg.text) return;
+      try {
+        const models = await getModels();
+        const ctx = { models: models.filter(m => m.enabled !== false) };
+        await streamSelection(ctx, msg.text, msg.type, (chunk) => {
+          try { port.postMessage({ type: 'chunk', delta: chunk }); } catch (_) {}
+        });
+        try { port.postMessage({ type: 'done' }); } catch (_) {}
+      } catch (e) {
+        try { port.postMessage({ type: 'error', error: e?.message || '处理失败' }); } catch (_) {}
+      }
+    });
+    return;
+  }
   // 实时字幕 offscreen 文档：接收音频片段并转发给内容脚本做 Whisper 转写
   if (port.name === 'offscreen-caption') {
     offscreenCaptionPort = port;
@@ -1155,13 +1177,54 @@ async function webSearch(query, maxResults = 6) {
 // KB 列表缓存：避免每次打开选择器都反复调用 API 耗尽配额。
 // 缓存 5 分钟，按 provider 隔离；KB_SEARCH 不缓存（需要实时结果）。
 // 必须声明在模块顶层（onMessage 回调之外），否则每次消息到达都会新建空 Map、缓存永远失效。
-// 注：MV3 service worker 休眠后顶层变量会清空，属固有限制；存活期内缓存有效，远优于无缓存。
+// 持久化到 chrome.storage.local，MV3 service worker 休眠后可恢复，避免反复请求 API。
+const KB_LIST_CACHE_KEY = 'kbListCache';
 const _kbListCache = new Map(); // providerId -> { list, ts }
 const _kbListPending = new Map(); // providerId -> Promise (去重并发请求)
 const KB_LIST_CACHE_MS = 5 * 60 * 1000;
+let _kbListCacheLoadPromise = null;
+let _kbListCachePersistDirty = false;
+let _kbListCachePersistTimer = null;
+
+async function loadKbListCache() {
+  if (_kbListCache.size > 0) return _kbListCache;
+  if (_kbListCacheLoadPromise) return _kbListCacheLoadPromise;
+  _kbListCacheLoadPromise = (async () => {
+    try {
+      const r = await chrome.storage.local.get(KB_LIST_CACHE_KEY);
+      const obj = r[KB_LIST_CACHE_KEY] || {};
+      const now = Date.now();
+      for (const [k, v] of Object.entries(obj)) {
+        if (v && v.list && v.ts && now - v.ts < KB_LIST_CACHE_MS) {
+          _kbListCache.set(k, { list: v.list, ts: v.ts });
+        }
+      }
+    } catch (_) { /* 读取失败，使用空缓存 */ }
+    return _kbListCache;
+  })();
+  return _kbListCache;
+}
+
+function persistKbListCache() {
+  if (!_kbListCachePersistDirty) return;
+  _kbListCachePersistDirty = false;
+  if (_kbListCachePersistTimer) { clearTimeout(_kbListCachePersistTimer); _kbListCachePersistTimer = null; }
+  const obj = {};
+  for (const [k, v] of _kbListCache) obj[k] = { list: v.list, ts: v.ts };
+  chrome.storage.local.set({ [KB_LIST_CACHE_KEY]: obj }).catch(() => {});
+}
+
+function scheduleKbListCachePersist() {
+  _kbListCachePersistDirty = true;
+  if (_kbListCachePersistTimer) return;
+  _kbListCachePersistTimer = setTimeout(persistKbListCache, 1000);
+}
 
 // content script / popup 的简单请求
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg.type === 'AGENT_RUN' || msg.type === 'AUTOMATE' || msg.type === 'WORKFLOW_RUN' || msg.type === 'PPT_EXPORT') {
+    console.log('[SW] 收到消息:', msg.type, '| 来自:', sender?.tab?.id || sender?.id || 'popup');
+  }
   if (msg.type === 'WEB_SEARCH') {
     (async () => {
       try {
@@ -1198,6 +1261,31 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (!tab || !tab.id) {
           if (!settled) { settled = true; clearTimeout(safety); }
           sendResponse({ ok: false, error: '无法获取当前标签页' });
+          return;
+        }
+        if (msg.tool === 'export_ppt') {
+          try {
+            const exporter = new PptExporter();
+            const outline = { title: msg.args?.title || '演示文稿', slides: msg.args?.slides || [] };
+            if (!outline.slides.length) {
+              if (!settled) { settled = true; clearTimeout(safety); }
+              sendResponse({ ok: false, error: 'PPT 没有幻灯片内容' });
+              return;
+            }
+            const blob = await exporter.export(outline, await resolvePptOpts({ template: msg.args?.template }));
+            const reader = new FileReader();
+            const dataUrl = await new Promise((resolve, reject) => {
+              reader.onload = () => resolve(reader.result);
+              reader.onerror = reject;
+              reader.readAsDataURL(blob);
+            });
+            chrome.downloads.download({ url: dataUrl, filename: sanitizeFilename(outline.title) + '.pptx' }, () => {});
+            if (!settled) { settled = true; clearTimeout(safety); }
+            sendResponse({ ok: true, result: { message: `PPT「${outline.title}」已下载`, slideCount: outline.slides.length, filename: sanitizeFilename(outline.title) + '.pptx' } });
+          } catch (e) {
+            if (!settled) { settled = true; clearTimeout(safety); }
+            sendResponse({ ok: false, error: 'PPT 导出失败：' + (e?.message || e) });
+          }
           return;
         }
         const out = await execTool(tab, msg.tool, msg.args || {});
@@ -1360,6 +1448,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     (async () => {
       let kb = null; // 在 catch 中也可读取 _lastMeta 诊断
       try {
+        await loadKbListCache();
         const state = await getKbState();
         const providerId = msg.provider || state.active;
         const provider = state.providers[providerId];
@@ -1385,14 +1474,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           if (!settled) { settled = true; clearTimeout(safety); }
           sendResponse({ ok: true, info: r });
         } else if (msg.type === 'KB_LIST') {
-          // 缓存优先：5 分钟内不重复请求同一 provider 的 KB 列表
+          await loadKbListCache();
           const cached = _kbListCache.get(providerId);
           if (cached && Date.now() - cached.ts < KB_LIST_CACHE_MS) {
             if (!settled) { settled = true; clearTimeout(safety); }
             sendResponse({ ok: true, list: cached.list });
             return;
           }
-          // 去重并发请求：同一 provider 的多个并发请求共享同一个 Promise
           if (_kbListPending.has(providerId)) {
             const list = await _kbListPending.get(providerId);
             if (!settled) { settled = true; clearTimeout(safety); }
@@ -1401,6 +1489,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           }
           const pending = kb.listKb({ limit: 100 }).then(list => {
             _kbListCache.set(providerId, { list, ts: Date.now() });
+            scheduleKbListCachePersist();
             _kbListPending.delete(providerId);
             return list;
           }).catch(err => {
@@ -1448,8 +1537,430 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     })();
     return true;
   }
+  // 清洗文件名：移除 Windows 非法字符与控制字符、防 ".." 路径穿越，避免 chrome.downloads.download 异常
+  function sanitizeFilename(name, fallback = '演示文稿') {
+    const cleaned = String(name || '')
+      .replace(/[\\/:*?"<>|\x00-\x1f]/g, '')
+      .replace(/\.{2,}/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    return cleaned.slice(0, 80) || fallback;
+  }
+
+  // ── 自定义 PPT 模板（用户上传的 .pptx） ────────────────────────────────────
+  const PPT_CUSTOM_KEY = 'pptCustomTemplate';
+  const PPT_CUSTOM_ID = '__custom__';
+
+  function base64ToBytes(b64) {
+    const bin = atob(b64);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+  function bytesToBase64(bytes) {
+    let bin = '';
+    const chunk = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunk) {
+      bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+    }
+    return btoa(bin);
+  }
+
+  async function loadCustomTemplate() {
+    try {
+      const r = await chrome.storage.local.get(PPT_CUSTOM_KEY);
+      return r[PPT_CUSTOM_KEY] || null;
+    } catch (_) { return null; }
+  }
+
+  // 把存储中的自定义模板还原成 exporter 可用的对象（media 为 Uint8Array）
+  // 新格式存了整份模板原始字节（raw），此处实时重新解析，保证拿到最新且完整的母版/主题/媒体。
+  async function reviveCustomTemplate(stored) {
+    if (!stored) return null;
+    if (stored.raw) {
+      return await parseTemplate(base64ToBytes(stored.raw));
+    }
+    // 旧格式兼容：media 为 base64 字符串
+    const media = {};
+    if (stored.media) {
+      for (const [name, b64] of Object.entries(stored.media)) media[name] = base64ToBytes(b64);
+    }
+    return { ...stored, media };
+  }
+
+  // 根据请求里的 template 决定传给 exporter 的 opts：
+  // - 内置主题 id → { template }
+  // - '__custom__' 或缺失且有已上传模板 → { custom }
+  // - 其它 → 回退 classic-blue
+  async function resolvePptOpts(msg) {
+    const t = msg && msg.template;
+    if (t && t !== PPT_CUSTOM_ID && PPT_THEMES.some(x => x.id === t)) {
+      return { template: t };
+    }
+    if (t === PPT_CUSTOM_ID) {
+      const custom = await loadCustomTemplate();
+      if (custom) return { custom: await reviveCustomTemplate(custom) };
+      return { template: 'classic-blue' };
+    }
+    // 未指定具体内置主题：若有自定义模板则优先套用
+    const custom = await loadCustomTemplate();
+    if (custom) return { custom: await reviveCustomTemplate(custom) };
+    return { template: 'classic-blue' };
+  }
+
+  // PPT 导出：结构化大纲 JSON → .pptx 文件
+  if (msg.type === 'GET_PPT_THEMES') {
+    (async () => {
+      const raw = await loadCustomTemplate();
+      let customInfo = null;
+      if (raw) {
+        const parsed = await reviveCustomTemplate(raw);
+        customInfo = {
+          name: raw.name,
+          palette: raw.palette,
+          layoutPhs: raw.layoutPhs,
+          layouts: (parsed.layouts || []).map(l => ({
+            num: l.num, type: l.type, name: l.layoutName,
+            hasBody: !!(l.phs && l.phs.body),
+            hasTitle: !!(l.phs && l.phs.title),
+          })),
+        };
+      }
+      sendResponse({ ok: true, themes: PPT_THEMES, custom: customInfo });
+    })();
+    return true; // 异步 sendResponse
+  }
+
+  // 导入用户上传的 .pptx 模板：解析并存入 storage（作为默认模板）
+  if (msg.type === 'PPT_IMPORT_TEMPLATE') {
+    (async () => {
+      try {
+        if (!msg.data) { sendResponse({ ok: false, error: '未收到模板数据' }); return; }
+        const bytes = base64ToBytes(msg.data);
+        const parsed = await parseTemplate(bytes);
+        // 存整份模板原始字节（base64）+ 轻量元数据；导出时实时重解析，
+        // 这样 parseTemplate 的任何改进都能自动生效，无需用户反复重传。
+        const stored = {
+          name: msg.name || '自定义模板',
+          raw: msg.data,
+          mediaExts: parsed.mediaExts,
+          layoutPhs: parsed.layoutPhs,
+          palette: parsed.palette,
+          sldSz: parsed.sldSz,
+        };
+        await chrome.storage.local.set({ [PPT_CUSTOM_KEY]: stored });
+        if (chrome.runtime.lastError) {
+          sendResponse({ ok: false, error: '模板过大无法保存（' + (chrome.runtime.lastError.message || '存储配额超限') + '），请换用体积更小的模板' });
+          return;
+        }
+        sendResponse({ ok: true, name: stored.name, palette: parsed.palette, layoutPhs: parsed.layoutPhs, mediaCount: Object.keys(parsed.media).length,
+          layouts: (parsed.layouts || []).map(l => ({ num: l.num, type: l.type, name: l.layoutName, hasBody: !!(l.phs && l.phs.body) })) });
+      } catch (e) {
+        sendResponse({ ok: false, error: '模板解析失败：' + (e?.message || e) });
+      }
+    })();
+    return true; // 异步 sendResponse
+  }
+
+  // 删除用户上传的自定义模板（清空 storage）
+  if (msg.type === 'DELETE_PPT_TEMPLATE') {
+    (async () => {
+      try {
+        await chrome.storage.local.remove(PPT_CUSTOM_KEY);
+        if (chrome.runtime.lastError) {
+          sendResponse({ ok: false, error: '删除失败：' + (chrome.runtime.lastError.message || '未知错误') });
+          return;
+        }
+        sendResponse({ ok: true });
+      } catch (e) {
+        sendResponse({ ok: false, error: '删除失败：' + (e?.message || e) });
+      }
+    })();
+    return true; // 异步 sendResponse
+  }
+  if (msg.type === 'PPT_EXPORT') {
+    let settled = false;
+    const SAFETY_MS = 30000;
+    const safety = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { sendResponse({ ok: false, error: 'PPT 导出超时' }); } catch (_) {}
+    }, SAFETY_MS);
+    (async () => {
+      try {
+        const exporter = new PptExporter();
+        let outline = msg.outline;
+        if (!outline && msg.markdown) {
+          outline = parseMarkdownOutline(msg.markdown);
+        }
+        if (!outline || !outline.slides) {
+          if (!settled) { settled = true; clearTimeout(safety); }
+          sendResponse({ ok: false, error: '缺少大纲数据' });
+          return;
+        }
+        const blob = await exporter.export(outline, await resolvePptOpts({ template: msg.template }));
+        const reader = new FileReader();
+        reader.onload = () => {
+          if (!settled) { settled = true; clearTimeout(safety); }
+          sendResponse({ ok: true, dataUrl: reader.result, filename: sanitizeFilename(outline.title) + '.pptx' });
+        };
+        reader.readAsDataURL(blob);
+      } catch (e) {
+        if (!settled) { settled = true; clearTimeout(safety); }
+        sendResponse({ ok: false, error: e?.message || 'PPT 导出失败' });
+      }
+    })();
+    return true;
+  }
+  // 自主 Agent：规划-执行-反思循环
+  if (msg.type === 'AGENT_RUN') {
+    console.log('[Agent-RUN] 收到 AGENT_RUN 消息:', msg.goal?.slice(0, 50));
+    let settled = false;
+    const SAFETY_MS = 280000; // 4.6min，Agent 多步任务可能较长
+    const safety = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { sendResponse({ ok: false, error: 'Agent 执行超时（超过 4.5 分钟）' }); } catch (_) {}
+    }, SAFETY_MS);
+    (async () => {
+      try {
+        const models = await getModels();
+        const enabledModels = models.filter(m => m.enabled !== false);
+        if (!enabledModels.length) {
+          if (!settled) { settled = true; clearTimeout(safety); }
+          sendResponse({ ok: false, error: '未配置可用模型' });
+          return;
+        }
+        const chatModel = enabledModels.find(m => m.id === msg.modelId)
+          || enabledModels.find(m => m.isPrimary)
+          || enabledModels[0];
+        if (!hasCred(chatModel)) {
+          if (!settled) { settled = true; clearTimeout(safety); }
+          sendResponse({ ok: false, error: '模型缺少有效凭证（API Key）' });
+          return;
+        }
+        const agent = _runningAgent = new Agent({
+          models: enabledModels,
+          maxSteps: msg.maxSteps || 15,
+          chatFn: async (messages, opts) => {
+            const fb = new FallbackManager({});
+            const candidates = [chatModel, ...enabledModels.filter(m => m !== chatModel)];
+            const options = { ...optionsFromModel(chatModel) };
+            if (msg.thinkingStrength) options.thinkingStrength = msg.thinkingStrength;
+            return fb.callStream(candidates, {
+              messages,
+              stream: false,
+              options,
+            });
+          },
+          execTool: async (tool, args) => {
+            if (tool === 'export_ppt') {
+              try {
+                const exporter = new PptExporter();
+                const outline = { title: args?.title || '演示文稿', slides: args?.slides || [] };
+                if (!outline.slides.length) return { ok: false, error: 'PPT 没有幻灯片内容' };
+                const blob = await exporter.export(outline);
+                const reader = new FileReader();
+                const dataUrl = await new Promise((resolve, reject) => {
+                  reader.onload = () => resolve(reader.result);
+                  reader.onerror = reject;
+                  reader.readAsDataURL(blob);
+                });
+                chrome.downloads.download({ url: dataUrl, filename: sanitizeFilename(outline.title) + '.pptx' }, () => {});
+                return { ok: true, result: { message: `PPT「${outline.title}」已下载`, slideCount: outline.slides.length, filename: sanitizeFilename(outline.title) + '.pptx' } };
+              } catch (e) {
+                return { ok: false, error: 'PPT 导出失败：' + (e?.message || e) };
+              }
+            }
+            const tab = await getActiveTab();
+            if (!tab || !tab.id) return { ok: false, error: '无法获取当前标签页' };
+            return await execTool(tab, tool, args || {});
+          },
+          onEvent: (event) => {
+            try {
+              chrome.runtime.sendMessage({
+                type: 'AGENT_PROGRESS',
+                payload: { ...event, ts: Date.now() },
+              }, () => { void chrome.runtime.lastError; });
+            } catch (_) {}
+          },
+        });
+        if (msg.signal?.aborted) { agent.abort(); }
+        const ctx = msg.context || {};
+        if (!ctx.pageInfo?.text) {
+          try {
+            const tab = await getActiveTab();
+            console.log('[Agent-RUN] activeTab:', tab?.id, tab?.url?.slice(0, 60));
+            if (tab && tab.id) {
+              let pageText = '';
+              try {
+                const page = await chrome.tabs.sendMessage(tab.id, { type: 'EXTRACT_PAGE' });
+                pageText = page?.text || '';
+                console.log('[Agent-RUN] EXTRACT_PAGE 结果长度:', pageText.length);
+              } catch (e1) {
+                console.warn('[Agent-RUN] EXTRACT_PAGE 失败:', e1?.message);
+                try {
+                  const [res] = await chrome.scripting.executeScript({
+                    target: { tabId: tab.id },
+                    func: () => {
+                      const root = document.querySelector('article') || document.querySelector('main') || document.body;
+                      const clone = root.cloneNode(true);
+                      clone.querySelectorAll('script,style,noscript,nav,header,footer,aside').forEach(e => e.remove());
+                      return (clone.innerText || '').replace(/\s+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+                    },
+                  });
+                  pageText = (res?.result) || '';
+                  console.log('[Agent-RUN] executeScript 结果长度:', pageText.length);
+                } catch (e2) {
+                  console.warn('[Agent-RUN] executeScript 也失败:', e2?.message);
+                }
+              }
+              ctx.pageInfo = {
+                title: tab.title || '',
+                url: tab.url || '',
+                text: pageText.slice(0, 8000),
+              };
+            } else {
+              console.warn('[Agent-RUN] 无有效 tab');
+            }
+          } catch (e) {
+            console.error('[Agent-RUN] 提取页面内容异常:', e?.message);
+          }
+        } else {
+          console.log('[Agent-RUN] 已有页面内容，长度:', ctx.pageInfo.text.length);
+        }
+        const result = await agent.run(msg.goal || '', ctx);
+        if (!settled) { settled = true; clearTimeout(safety); }
+        sendResponse({ ok: true, ...result, _debug: { pageInfoLen: ctx.pageInfo?.text?.length || 0, hasPageInfo: !!ctx.pageInfo?.text } });
+      } catch (e) {
+        if (!settled) { settled = true; clearTimeout(safety); }
+        sendResponse({ ok: false, error: e?.message || 'Agent 执行失败', _debug: { pageInfoLen: ctx.pageInfo?.text?.length || 0 } });
+      } finally {
+        _runningAgent = null;
+      }
+    })();
+    return true;
+  }
+  // 中止 Agent 运行
+  if (msg.type === 'AGENT_ABORT') {
+    // 直接调用运行中 Agent 实例的 abort()，使其内部的 this._aborted 置位
+    _runningAgent?.abort();
+    try { chrome.runtime.sendMessage({ type: 'AGENT_PROGRESS', payload: { phase: 'abort' } }, () => { void chrome.runtime.lastError; }); } catch (_) {}
+    sendResponse({ ok: true });
+    return true;
+  }
+  // 工作流引擎执行
+  if (msg.type === 'WORKFLOW_RUN') {
+    let settled = false;
+    const SAFETY_MS = 240000; // 4min
+    const safety = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { sendResponse({ ok: false, error: '工作流执行超时' }); } catch (_) {}
+    }, SAFETY_MS);
+    (async () => {
+      try {
+        const engine = createWorkflowEngine();
+        const models = await getModels();
+        const enabledModels = models.filter(m => m.enabled !== false);
+        const tab = await getActiveTab();
+        engine.globals = new Map();
+        engine.globals.set('models', enabledModels);
+        engine.globals.set('api', {
+          extractMain: async () => {
+            if (!tab?.id) return '';
+            try {
+              return await chrome.tabs.sendMessage(tab.id, { type: 'EXTRACT_PAGE' });
+            } catch (_) {
+              const [res] = await chrome.scripting.executeScript({
+                target: { tabId: tab.id },
+                func: () => {
+                  const root = document.querySelector('article') || document.querySelector('main') || document.body;
+                  const clone = root.cloneNode(true);
+                  clone.querySelectorAll('script,style,noscript,nav,header,footer,aside').forEach(e => e.remove());
+                  return (clone.innerText || '').replace(/\s+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+                },
+              });
+              return { text: (res?.result) || '' };
+            }
+          },
+          summarize: async (input, cfg) => {
+            const page = typeof input === 'string' ? { text: input } : (input?.text ? input : { text: JSON.stringify(input) });
+            const instruction = cfg?.ppt
+              ? '请将内容整理为适合直接制作 PPT 的结构化大纲：用 # 表示每张幻灯片标题，用 - 表示要点；建议 5-10 页，每页 3-6 个要点。' +
+                '请在合适的页面使用语义清晰的标题，以便系统自动匹配模板版式：封面页用标题概括主题；目录/议程页标题含「目录」或「大纲」；' +
+                '章节/分区页标题含「第X章」「章节」或「Part」；结尾/致谢页标题含「谢谢」「总结」或「联系我们」；其余为内容页（页标题 + 要点）。' +
+                '若需要强制某页版式，可在标题行末尾加 @layout=cover|toc|section|content|closing。'
+              : '';
+            const result = await summarizePage({ models: enabledModels }, page, { stream: false, instruction });
+            return result.text;
+          },
+          translate: async (texts, targetLang, modelId) => {
+            const m = enabledModels.find(x => x.id === modelId) || enabledModels.find(x => x.isPrimary) || enabledModels[0];
+            return await translateSegments(m, texts, targetLang || '中文（简体）', {});
+          },
+          kbSearch: async (query, cfg) => {
+            const state = await getKbState();
+            const kbCfg = state.providers[state.active];
+            if (!kbCfg) return { chunks: [], error: '未配置知识库' };
+            const kb = createKbConnector(kbCfg.type, kbCfg.cfg);
+            if (!kb) return { chunks: [], error: '知识库连接器不可用' };
+            return await kb.search(query, { knowledgeBaseId: cfg.knowledgeBaseId });
+          },
+          execTool: async (tool, args) => {
+            if (!tab?.id) return { ok: false, error: '无法获取当前标签页' };
+            return await execTool(tab, tool, args || {});
+          },
+          exportPpt: async (input, cfg) => {
+            const exporter = new PptExporter();
+            let outline;
+            if (cfg.markdown) {
+              outline = parseMarkdownOutline(cfg.markdown);
+            } else if (typeof input === 'string') {
+              outline = parseMarkdownOutline(input);
+            } else {
+              outline = input;
+            }
+            const blob = await exporter.export(outline, await resolvePptOpts({ template: cfg.template || msg.template }));
+            const reader = new FileReader();
+            const dataUrl = await new Promise((resolve) => {
+              reader.onload = () => resolve(reader.result);
+              reader.readAsDataURL(blob);
+            });
+            return { format: 'pptx', dataUrl, filename: sanitizeFilename(outline?.title) + '.pptx' };
+          },
+        });
+        const graph = msg.graph || (msg.templateId && WORKFLOW_TEMPLATES[msg.templateId]?.graph);
+        if (!graph) {
+          if (!settled) { settled = true; clearTimeout(safety); }
+          sendResponse({ ok: false, error: '缺少工作流图定义' });
+          return;
+        }
+        const result = await engine.run(graph, msg.input || '', (event) => {
+          try {
+            chrome.runtime.sendMessage({
+              type: 'WORKFLOW_PROGRESS',
+              payload: { ...event, ts: Date.now() },
+            }, () => { void chrome.runtime.lastError; });
+          } catch (_) {}
+        });
+        if (!settled) { settled = true; clearTimeout(safety); }
+        const resultsObj = {};
+        const errorsObj = {};
+        for (const [k, v] of result.results) resultsObj[k] = v;
+        for (const [k, v] of result.errors) errorsObj[k] = v;
+        sendResponse({ ok: true, results: resultsObj, errors: errorsObj });
+      } catch (e) {
+        if (!settled) { settled = true; clearTimeout(safety); }
+        sendResponse({ ok: false, error: e?.message || '工作流执行失败' });
+      }
+    })();
+    return true;
+  }
   return false;
 });
+
+let _runningAgent = null;
 
 
 // 点击工具栏图标：直接在浏览器原生侧边栏中打开聊天应用（最可靠，无需内容脚本）
@@ -1502,5 +2013,6 @@ chrome.runtime.onInstalled?.addListener(async () => {
 });
 chrome.runtime.onStartup?.addListener(async () => {
   try { await closeLingeringOffscreen(); } catch (_) {}
+  loadKbListCache();
   injectContentScriptsToOpenTabs();
 });
