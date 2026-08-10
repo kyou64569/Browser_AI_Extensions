@@ -28,14 +28,14 @@ core/
   translate-rate.js           网页翻译优化：token 估算 / 句边界切分 / 分块 / TPM-RPM 限流
 connectors/
   knowledge-base.js           KnowledgeBaseConnector 抽象接口（search/add）
-  local-kb.js                 本地知识库连接器（HTTP 实现，字段待你提供）
-  online-kb.js                在线知识库（NotebookLM/ima 等）占位，TODO 留空
+  local-kb.js                 本地知识库连接器（HTTP 实现，含 SSRF 防护 + 分页列表 + 检索）
+  online-kb.js                在线知识库（ima OpenAPI，含分页列表、检索、内容召回、URL 抓取）
 features/
   summarize.js                网页总结（最小闭环，依赖 router+fallback+kb）
   chat.js                     通用聊天：单模型 / 多模型协作 / 视觉转发，复用 adapter+fallback
-  selection.js                划词处理（翻译/解释/追问）接口骨架，TODO 接 UI
+  selection.js                划词处理（翻译/解释/追问，含浮窗 UI + 流式回传）
   automation.js               网页自动化：工具定义 + 提示词 + ReAct 式工具调用解析
-  placeholders.js             未实现模块占位：工作流/Agent/Skill/PPT/网页自动化
+  placeholders.js             仅保留 SkillLoader / WebAutomator 占位；工作流/Agent/PPT/自动化已移至独立模块
 content/
   extract.js                  content script：提取正文 + 监听划词（GET_SELECTION）
   sidebar-inject.js           在任意网页右侧注入可拖拽/折叠的 iframe 侧边栏（加载 preview）
@@ -135,10 +135,10 @@ preview/
 
 ## 待你提供 / 待补项
 
-- `connectors/local-kb.js`：真实接口路径、请求/响应字段（当前按 `/retrieve`、`/add` 占位）。
-- `connectors/online-kb.js`：在线知识库（ima）已接入多 provider 检索；官方全文 RAG 能力不通过开放 API 暴露（详见代码内诊断说明）。
-- `features/selection.js`：划词浮层 UI（已预留接口）。
-- `features/placeholders.js`：工作流、自主 Agent、Skill 系统、PPT 导出（仅接口占位）。
+- `connectors/local-kb.js`：已实现，含 SSRF 防护、分页列表、检索。
+- `connectors/online-kb.js`：已实现 ima OpenAPI 集成，含分页列表、检索、内容召回、URL 抓取。
+- `features/selection.js`：已实现，含浮窗 UI + 流式回传。
+- `features/placeholders.js`：仅 SkillLoader / WebAutomator 未实现，工作流/Agent/PPT/自动化已移至独立模块。
 - 侧边栏 UI 统一走 `preview/` 路径（`index.html` 为 sidePanel 默认页），聊天已支持逐 chunk 打字机效果。
 
 ---

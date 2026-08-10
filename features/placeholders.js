@@ -1,10 +1,12 @@
 // features/placeholders.js
 // 未实现模块的接口占位。仅定义契约与 TODO，方便后续逐个补，不破坏上层调用。
 
-// 已实现的模块：
-//   - WorkflowEngine：见 features/workflow.js
-//   - Agent：见 features/agent.js
-//   - PptExporter：见 features/ppt-exporter.js
+// 本文件仅保留尚未实现的接口占位。
+// WorkflowEngine / Agent / PptExporter / 自动化均已迁移至独立模块：
+//   - WorkflowEngine：features/workflow.js
+//   - Agent：features/agent.js
+//   - PptExporter：features/ppt-exporter.js
+//   - 网页自动化：features/automation.js + background/web-tools.js
 
 /**
  * 1) 动态加载的 Skill 插件系统

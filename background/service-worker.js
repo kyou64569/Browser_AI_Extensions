@@ -1,5 +1,6 @@
 // background/service-worker.js
-// MV3 service worker：模块装配中枢。持有 router / fallback / kb 连接器。
+// MV3 service worker：后台消息分发 + 业务逻辑中枢。
+// 持有 router / fallback / kb 连接器，处理字幕/翻译/PPT 导出等核心逻辑。
 // 通过消息与 side panel / popup / content script 通信。
 
 import { getModels, getKbConfig, getKbState, getWhisperModels } from '../shared/storage.js';

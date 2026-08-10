@@ -1,5 +1,5 @@
 // connectors/local-kb.js
-// 本地知识库连接器：调用本地自建的知识库服务（接口见 D:/work/knowledge-base/README.md）。
+// 本地知识库连接器：调用本地自建的知识库服务（需自建，接口见项目文档）。
 // API 前缀 /api/v1：检索 GET /api/v1/search，健康检查 GET /api/v1/health，
 // 知识库列表（书源）GET /api/v1/admin/book-sources。
 // 所有请求由后台 Service Worker 发起（配合 <all_urls> 宿主权限），不受页面 CORS 限制。
