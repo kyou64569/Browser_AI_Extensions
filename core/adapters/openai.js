@@ -5,6 +5,7 @@
 import { ModelClient } from '../model-base.js';
 import { postJson, fetchWithTimeout, HttpError } from '../http.js';
 import { normalizeApiBase } from '../../shared/utils.js';
+import { redactUrl } from '../../shared/sanitize.js';
 
 export class OpenAIAdapter extends ModelClient {
   get endpoint() {
@@ -108,8 +109,9 @@ export class OpenAIAdapter extends ModelClient {
         yield* this._nonStream(req, signal);
       }
     } catch (e) {
-      // 附加请求 URL 到错误信息，方便定位"apiBase 配置是否正确"
-      const urlTip = `（请求地址：${this.endpoint}）`;
+      // 附加请求 URL 到错误信息，方便定位"apiBase 配置是否正确"；
+      // 只透出 origin+path（redactUrl），避免自定义代理把 token 写在 query 上时外泄。
+      const urlTip = `（请求地址：${redactUrl(this.endpoint)}）`;
       if (e instanceof HttpError && (e.status === 404 || e.kind === 'network')) {
         throw new HttpError(e.kind, (e.message || '请求失败') + ' ' + urlTip, e.status);
       }

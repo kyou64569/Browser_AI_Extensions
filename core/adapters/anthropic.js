@@ -5,6 +5,7 @@
 import { ModelClient } from '../model-base.js';
 import { postJson, fetchWithTimeout, HttpError } from '../http.js';
 import { normalizeApiBase } from '../../shared/utils.js';
+import { redactUrl } from '../../shared/sanitize.js';
 
 /** Anthropic 思考预算（tokens）档位映射 */
 const ANTHROPIC_THINKING_BUDGET = { low: 2000, medium: 8000, high: 16000 };
@@ -137,7 +138,8 @@ export class AnthropicAdapter extends ModelClient {
         yield* this._nonStream(req, signal);
       }
     } catch (e) {
-      const urlTip = `（请求地址：${this.endpoint}）`;
+      // 同上：错误信息只透出 origin+path，不泄露 query 中可能携带的凭证。
+      const urlTip = `（请求地址：${redactUrl(this.endpoint)}）`;
       if (e instanceof HttpError && (e.status === 404 || e.kind === 'network')) {
         throw new HttpError(e.kind, (e.message || '请求失败') + ' ' + urlTip, e.status);
       }

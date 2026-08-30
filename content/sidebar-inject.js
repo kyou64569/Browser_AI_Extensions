@@ -7,6 +7,7 @@
 // 预览模式下请用 preview/host.html 体验同一交互。
 
 (function () {
+  'use strict';
   const ROOT_ID = '__ai_sidebar_root';
   if (window.self !== window.top) return; // 仅在顶层框架注入，避免子 iframe 内重复注入
   if (document.getElementById(ROOT_ID)) return;

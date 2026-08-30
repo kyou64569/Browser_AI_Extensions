@@ -8,6 +8,7 @@
 // 保留自动模式：同站 SPA 跳转后自动重翻（从 storage 读取预存参数）。
 
 (function () {
+  'use strict';
   if (window.self !== window.top) return;
   if (window.__aiTranslateWorker) return;
   window.__aiTranslateWorker = true;

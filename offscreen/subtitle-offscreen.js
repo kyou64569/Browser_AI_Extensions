@@ -11,6 +11,10 @@
 //
 // 注意：Offscreen 文档只能使用 chrome.runtime API，故音频片段经 chrome.runtime 端口回传 SW。
 
+// 本文件由 <script src> 以传统脚本方式加载（非 module），因此不会自动进入严格模式，
+// 必须显式声明：否则隐式全局赋值、八进制字面量等静默问题不会被报出来。
+'use strict';
+
 // ============================================================
 // VAD（静音驱动）分片：不再“固定每秒切一片”，而是累积音频直到检测到句末停顿才发一片。
 // 目的（根治）：把 Whisper 调用频率从 ~60 次/分钟（每秒一片）降到“句频”（~10~30 次/分钟），
@@ -25,8 +29,8 @@ const TARGET_RATE = 16000;          // Whisper 原生采样率：降采样减少
 
 let capStream = null;     // 捕获到的标签页音频流
 let capAudioCtx = null;   // Web Audio 上下文（恢复被静音的标签页声音 + 抓取 PCM）
-let capPcmNode = null;    // ScriptProcessorNode（持续抓取 PCM）
-let capPcmBuf = [];       // 当前 STEP 内累积的 Float32 帧（由 onaudioprocess 填充，evaluate 每 STEP_MS 取走）
+let capPcmNode = null;    // AudioWorkletNode（在 worklet 线程持续抓取 PCM，替代已废弃的 ScriptProcessorNode）
+let capPcmBuf = [];       // 当前 STEP 内累积的 Float32 帧（由 worklet 的 port.onmessage 填充，evaluate 每 STEP_MS 取走）
 let capPcmLen = 0;        // 当前 STEP 已累积样本数
 let capSliceTimer = null; // VAD 评估定时器（每 STEP_MS 触发 evaluate）
 let capActive = false;
@@ -89,7 +93,9 @@ function restoreTabAudio(stream) {
 // 方案 C：用 Web Audio 直接抓取 PCM（而非 MediaRecorder 的 webm 分片）。
 // 原因：MediaRecorder 多块拼出的 webm 只有首块带文件头，后续窗口缺头无法解码（报 decode 错误）。
 // 改抓 PCM 后，每个窗口独立编码成合法的 WAV，全程连续、无 stop/start 空缺，且绝不会出现解码失败。
-function startSlice() {
+// PCM 采集用 AudioWorkletNode（offscreen/pcm-worklet.js）替代已废弃的 ScriptProcessorNode：
+// process() 跑在专用音频线程，降采样也在 worklet 内完成，主线程只收 chunk 数据。
+async function startSlice() {
   if (!capActive || !capStream) return;
   const AC = window.AudioContext || window.webkitAudioContext;
   if (!AC) { console.warn('[offscreen] 无 AudioContext，无法捕获'); return; }
@@ -97,15 +103,57 @@ function startSlice() {
     try { capAudioCtx = new AC(); } catch (_) { console.warn('[offscreen] AudioContext 创建失败'); return; }
   }
   try {
+    // AudioWorklet 模块按 AudioContext 加载：每次 start 都 addModule。
+    // 同一 ctx 重复调用是幂等的（no-op 且 resolve）；新 ctx 则必须重新加载。
+    // worklet 文件位于扩展内，chrome-extension:// 页面为 secure context，AudioWorklet 可用。
+    await capAudioCtx.audioWorklet.addModule(chrome.runtime.getURL('offscreen/pcm-worklet.js'));
     const src = capAudioCtx.createMediaStreamSource(capStream);
-    // 抓取 PCM：ScriptProcessor 必须接在图中才会触发 onaudioprocess，
+    // 抓取 PCM：AudioWorklet 必须接在图中才会被拉取（与原 ScriptProcessor 同理）。
     // 用静音增益接回 destination，避免重复出声（恢复声音由 restoreTabAudio 单独负责）。
+    const node = new AudioWorkletNode(capAudioCtx, 'pcm-capture-processor', {
+      numberOfInputs: 1,
+      numberOfOutputs: 1,
+      outputChannelCount: [1],
+    });
+    capPcmNode = node;
+    capPcmBuf = [];
+    capPcmLen = 0;
+    // worklet 已在内部完成降采样（48kHz→16kHz，数据量减约 60%），主线程直接收块即可
+    node.port.onmessage = (ev) => {
+      if (!capActive) return;
+      const d = ev.data; // Float32Array（16kHz 降采样块）
+      capPcmBuf.push(d);
+      capPcmLen += d.length;
+    };
+    const silent = capAudioCtx.createGain();
+    silent.gain.value = 0;
+    src.connect(node);
+    node.connect(silent);
+    silent.connect(capAudioCtx.destination);
+    if (capAudioCtx.state === 'suspended') capAudioCtx.resume().catch(() => {});
+  } catch (e) {
+    // AudioWorklet 加载失败（个别 WebView / 旧 Chromium）：降级回 ScriptProcessorNode，
+    // 保证字幕功能不退化。该节点虽已废弃但仍在支持范围内。
+    console.warn('[offscreen] AudioWorklet 初始化失败，降级 ScriptProcessorNode：', (e && e.message) || e);
+    const fallback = startSliceLegacy();
+    if (!fallback) { console.warn('[offscreen] PCM 捕获初始化失败（含降级）', e); return; }
+  }
+  // 重置 VAD 段状态并按 STEP_MS 周期评估
+  segFrames = []; segSamples = 0; segVoiceMs = 0; segTotalMs = 0;
+  inSpeech = false; silenceMs = 0; lastStep = null;
+  capSliceTimer = setInterval(evaluateStep, STEP_MS);
+}
+
+// ScriptProcessorNode 降级路径（仅当 AudioWorklet 不可用时启用，见 startSlice 的 catch）。
+// 与原实现完全一致：4096 buffer、主线程降采样、onaudioprocess 填充 capPcmBuf。
+function startSliceLegacy() {
+  if (!capActive || !capStream) return false;
+  try {
+    const src = capAudioCtx.createMediaStreamSource(capStream);
     const node = capAudioCtx.createScriptProcessor(4096, 1, 1);
     capPcmNode = node;
     capPcmBuf = [];
     capPcmLen = 0;
-    // 降采样到 TARGET_RATE（16kHz）：Whisper 原生只需 16kHz，减少约 60% 数据量
-    // 降低编码耗时、跨进程传输耗时和 API 上传耗时（48kHz→16kHz 数据缩减约 3 倍）
     const decimate = Math.max(1, Math.floor(capAudioCtx.sampleRate / TARGET_RATE));
     node.onaudioprocess = (ev) => {
       if (!capActive) return;
@@ -121,14 +169,10 @@ function startSlice() {
     node.connect(silent);
     silent.connect(capAudioCtx.destination);
     if (capAudioCtx.state === 'suspended') capAudioCtx.resume().catch(() => {});
-  } catch (e) {
-    console.warn('[offscreen] PCM 捕获初始化失败', e);
-    return;
+    return true;
+  } catch (_) {
+    return false;
   }
-  // 重置 VAD 段状态并按 STEP_MS 周期评估
-  segFrames = []; segSamples = 0; segVoiceMs = 0; segTotalMs = 0;
-  inSpeech = false; silenceMs = 0; lastStep = null;
-  capSliceTimer = setInterval(evaluateStep, STEP_MS);
 }
 
 // VAD 评估：每 STEP_MS 取走本步累积的 PCM，算峰值，交由状态机判定“有声/静音”。
@@ -187,9 +231,10 @@ function flushSegment() {
   encodeAndSendAsync(data, samples);
 }
 
-// 异步编码 + 发送：先释放主线程，避免阻塞 audio context
+// 异步编码 + 发送：先释放主线程，避免阻塞 UI 与消息泵
 async function encodeAndSendAsync(data, total) {
-  // 释放主线程：确保 audio context 的 onaudioprocess（50ms 周期）不被编码阻塞
+  // 释放主线程：编码/传输不在采集回调里做（PCM 采集已移到 worklet 独立线程，
+  // 主线程这里即使被短暂阻塞也不会掉音；释放一次仍能降低卡顿感）
   await new Promise(r => setTimeout(r, 0));
   if (!capActive || !capAudioCtx) return;
   try {
@@ -215,7 +260,11 @@ async function encodeAndSendAsync(data, total) {
 function stopCapture() {
   capActive = false;
   if (capSliceTimer) { clearInterval(capSliceTimer); capSliceTimer = null; }
-  if (capPcmNode) { try { capPcmNode.disconnect(); } catch (_) {} capPcmNode = null; }
+  if (capPcmNode) {
+    // AudioWorkletNode 的清理比 ScriptProcessor 多一步：断开图 + 关闭 port
+    try { capPcmNode.disconnect(); capPcmNode.port.close(); } catch (_) {}
+    capPcmNode = null;
+  }
   capPcmBuf = []; capPcmLen = 0;
   segFrames = []; segSamples = 0; segVoiceMs = 0; segTotalMs = 0;
   inSpeech = false; silenceMs = 0; lastStep = null;

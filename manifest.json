@@ -15,6 +15,9 @@
   "side_panel": {
     "default_path": "preview/index.html"
   },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'"
+  },
   "options_page": "ui/options/options.html",
   "content_scripts": [
     {
@@ -29,7 +32,9 @@
         "preview/index.html",
         "preview/preview.css",
         "preview/preview.js",
-        "shared/dom-tools.js"
+        "shared/dom-tools.js",
+        "shared/extract.js",
+        "offscreen/pcm-worklet.js"
       ],
       "matches": ["<all_urls>"]
     }

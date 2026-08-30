@@ -10,6 +10,7 @@ import { listModels } from '../core/list-models.js';
 import { thinkingLevels } from '../shared/utils.js';
 import { postJson, fetchWithTimeout } from '../core/http.js';
 import { normalizeKbState, defaultKbState } from '../shared/storage.js';
+import { safeImageSrc } from '../shared/sanitize.js';
 import { KB_PROVIDERS, createKbConnector } from '../connectors/kb-registry.js';
 
 const $ = (s) => document.querySelector(s);
@@ -86,8 +87,84 @@ function updateTranslateProgress(p) {
   if (text) text.textContent = (p.message || '翻译中…') + (total ? `（${pct}%）` : '') + (p.indeterminate ? ' · 等待模型响应…' : '');
 }
 
-chrome.runtime.onMessage.addListener((msg) => {
-  if (msg && msg.type === 'WEB_TRANSLATE_PROGRESS') updateTranslateProgress(msg.payload);
+// ---------- 跨域跳转确认（S-03：Agent open_url 的域名守卫）----------
+// 后台在检测到"跳到当前站点之外的域名"时会广播 AUTOMATE_CONFIRM_NAV 并阻塞等待。
+// 这里弹确认框把决定权交回用户；用户拒绝/无应答 → 后台一律按拒绝处理。
+function confirmCrossOriginNav({ fromHost, toHost, url } = {}) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (v) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      document.removeEventListener('keydown', onKey, true);
+      overlay.remove();
+      resolve(v);
+    };
+    const onKey = (e) => { if (e.key === 'Escape') finish(false); };
+
+    const overlay = document.createElement('div');
+    overlay.style.cssText =
+      'position:fixed;inset:0;z-index:99999;display:flex;align-items:center;justify-content:center;' +
+      'background:rgba(0,0,0,.55);font:13px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif;color:#e5e7eb;';
+    // 纯文本写入（textContent），绝不把外部可控的 url 交给 innerHTML
+    const card = document.createElement('div');
+    card.style.cssText =
+      'max-width:380px;padding:18px 20px;border-radius:12px;background:#1f2937;' +
+      'box-shadow:0 12px 32px rgba(0,0,0,.45);border:1px solid #374151;';
+    const title = document.createElement('div');
+    title.style.cssText = 'font-weight:600;font-size:14px;margin-bottom:10px;color:#fbbf24;';
+    title.textContent = '⚠️ 确认跨域跳转';
+    const desc = document.createElement('div');
+    desc.style.cssText = 'margin-bottom:10px;color:#d1d5db;';
+    desc.textContent = 'AI 助手请求跳转到当前站点之外的域名：';
+    const route = document.createElement('div');
+    route.style.cssText = 'margin-bottom:8px;font-weight:600;word-break:break-all;';
+    route.textContent = `${fromHost || '当前页面'} → ${toHost || '未知域名'}`;
+    const full = document.createElement('div');
+    full.style.cssText =
+      'margin-bottom:14px;padding:8px 10px;border-radius:6px;background:#111827;' +
+      'color:#9ca3af;font-size:12px;word-break:break-all;max-height:80px;overflow:auto;';
+    full.textContent = url || '';
+    const hint = document.createElement('div');
+    hint.style.cssText = 'margin-bottom:14px;color:#9ca3af;font-size:12px;';
+    hint.textContent = '若该网址不是你要访问的，请点拒绝（45 秒后自动拒绝）。';
+
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex;gap:10px;justify-content:flex-end;';
+    const deny = document.createElement('button');
+    deny.textContent = '拒绝';
+    deny.style.cssText =
+      'padding:6px 16px;border-radius:6px;border:1px solid #4b5563;background:#374151;' +
+      'color:#e5e7eb;cursor:pointer;font-size:13px;';
+    const allow = document.createElement('button');
+    allow.textContent = '允许跳转';
+    allow.style.cssText =
+      'padding:6px 16px;border-radius:6px;border:0;background:#2563eb;color:#fff;' +
+      'cursor:pointer;font-size:13px;font-weight:600;';
+    deny.addEventListener('click', () => finish(false));
+    allow.addEventListener('click', () => finish(true));
+    row.append(deny, allow);
+    card.append(title, desc, route, full, hint, row);
+    overlay.append(card);
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) finish(false); });
+
+    // 与后台 NAV_CONFIRM_TIMEOUT_MS(45s) 对齐，超时先本地关门，后台随后也会按拒绝兜底
+    const timer = setTimeout(() => finish(false), 44000);
+    document.addEventListener('keydown', onKey, true);
+    (document.body || document.documentElement).appendChild(overlay);
+    allow.focus();
+  });
+}
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg && msg.type === 'WEB_TRANSLATE_PROGRESS') { updateTranslateProgress(msg.payload); return; }
+  if (msg && msg.type === 'AUTOMATE_CONFIRM_NAV') {
+    confirmCrossOriginNav(msg).then((approved) => {
+      try { sendResponse({ approved }); } catch (_) { /* 端口已关闭，后台按拒绝兜底 */ }
+    });
+    return true; // 异步 sendResponse
+  }
 });
 
 // ---------- bfcache 生命周期处理 ----------
@@ -1281,7 +1358,10 @@ function pushToolMessage(m) {
   body += `<div class="tool-head">🛠 ${escapeHtml(t.name || '工具')} <span class="tool-badge ${ok ? 'ok' : 'err'}">${ok ? '成功' : '失败'}</span></div>`;
   body += `<div class="tool-args">${escapeHtml(JSON.stringify(t.args || {}))}</div>`;
   if (ok && t.shot) {
-    body += `<div class="tool-result ok"><img class="tool-shot" src="${t.shot}" alt="截图"/></div>`;
+    // 截图 dataURL 直接拼进 innerHTML：必须先过协议白名单，
+    // 否则外部可控的 src（如 javascript: / data:text/html）会变成注入点。
+    const src = safeImageSrc(t.shot);
+    if (src) body += `<div class="tool-result ok"><img class="tool-shot" src="${src}" alt="截图"/></div>`;
   }
   if (ok && t.summary) {
     body += `<div class="tool-result ok">${escapeHtml(t.summary)}</div>`;

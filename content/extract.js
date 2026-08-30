@@ -10,6 +10,7 @@
 // chrome.scripting.executeScript 注入被浏览器以“权限不足”拒绝的问题。
 
 (function () {
+  'use strict';
   // 扩展更新/重载后会重新注入本脚本；若已存在旧 listener，先移除，
   // 避免旧内容脚本的 EXECUTE_TOOL 响应抢占并返回"未知工具"。
   if (window.__aiAssistantExtractListener) {
@@ -19,6 +20,7 @@
 
   let pageTool = null;
   let pageToolLoading = null;
+  let sharedExtract = null;   // shared/extract.js 的 extractMainTextInPage
 
   function ensurePageTool() {
     if (pageTool) return Promise.resolve(pageTool);
@@ -30,12 +32,22 @@
     return pageToolLoading;
   }
 
+  // 正文提取复用 shared/extract.js（与后台 executeScript 兜底同一份实现），
+  // 避免同一个逻辑在内容脚本与后台各维护一遍、改一处漏一处。
+  // 共享模块是异步 import 的，未就绪时走下方等价的本地实现兜底，
+  // 因此 EXTRACT_PAGE 不会因为模块尚未加载而失败。
+  import(chrome.runtime.getURL('shared/extract.js'))
+    .then(mod => { sharedExtract = mod.extractMainTextInPage; })
+    .catch(() => { sharedExtract = null; });
+
   /** 简单正文提取：优先 article/main，否则 body 文本 */
   function extractMainText() {
+    if (sharedExtract) return sharedExtract();
     const root =
       document.querySelector('article') ||
       document.querySelector('main') ||
       document.body;
+    if (!root) return '';
     const clone = root.cloneNode(true);
     clone.querySelectorAll('script,style,noscript,nav,header,footer,aside').forEach(e => e.remove());
     const text = (clone.innerText || clone.textContent || '')

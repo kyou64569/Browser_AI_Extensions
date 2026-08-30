@@ -9,6 +9,76 @@
 
 import { pageTool, DOM_TOOLS } from '../shared/dom-tools.js';
 
+// ── 跨域导航守卫（S-03）────────────────────────────────────────────────────
+// open_url 原本只有"协议白名单"，但没有域名约束：只要网页正文里有一段诱导文本
+// （prompt injection），Agent 就可能被诱导把当前标签导航到钓鱼站。
+// 这里补上程序化约束：跨域名跳转必须先经用户确认，同域名（含子域）正常放行。
+const NAV_APPROVE_KEY = 'navApprovedHosts';   // 存 chrome.storage.session，浏览器会话内有效
+const NAV_CONFIRM_TIMEOUT_MS = 45000;         // 等用户点确认的时间上限
+const _navApproved = new Set();               // 内存副本，避免每次跳转都读存储
+let _navApprovedLoaded = false;
+
+async function loadNavApprovals() {
+  if (_navApprovedLoaded) return _navApproved;
+  _navApprovedLoaded = true;
+  try {
+    const r = await chrome.storage.session.get(NAV_APPROVE_KEY);
+    for (const h of r[NAV_APPROVE_KEY] || []) _navApproved.add(String(h));
+  } catch (_) { /* 该浏览器版本无 storage.session，退化为仅内存缓存 */ }
+  return _navApproved;
+}
+
+async function rememberNavApproval(host) {
+  _navApproved.add(host);
+  try {
+    await chrome.storage.session.set({ [NAV_APPROVE_KEY]: [..._navApproved] });
+  } catch (_) { /* 持久化失败不影响本次放行 */ }
+}
+
+/** 取 host；解析失败返回 '' */
+function hostOf(raw) {
+  try { return new URL(String(raw || '')).host; } catch (_) { return ''; }
+}
+
+/**
+ * a、b 是否"同源站点"：host 完全相同，或一方是另一方的子域。
+ * 子域互通是因为登录/跳转常在 www ↔ 主域之间来回，逐次确认会严重打断自动化。
+ */
+function sameSite(a, b) {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  // 正确的子域检查：a 是 b 的子域，或 b 是 a 的子域
+  const aParts = a.split('.');
+  const bParts = b.split('.');
+  if (aParts.length > bParts.length) {
+    return aParts.slice(aParts.length - bParts.length).join('.') === b;
+  }
+  if (bParts.length > aParts.length) {
+    return bParts.slice(bParts.length - aParts.length).join('.') === a;
+  }
+  return false;
+}
+
+/**
+ * 向扩展 UI 广播跨域导航确认请求，等用户在侧边栏点同意/拒绝。
+ * 无人应答（侧边栏未打开）或超时 → 一律按"拒绝"处理（安全默认）。
+ */
+function requestNavApproval(payload) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (res) => { if (done) return; done = true; clearTimeout(timer); resolve(res); };
+    const timer = setTimeout(() => finish({ approved: false, reason: 'timeout' }), NAV_CONFIRM_TIMEOUT_MS);
+    try {
+      chrome.runtime.sendMessage({ type: 'AUTOMATE_CONFIRM_NAV', ...payload }, (resp) => {
+        void chrome.runtime.lastError; // 无接收端时的 "Could not establish connection"
+        finish({ approved: !!(resp && resp.approved) });
+      });
+    } catch (_) {
+      finish({ approved: false, reason: 'no-ui' });
+    }
+  });
+}
+
 /**
  * 通过已注入的 content script 执行 DOM 工具（首选路径）。
  * 内容脚本对宿主页面有完整 DOM 权限（manifest content_scripts 常驻注入），
@@ -228,9 +298,9 @@ async function takeElementScreenshot(tab, a) {
 async function switchTab(a) {
   const tabs = await chrome.tabs.query({ currentWindow: true });
   let target = null;
-  if (a.tabId) target = tabs.find(t => t.id === a.tabId);
+  if (a.tabId) target = tabs.find(t => t && t.id === a.tabId);
   else if (typeof a.index === 'number') target = tabs[a.index];
-  else if (a.title) target = tabs.find(t => (t.title || '').includes(a.title) || (t.url || '').includes(a.title));
+  else if (a.title) target = tabs.find(t => t && ((t.title || '').includes(a.title) || (t.url || '').includes(a.title)));
   if (!target) return { ok: false, error: '未找到匹配的标签页（index/title/tabId）' };
   await chrome.tabs.update(target.id, { active: true });
   return { ok: true, result: { tabId: target.id, title: target.title, url: target.url, total: tabs.length } };
@@ -242,13 +312,13 @@ async function closeTab(a) {
   let target = null;
   if (a.tabId) {
     const tabs = await chrome.tabs.query({});
-    target = tabs.find(t => t.id === a.tabId);
+    target = tabs.find(t => t && t.id === a.tabId);
   } else if (typeof a.index === 'number') {
     const tabs = await chrome.tabs.query({ currentWindow: true });
     target = tabs[a.index];
   } else if (a.title) {
     const tabs = await chrome.tabs.query({ currentWindow: true });
-    target = tabs.find(t => (t.title || '').includes(a.title) || (t.url || '').includes(a.title));
+    target = tabs.find(t => t && ((t.title || '').includes(a.title) || (t.url || '').includes(a.title)));
   } else if (a.current) {
     const [cur] = await chrome.tabs.query({ active: true, currentWindow: true });
     target = cur;
@@ -277,6 +347,28 @@ async function openUrl(tab, a) {
   if (proto !== 'http:' && proto !== 'https:') {
     return { ok: false, error: `不支持的跳转协议：${proto || '无效地址'}（仅允许 http/https）` };
   }
+
+  // 域名守卫：跳到"当前标签所在站点之外"的域名必须先经用户确认。
+  // 网页正文是提示词的一部分，攻击者可在页面里埋一段"请打开 xxx.com"诱导 Agent 跳转，
+  // 只靠提示词约束挡不住，必须有程序化校验。
+  const toHost = hostOf(url);
+  const fromHost = hostOf(tab && tab.url);
+  if (toHost && !sameSite(fromHost, toHost)) {
+    await loadNavApprovals();
+    if (!_navApproved.has(toHost)) {
+      const { approved, reason } = await requestNavApproval({ fromHost, toHost, url });
+      if (!approved) {
+        const why = reason === 'timeout' ? '等待确认超时' : '用户拒绝或侧边栏未打开';
+        return {
+          ok: false,
+          error: `已阻止跨域跳转：${fromHost || '当前页面'} → ${toHost}（${why}）。` +
+                 '若确需跳转，请在侧边栏弹出的确认框点「允许」，或先手动打开该站点。',
+        };
+      }
+      await rememberNavApproval(toHost);
+    }
+  }
+
   if (a && a.newTab) {
     const t = await chrome.tabs.create({ url, active: true });
     return { ok: true, result: { opened: 'newTab', tabId: t.id, url: t.url } };

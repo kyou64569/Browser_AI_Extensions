@@ -21,6 +21,7 @@
 //     2) 捕获失败时显示错误（LIVE_CAPTION_CAPTURE_ERROR）。
 
 (function () {
+  'use strict';
   if (window.self !== window.top) return;       // 仅顶层文档
   if (window.__aiSubtitleWorker) return;
   window.__aiSubtitleWorker = true;
