@@ -11,6 +11,7 @@ import { thinkingLevels } from '../shared/utils.js';
 import { postJson, fetchWithTimeout } from '../core/http.js';
 import { normalizeKbState, defaultKbState } from '../shared/storage.js';
 import { safeImageSrc } from '../shared/sanitize.js';
+import { describeError, formatErrorLine } from '../shared/errors.js';
 import { KB_PROVIDERS, createKbConnector } from '../connectors/kb-registry.js';
 
 const $ = (s) => document.querySelector(s);
@@ -830,6 +831,46 @@ function setStatus(msg, kind = '') {
   chatStatus.textContent = msg;
   chatStatus.className = 'status-bar' + (kind ? ' ' + kind : '');
 }
+
+/**
+ * 错误态状态条：主文案用可读翻译，技术细节放进可展开的 <details>。
+ *
+ * 以前这里直接展示 `错误：${e.message}`，用户会看到满屏
+ * `HTTP 429: {"error":{"message":"Rate limit exceeded"}}` 这类原始响应体。
+ * 现在只留一句人话 + 一个「详情」折叠区，排障时再展开。
+ *
+ * @param {unknown} e 错误对象
+ * @param {string} [prefix] 前缀（如"翻译失败"），为空则用错误自身分类文案
+ */
+function setStatusError(e, prefix = '') {
+  const d = describeError(e);
+  chatStatus.className = 'status-bar err status-error';
+  chatStatus.textContent = ''; // 清空后用 DOM 构造，绝不拼 innerHTML
+
+  const label = document.createElement('span');
+  label.textContent = (prefix ? prefix + '：' : '') + d.title;
+  chatStatus.appendChild(label);
+
+  // 处理建议单独一行弱化展示（若该分类有）
+  if (d.hint) {
+    const hint = document.createElement('span');
+    hint.className = 'status-hint';
+    hint.textContent = ' ' + d.hint;
+    chatStatus.appendChild(hint);
+  }
+
+  // 技术细节：折叠，默认收起
+  if (d.detail) {
+    const det = document.createElement('details');
+    det.className = 'status-detail';
+    const sum = document.createElement('summary');
+    sum.textContent = '详情';
+    const body = document.createElement('div');
+    body.textContent = d.detail; // textContent：原始响应体可能含 HTML 片段
+    det.append(sum, body);
+    chatStatus.appendChild(det);
+  }
+}
 function scrollBottom() { chatScroll.scrollTop = chatScroll.scrollHeight; }
 
 function autosize() {
@@ -1051,7 +1092,7 @@ async function send() {
       }
     } catch (e) {
       console.warn('[kb] 检索异常，跳过知识库增强：', e.message);
-      setStatus('📚 知识库检索异常：' + e.message + '（模型将基于自身知识回答）');
+      setStatus('📚 知识库检索异常：' + formatErrorLine(e) + '（模型将基于自身知识回答）');
       kbChunks = null;
     }
   }
@@ -1230,7 +1271,7 @@ async function send() {
   } catch (e) {
     a.stopTyping();
     a.setText(acc ? acc + '\n\n[中断] ' + e.message : '错误：' + e.message);
-    setStatus('错误：' + e.message, 'err');
+    setStatusError(e);
   } finally {
     streaming = false; updateSendState(); scrollBottom();
     // 发送消息后功能标签消失（翻译 / 解释 / 文件模式在此清除；总结网页为即时执行，
@@ -1612,7 +1653,7 @@ async function runAutomation(userText) {
       a.stopTyping();
       a.setText(acc ? acc + '\n\n[中断] ' + e.message : '错误：' + e.message);
     }
-    setStatus('错误：' + e.message, 'err');
+    setStatusError(e);
   } finally {
     streaming = false; updateSendState(); scrollBottom();
     clearFuncMode();
@@ -2257,7 +2298,7 @@ async function runSummarizeInChat(instruction) {
   setStatus('正在获取当前网页…');
   let page;
   try { page = await getActivePage(); }
-  catch (e) { setStatus('获取网页失败：' + e.message, 'err'); clearFuncMode(); return; }
+  catch (e) { setStatusError(e, '获取网页失败'); clearFuncMode(); return; }
   if (!page.text || !page.text.trim()) {
     setStatus('未能从当前网页提取到正文', 'err'); clearFuncMode(); return;
   }
@@ -2303,7 +2344,7 @@ async function runSummarizeInChat(instruction) {
   } catch (e) {
     a.stopTyping();
     a.setText(acc ? acc + '\n\n[中断] ' + e.message : '错误：' + e.message);
-    setStatus('错误：' + e.message, 'err');
+    setStatusError(e);
   } finally {
     streaming = false; updateSendState(); scrollBottom();
     // 发送消息（或手动关闭）后功能标签消失；总结现已改为“手动发送”，故发送后清除标签
@@ -2353,7 +2394,7 @@ async function runWebToPpt(templateId = 'classic-blue') {
     setStatus('');
   } catch (e) {
     done('❌ 错误：' + e.message);
-    setStatus('错误：' + e.message, 'err');
+    setStatusError(e);
   } finally {
     streaming = false; updateSendState(); scrollBottom();
     clearFuncMode();
@@ -2409,8 +2450,8 @@ async function runWebSearchInChat(query) {
     if (!results.length) throw new Error('未获取到搜索结果');
   } catch (e) {
     a.stopTyping();
-    a.setText('联网搜索失败：' + e.message);
-    setStatus('联网搜索失败：' + e.message, 'err');
+    a.setText('联网搜索失败：' + formatErrorLine(e));
+    setStatusError(e, '联网搜索失败');
     streaming = false; updateSendState(); scrollBottom();
     persistActiveConversation();
     return;
@@ -2475,7 +2516,7 @@ async function runWebSearchInChat(query) {
   } catch (e) {
     a.stopTyping();
     a.setText(acc ? acc + '\n\n[中断] ' + e.message : '错误：' + e.message);
-    setStatus('错误：' + e.message, 'err');
+    setStatusError(e);
   } finally {
     streaming = false; updateSendState(); scrollBottom();
     persistActiveConversation();
@@ -2599,8 +2640,8 @@ async function routeMultimodalTask(task, prompt) {
     setStatus('');
   } catch (e) {
     a.stopTyping();
-    a.setText('多模态生成失败：' + e.message);
-    setStatus('多模态生成失败：' + e.message, 'err');
+    a.setText('多模态生成失败：' + formatErrorLine(e));
+    setStatusError(e, '多模态生成失败');
   } finally {
     // 清理 blob URL 避免内存泄漏
     if (blobUrlToRevoke) {

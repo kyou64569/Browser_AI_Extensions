@@ -274,6 +274,36 @@ body {
 .status-bar.ok { color: var(--ok); }
 .status-bar.warn { color: #b7791f; }
 
+/* 错误态：主文案 + 弱化建议 + 可折叠的技术细节 */
+.status-bar.status-error { line-height: 1.6; }
+.status-hint { color: var(--muted); }
+.status-detail {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.status-detail > summary {
+  cursor: pointer;
+  list-style: none;
+  display: inline-block;
+  opacity: .8;
+  user-select: none;
+}
+.status-detail > summary::before { content: '▸ '; }
+.status-detail[open] > summary::before { content: '▾ '; }
+.status-detail > summary::-webkit-details-marker { display: none; }
+.status-detail > div {
+  margin-top: 2px;
+  padding: 5px 7px;
+  border-radius: 6px;
+  background: var(--panel-2);
+  max-height: 96px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
 /* 输入区：更大的聊天框 */
 .composer {
   flex: 0 0 auto;
