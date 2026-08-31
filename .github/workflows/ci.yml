@@ -1,0 +1,21 @@
+# CI：push / PR 时自动跑 lint + test，防回归。
+# 测试用 Node 内置 runner（node --test），无需额外依赖。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
