@@ -547,6 +547,10 @@ body {
 .send-btn:hover { filter: brightness(1.08); }
 /* 空内容时置灰且不可点击 */
 .send-btn:disabled { background: var(--panel-2); color: var(--muted); opacity: 1; cursor: not-allowed; filter: none; }
+/* 流式生成中：发送按钮切换为"停止"形态（红色方块，点击中止） */
+.send-btn.stopping { background: #e5484d; }
+.send-btn.stopping svg { display: none; }
+.send-btn.stopping::after { content: '■'; font-size: 13px; line-height: 1; }
 
 /* ---------- 功能 / 设置 页面 ---------- */
 .page {

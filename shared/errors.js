@@ -16,6 +16,7 @@ export const ERROR_KIND = {
   RATE_LIMIT: 'rate_limit',     // 429 限流 / 配额用尽
   SERVER: 'server',             // 5xx 服务侧故障
   TIMEOUT: 'timeout',           // 请求超时
+  ABORTED: 'aborted',           // 用户主动停止（不是故障）
   NETWORK: 'network',           // 连不上（DNS/代理/CORS/apiBase 配错）
   BAD_REQUEST: 'bad_request',   // 400 类：参数或音频格式问题
   UNKNOWN: 'unknown',
@@ -42,6 +43,10 @@ const MESSAGES = {
   [ERROR_KIND.TIMEOUT]: {
     title: '请求超时',
     hint: '请检查网络，或到设置里把该模型的超时时间调大一些。',
+  },
+  [ERROR_KIND.ABORTED]: {
+    title: '已停止生成',
+    hint: '',
   },
   [ERROR_KIND.NETWORK]: {
     title: '无法连接到模型服务',
@@ -71,6 +76,7 @@ export function classifyError(e) {
   const kind = (e && e.kind) ? String(e.kind) : '';
 
   // 1) 结构化信息优先
+  if (kind === 'aborted') return ERROR_KIND.ABORTED;
   if (kind === 'auth' || status === 401 || status === 403) return ERROR_KIND.AUTH;
   if (kind === 'rate_limit' || status === 429) return ERROR_KIND.RATE_LIMIT;
   if (kind === 'server' || (status >= 500 && status < 600)) return ERROR_KIND.SERVER;

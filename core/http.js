@@ -4,7 +4,8 @@
 
 /**
  * 把响应归类为可识别的错误类型，供 fallback 机制判断是否可重试。
- * @typedef {'timeout'|'auth'|'rate_limit'|'server'|'network'|'unknown'} HttpErrorKind
+ * aborted 表示"调用方主动中止"（用户点停止），不属于故障，fallback 不应重试。
+ * @typedef {'timeout'|'aborted'|'auth'|'rate_limit'|'server'|'network'|'unknown'} HttpErrorKind
  */
 export class HttpError extends Error {
   /**
@@ -57,6 +58,11 @@ export async function fetchWithTimeout(url, init = {}, timeoutMs = 0) {
   } catch (e) {
     if (e instanceof HttpError) throw e;
     if (e?.name === 'AbortError') {
+      // 区分两类中止：调用方主动停止（用户点"停止生成"）与内部超时看门狗。
+      // 混淆会把用户中止误报成"请求超时"。
+      if (init.signal && init.signal.aborted) {
+        throw new HttpError('aborted', '请求已被用户中止', 0);
+      }
       throw new HttpError('timeout', `请求超时（>${timeoutMs}ms）`, 0);
     }
     throw new HttpError('network', e?.message || 'network error', 0);

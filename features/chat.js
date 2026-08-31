@@ -33,11 +33,12 @@ function buildDemoReply(prompt) {
 }
 
 /** 本地模拟流式输出：保证未配置密钥时也能看到可运行的聊天效果 */
-async function* simulateStream(messages, errNote) {
+async function* simulateStream(messages, errNote, signal) {
   const prompt = messages.filter(m => m.role === 'user').pop()?.content || '';
   let reply = buildDemoReply(prompt);
   if (errNote) reply = `（本地演示 · 真实调用失败：${errNote}）\n\n` + reply;
   for (const ch of reply) {
+    if (signal && signal.aborted) throw new Error('已停止生成');
     await new Promise(r => setTimeout(r, 10));
     yield { delta: ch, model: '演示模式（本地）', index: 0 };
   }
@@ -143,7 +144,7 @@ export async function* chatStream(ctx, messages, opts = {}) {
   const models = (ctx.models || []).filter(Boolean);
   const hasAnyCred = models.some(hasCred);
   if (!models.length || !hasAnyCred) {
-    yield* simulateStream(messages);
+    yield* simulateStream(messages, undefined, opts.signal);
     return;
   }
 
@@ -184,7 +185,7 @@ export async function* chatStream(ctx, messages, opts = {}) {
     });
   } catch (e) {
     if (!hasCred(chatModel)) {
-      yield* simulateStream(messages, e.message);
+      yield* simulateStream(messages, e.message, opts.signal);
       return;
     }
     throw e;

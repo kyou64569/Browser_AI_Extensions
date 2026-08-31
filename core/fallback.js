@@ -75,6 +75,8 @@ export class FallbackManager {
         if (i > 0) this.onFallback(i, cfg, '自动降级');
         return { text, used, tried: i + 1 };
       } catch (e) {
+        // 用户主动中止：不属于模型故障，不记冷却、不降级，直接上抛
+        if (req && req.signal && req.signal.aborted) throw e;
         const reason = e instanceof HttpError ? `${e.kind}(${e.status})` : (e?.message || 'unknown error');
         this._recordFailure(cfg.id, reason);
         lastErr = e;
@@ -110,6 +112,8 @@ export class FallbackManager {
         if (i > 0) this.onFallback(i, cfg, '自动降级');
         return;
       } catch (e) {
+        // 用户主动中止：不属于模型故障，不记冷却、不降级，直接上抛
+        if (req && req.signal && req.signal.aborted) throw e;
         const reason = e instanceof HttpError ? `${e.kind}(${e.status})` : (e?.message || 'unknown error');
         this._recordFailure(cfg.id, reason);
         lastErr = e;

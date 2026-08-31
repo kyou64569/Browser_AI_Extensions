@@ -576,6 +576,7 @@ let attachments = [];       // 待发送附件 {name, type, content}
 let chatModelId = models[0]?.id || null;  // 当前聊天所选模型（'__collab__' 表示多模型协作）
 let thinkingStrength = 'off';             // 聊天界面“思考强度”下拉的当前选择
 let streaming = false;
+let activeAbort = null;     // 当前流式操作的中止控制器；非 null 时发送按钮切换为"停止"
 let activeMode = null;      // 当前激活的功能模式（null | {type:'summarize'|'translate'|'explain'|'ocr'|'file', label?:string}）
 let translateTarget = '';    // 翻译模式下的目标语言（空 = 未选择，翻译不可用）
 
@@ -948,8 +949,17 @@ function newAssistant() {
   };
 }
 
-// 发送按钮状态：输入框为空且无附件时置灰禁用，否则激活
+// 发送按钮状态：输入框为空且无附件时置灰禁用，否则激活。
+// 流式进行中且本次操作支持中止（activeAbort 非空）时，按钮切换为"停止生成"。
 function updateSendState() {
+  if (streaming && activeAbort) {
+    sendBtn.classList.add('stopping');
+    sendBtn.title = '停止生成';
+    sendBtn.disabled = false;
+    return;
+  }
+  sendBtn.classList.remove('stopping');
+  sendBtn.title = '发送';
   // 翻译模式：未选择目标语言则翻译不可用（禁用发送）
   if (activeMode && activeMode.type === 'translate') {
     sendBtn.disabled = !translateTarget || !input.value.trim() || streaming;
@@ -1177,7 +1187,9 @@ async function send() {
   const ts = (ref && ref.supportsThinking) ? thinkingStrength : undefined;
 
   const a = newAssistant();
-  streaming = true; sendBtn.disabled = true;
+  streaming = true;
+  activeAbort = new AbortController();   // 支持"停止生成"
+  updateSendState();
   // 知识库前缀：首个 token 到达时自动附加到回复顶部
   const kbPrefix = kbUsed ? '📚 基于知识库「' + activeKb.name + '」回答（检索到 ' + kbChunks.length + ' 条片段）：\n\n' : '';
   setStatus(funcMode === 'ocr' ? '正在识别图片中的文字…' : '思考中…');
@@ -1189,6 +1201,7 @@ async function send() {
       mode,
       selectedId: mode === 'single' ? chatModelId : undefined,
       thinkingStrength: ts,
+      signal: activeAbort.signal,
       onFallback: (i, cfg, reason) => setStatus(`已切换到备用模型 #${i + 1}：${cfg.name}（${reason}）`),
     })) {
       if (chunk.error === 'NO_PRIMARY') {
@@ -1270,9 +1283,20 @@ async function send() {
     setStatus('');
   } catch (e) {
     a.stopTyping();
-    a.setText(acc ? acc + '\n\n[中断] ' + e.message : '错误：' + e.message);
-    setStatusError(e);
+    if (activeAbort && activeAbort.signal.aborted) {
+      // 用户主动停止：保留已生成的部分并写入历史（下轮可继续追问）
+      a.setText(acc ? acc + '\n\n（已停止）' : '（已停止，未收到回复内容）');
+      setStatus('已停止生成');
+      if (acc) {
+        messages.push(userMsg);
+        messages.push({ role: 'assistant', content: acc });
+      }
+    } else {
+      a.setText(acc ? acc + '\n\n[中断] ' + e.message : '错误：' + e.message);
+      setStatusError(e);
+    }
   } finally {
+    activeAbort = null;
     streaming = false; updateSendState(); scrollBottom();
     // 发送消息后功能标签消失（翻译 / 解释 / 文件模式在此清除；总结网页为即时执行，
     // 标签在其执行期间保留，直至用户发送下一条消息或手动关闭）
@@ -1281,9 +1305,14 @@ async function send() {
   }
 }
 
-$('#composer').addEventListener('submit', (e) => { e.preventDefault(); send(); });
+$('#composer').addEventListener('submit', (e) => {
+  e.preventDefault();
+  // 流式进行中：按钮已是"停止"形态，点击 = 中止当前生成（Enter 不触发停止，避免误按）
+  if (streaming && activeAbort) { activeAbort.abort(); return; }
+  send();
+});
 input.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (!streaming) send(); }
 });
 
 // ============================================================
@@ -1334,7 +1363,7 @@ async function consultCollaborators(collaborators, observation, models, backupMo
         { role: 'user', content: observation },
       ];
       let text = '';
-      for await (const chunk of chatStream({ models, backupModels }, msgs, { mode: 'single', selectedId: m.id })) {
+      for await (const chunk of chatStream({ models, backupModels }, msgs, { mode: 'single', selectedId: m.id, signal: activeAbort?.signal })) {
         if (chunk.delta) text += chunk.delta;
       }
       text = (text || '').trim();
@@ -1483,7 +1512,9 @@ async function runAutomation(userText) {
   let a = null;
   let acc = '';
   let pendingShot = null;   // 待回灌给「下一轮」模型的截图：仅发送一次，避免大图被每轮重复回灌导致 token 暴涨 / 触发模型 API 限流
-  streaming = true; sendBtn.disabled = true; setStatus('思考中…');
+  streaming = true;
+  activeAbort = new AbortController();   // 支持"停止生成"（中止当前轮模型调用；已派发的单次工具操作会先执行完）
+  updateSendState(); setStatus('思考中…');
   try {
     let iter = 0;
     let finished = false;
@@ -1516,6 +1547,7 @@ async function runAutomation(userText) {
         mode: autoMode,
         selectedId: autoSelectedId,
         thinkingStrength: ts,
+        signal: activeAbort.signal,
         onFallback: (i, cfg, reason) => setStatus(`已切换到备用模型 #${i + 1}：${cfg.name}（${reason}）`),
       })) {
         if (chunk.error === 'NO_PRIMARY') {
@@ -1649,12 +1681,22 @@ async function runAutomation(userText) {
       setStatus('已达上限，任务未完成', 'warn');
     }
   } catch (e) {
-    if (a) {
-      a.stopTyping();
-      a.setText(acc ? acc + '\n\n[中断] ' + e.message : '错误：' + e.message);
+    if (activeAbort && activeAbort.signal.aborted) {
+      // 用户主动停止：ReAct 循环中途不写历史（半截工具调用上下文不完整），仅展示已生成内容
+      if (a) {
+        a.stopTyping();
+        a.setText(acc ? acc + '\n\n（已停止）' : '（已停止）');
+      }
+      setStatus('已停止任务');
+    } else {
+      if (a) {
+        a.stopTyping();
+        a.setText(acc ? acc + '\n\n[中断] ' + e.message : '错误：' + e.message);
+      }
+      setStatusError(e);
     }
-    setStatusError(e);
   } finally {
+    activeAbort = null;
     streaming = false; updateSendState(); scrollBottom();
     clearFuncMode();
     persistActiveConversation();
@@ -2323,6 +2365,8 @@ async function runSummarizeInChat(instruction) {
   }
   const sumRef = currentRefModel();
   const sumTs = (sumRef && sumRef.supportsThinking) ? thinkingStrength : undefined;
+  activeAbort = new AbortController();   // 支持"停止生成"
+  updateSendState();
   try {
     for await (const chunk of summarizeStream({ models: prepareModels() }, page, {
       kb: makeKb(),
@@ -2330,6 +2374,7 @@ async function runSummarizeInChat(instruction) {
       instruction: prompt,
       mode: sumMode,
       thinkingStrength: sumTs,
+      signal: activeAbort.signal,
       onFallback: (i, cfg, reason) => setStatus(`已切换到备用模型 #${i + 1}：${cfg.name}（${reason}）`),
     })) {
       if (!started) { started = true; a.stopTyping(); setStatus('正在回复…'); }
@@ -2343,9 +2388,20 @@ async function runSummarizeInChat(instruction) {
     setStatus('');
   } catch (e) {
     a.stopTyping();
-    a.setText(acc ? acc + '\n\n[中断] ' + e.message : '错误：' + e.message);
-    setStatusError(e);
+    if (activeAbort && activeAbort.signal.aborted) {
+      // 用户主动停止：保留已生成的部分并写入历史
+      a.setText(acc ? acc + '\n\n（已停止）' : '（已停止，未收到回复内容）');
+      setStatus('已停止生成');
+      if (acc) {
+        messages.push({ role: 'user', content: prompt });
+        messages.push({ role: 'assistant', content: acc });
+      }
+    } else {
+      a.setText(acc ? acc + '\n\n[中断] ' + e.message : '错误：' + e.message);
+      setStatusError(e);
+    }
   } finally {
+    activeAbort = null;
     streaming = false; updateSendState(); scrollBottom();
     // 发送消息（或手动关闭）后功能标签消失；总结现已改为“手动发送”，故发送后清除标签
     clearFuncMode();
@@ -2491,11 +2547,14 @@ async function runWebSearchInChat(query) {
 
   setStatus('正在整理搜索结果…');
   let acc = ''; let started = false;
+  activeAbort = new AbortController();   // 支持"停止生成"（搜索抓取阶段不支持，仅作答阶段可停）
+  updateSendState();
   try {
     for await (const chunk of chatStream({ models, backupModels }, apiMessages, {
       mode,
       selectedId: mode === 'single' ? chatModelId : undefined,
       thinkingStrength: ts,
+      signal: activeAbort.signal,
       onFallback: (i, cfg, reason) => setStatus(`已切换到备用模型 #${i + 1}：${cfg.name}（${reason}）`),
     })) {
       if (chunk.error === 'NO_PRIMARY') {
@@ -2515,9 +2574,20 @@ async function runWebSearchInChat(query) {
     setStatus('');
   } catch (e) {
     a.stopTyping();
-    a.setText(acc ? acc + '\n\n[中断] ' + e.message : '错误：' + e.message);
-    setStatusError(e);
+    if (activeAbort && activeAbort.signal.aborted) {
+      // 用户主动停止：保留已生成的部分并写入历史
+      a.setText(acc ? acc + '\n\n（已停止）' : '（已停止，未收到回复内容）');
+      setStatus('已停止生成');
+      if (acc) {
+        messages.push({ role: 'user', content: query });
+        messages.push({ role: 'assistant', content: acc });
+      }
+    } else {
+      a.setText(acc ? acc + '\n\n[中断] ' + e.message : '错误：' + e.message);
+      setStatusError(e);
+    }
   } finally {
+    activeAbort = null;
     streaming = false; updateSendState(); scrollBottom();
     persistActiveConversation();
   }
