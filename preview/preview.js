@@ -13,6 +13,7 @@ import { normalizeKbState, defaultKbState } from '../shared/storage.js';
 import { safeImageSrc } from '../shared/sanitize.js';
 import { describeError, formatErrorLine } from '../shared/errors.js';
 import { extractCodeBlocks, highlightCode } from '../shared/code-highlight.js';
+import { conversationToMarkdown, safeFilename } from '../shared/conv-export.js';
 import { KB_PROVIDERS, createKbConnector } from '../connectors/kb-registry.js';
 
 const $ = (s) => document.querySelector(s);
@@ -786,14 +787,27 @@ function deleteConversation(id) {
 }
 
 // 渲染会话列表
+let convSearchQuery = '';   // 会话列表搜索词（空 = 不过滤）
+
 function renderConversationList() {
   const list = $('#convList');
   if (!list) return;
+  const q = convSearchQuery.trim().toLowerCase();
+  // 搜索范围：标题 + 全部消息内容（大小写不敏感）
+  const shown = q
+    ? conversations.filter(c =>
+        (c.title || '').toLowerCase().includes(q)
+        || (c.messages || []).some(m => (m.content || '').toLowerCase().includes(q)))
+    : conversations;
   if (!conversations.length) {
     list.innerHTML = '<div class="conv-empty">暂无历史会话。<br/>在聊天中发送消息即可自动保存为历史会话。</div>';
     return;
   }
-  list.innerHTML = conversations.map(c => {
+  if (!shown.length) {
+    list.innerHTML = `<div class="conv-empty">没有匹配「${escapeHtml(convSearchQuery.trim())}」的会话。</div>`;
+    return;
+  }
+  list.innerHTML = shown.map(c => {
     const firstUser = (c.messages || []).find(m => m.role === 'user');
     const preview = (firstUser && firstUser.content ? firstUser.content : '').replace(/\s+/g, ' ').trim();
     const previewText = preview ? (preview.length > 42 ? preview.slice(0, 42) + '…' : preview) : '（空会话）';
@@ -807,19 +821,70 @@ function renderConversationList() {
         </div>
         <div class="conv-item-meta">
           <div class="conv-item-time">${time}</div>
-          <button type="button" class="icon-btn conv-del" data-del="${c.id}" title="删除会话">${ICON_TRASH}</button>
+          <div class="conv-item-acts">
+            <button type="button" class="icon-btn conv-export-md" data-md="${c.id}" title="导出为 Markdown">MD</button>
+            <button type="button" class="icon-btn conv-export-json" data-json="${c.id}" title="导出为 JSON">JSON</button>
+            <button type="button" class="icon-btn conv-del" data-del="${c.id}" title="删除会话">${ICON_TRASH}</button>
+          </div>
         </div>
       </div>`;
   }).join('');
   list.querySelectorAll('.conv-item').forEach(it => it.onclick = (e) => {
-    if (e.target.closest('.conv-del')) return;   // 删除按钮单独处理
+    if (e.target.closest('.conv-del') || e.target.closest('.conv-export-md') || e.target.closest('.conv-export-json')) return;
     loadConversation(it.dataset.id);
   });
   list.querySelectorAll('.conv-del').forEach(b => b.onclick = (e) => {
     e.stopPropagation();
     if (confirm('确定删除该会话？此操作不可恢复。')) deleteConversation(b.dataset.del);
   });
+  list.querySelectorAll('.conv-export-md').forEach(b => b.onclick = (e) => {
+    e.stopPropagation();
+    exportConversation(b.dataset.md, 'md');
+  });
+  list.querySelectorAll('.conv-export-json').forEach(b => b.onclick = (e) => {
+    e.stopPropagation();
+    exportConversation(b.dataset.json, 'json');
+  });
 }
+
+// ---------- 会话搜索 / 导出 ----------
+
+$('#convSearch').addEventListener('input', (e) => {
+  convSearchQuery = e.target.value || '';
+  renderConversationList();
+});
+
+/** 触发浏览器下载（扩展页面内 <a download> + Blob，无需额外权限） */
+function downloadText(filename, text, mime) {
+  const blob = new Blob([text], { type: (mime || 'text/plain') + ';charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+/** 导出单个会话（md = Markdown 存档；json = 结构化备份） */
+function exportConversation(id, fmt) {
+  const conv = conversations.find(c => c.id === id);
+  if (!conv) return;
+  const name = safeFilename(conv.title);
+  const date = new Date(conv.updatedAt || conv.createdAt || Date.now());
+  const day = `${date.getFullYear()}${String(date.getMonth() + 1).padStart(2, '0')}${String(date.getDate()).padStart(2, '0')}`;
+  if (fmt === 'md') {
+    downloadText(`会话-${name}-${day}.md`, conversationToMarkdown(conv), 'text/markdown');
+  } else {
+    downloadText(`会话-${name}-${day}.json`, JSON.stringify(conv, null, 2), 'application/json');
+  }
+}
+
+$('#exportAllConvBtn').onclick = () => {
+  if (!conversations.length) { setStatus('暂无可导出的会话', 'warn'); return; }
+  downloadText(`AI助手会话备份-${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(conversations, null, 2), 'application/json');
+};
 
 $('#newConvBtn').onclick = () => startNewChat();
 

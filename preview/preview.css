@@ -778,6 +778,24 @@ button.mini { padding: 4px 10px; font-size: 12px; }
 .app-bar-left { display: flex; align-items: center; gap: 8px; }
 .conv-header { display: flex; align-items: center; justify-content: space-between; margin: 2px 2px 14px; }
 .conv-list { display: flex; flex-direction: column; gap: 10px; }
+
+/* 会话工具栏：搜索框 + 导出全部 */
+.conv-toolbar { display: flex; gap: 8px; margin: 0 2px 12px; }
+.conv-toolbar input[type="search"] {
+  flex: 1; min-width: 0; padding: 7px 12px;
+  border: 1px solid var(--line); border-radius: 10px;
+  background: var(--panel-2); color: var(--text); font-size: 12.5px;
+  outline: none;
+}
+.conv-toolbar input[type="search"]:focus { border-color: var(--accent); }
+.conv-toolbar button {
+  flex: 0 0 auto; padding: 6px 12px; font-size: 12px;
+  border: 1px solid var(--line); border-radius: 10px;
+  background: var(--panel-2); color: var(--text); cursor: pointer;
+}
+.conv-toolbar button:hover { border-color: var(--accent); color: var(--accent); }
+.conv-item-acts { display: flex; gap: 4px; align-items: center; }
+.conv-export-md, .conv-export-json { font-size: 10px; font-weight: 600; letter-spacing: .02em; }
 .conv-item {
   display: flex; align-items: stretch; gap: 10px;
   padding: 12px;
