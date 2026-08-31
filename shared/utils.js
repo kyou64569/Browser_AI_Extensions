@@ -5,7 +5,7 @@
  * 清洗 API Base URL：去空白 / BOM / 行尾斜杠 / 已含路径后缀。
  * 防范因 copy-paste 带入的不可见字符（空格、BOM、换行等）导致 URL 编码后 HTTP 404；
  * 同时处理用户粘贴完整接口地址（如 .../v1/chat/completions）到 apiBase 的常见误用。
- * @param {string} raw
+ * @param {*} raw 任意输入；非字符串返回空串
  * @returns {string} 已清洗、去除尾部斜杠、不包含已知子路径的纯 Base URL
  */
 export function normalizeApiBase(raw) {
@@ -24,8 +24,8 @@ export function normalizeApiBase(raw) {
 }
 
 /**
- * 检查模型配置是否有有效凭证
- * @param {import('../core/model-config.js').ModelConfig} m
+ * 检查模型配置是否有有效凭证（容忍部分字段的配置对象，缺字段按无凭证处理）
+ * @param {{vendor?:string, apiKey?:string, [k:string]:any}} m
  * @returns {boolean}
  */
 export function hasCred(m) {
@@ -35,8 +35,8 @@ export function hasCred(m) {
 /**
  * 从模型配置中提取采样参数，作为 ChatRequest.options 透传给适配器。
  * 仅当字段为合法数值时才包含，避免把 undefined 发往 API（保持各厂商默认行为）。
- * @param {import('../core/model-config.js').ModelConfig} [m]
- * @returns {Record<string, number>}
+ * @param {Partial<import('../core/model-config.js').ModelConfig>} [m] 可为部分字段（函数逐字段容错判断）
+ * @returns {Record<string, any>} 仅含合法数值选项；thinkingStrength 为字符串档位
  */
 export function optionsFromModel(m = {}) {
   const o = {};

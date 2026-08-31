@@ -34,12 +34,12 @@ export class AnthropicAdapter extends ModelClient {
           // a.data 期望 data:image/png;base64,xxxx 或 http(s) url
           const m2 = a.data.match(/^data:(.+?);base64,(.+)$/);
           if (m2) {
-            content.push({
+            /** @type {any} */ (content).push({
               type: 'image',
               source: { type: 'base64', media_type: m2[1], data: m2[2] },
             });
           } else if (/^https?:\/\//.test(a.data)) {
-            content.push({ type: 'image', source: { type: 'url', url: a.data } });
+            /** @type {any} */ (content).push({ type: 'image', source: { type: 'url', url: a.data } });
           }
         }
         messages.push({ role: m.role, content });

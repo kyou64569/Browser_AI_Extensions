@@ -26,8 +26,7 @@ export class SkillLoader {
  */
 export class WebAutomator {
   /**
-   * @param {string} instruction
-   * @returns {Promise<import('./message.js').DomAction[]>} 模型返回的操作序列
+   * @returns {Promise<DomAction[]>} 模型返回的操作序列
    */
   // TODO: 读取 DOM -> 拼接 prompt -> 调用模型 -> 解析为 DomAction[]
   async plan() {

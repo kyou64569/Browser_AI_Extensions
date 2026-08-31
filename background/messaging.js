@@ -19,7 +19,7 @@
  *
  * @param {(ctx:{respond:(payload:object)=>void}) => Promise<object|void>} fn
  * @param {object} opts
- * @param {(e:Error)=>void} opts.sendResponse chrome 的回包函数
+ * @param {(payload:{ok?:boolean, error?:string, [k:string]:any})=>void} opts.sendResponse chrome 的回包函数
  * @param {number} opts.timeoutMs 兜底超时
  * @param {string} opts.label 超时/错误文案前缀，便于定位是哪个消息超时
  * @returns {true} 固定返回 true，供 onMessage 直接 return（表示异步回包）

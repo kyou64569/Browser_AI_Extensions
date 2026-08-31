@@ -30,7 +30,9 @@ function broadcast(type, payload) {
 
 /**
  * AGENT_RUN：规划-执行-反思循环。
- * @param {object} msg
+ * @param {{goal?:string, modelId?:string, maxSteps?:number, thinkingStrength?:string,
+ *          signal?:AbortSignal, context?:{pageInfo?:{title?:string,url?:string,text?:string},[k:string]:any},
+ *          template?:string, [k:string]:any}} msg
  * @param {{respond:(payload:object)=>void}} ctx
  */
 export function handleAgentRun(msg, { respond }) {
@@ -133,7 +135,7 @@ export function handleAgentAbort({ respond }) {
  * WORKFLOW_RUN：DAG 工作流引擎执行。
  * engine.globals 里的 api 对象向工作流节点暴露：extractMain / summarize / translate /
  * kbSearch / execTool / exportPpt。
- * @param {object} msg
+ * @param {{graph?:object, templateId?:string, input?:string, template?:string, [k:string]:any}} msg
  * @param {{respond:(payload:object)=>void}} ctx
  */
 export function handleWorkflowRun(msg, { respond }) {

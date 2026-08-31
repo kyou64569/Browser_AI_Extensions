@@ -9,7 +9,7 @@ import { fetchWithTimeout } from '../core/http.js';
 
 export class LocalKbConnector extends KnowledgeBaseConnector {
   /**
-   * @param {object} cfg { baseUrl, apiKey?, timeoutMs? }
+   * @param {{baseUrl?:string, apiKey?:string, timeoutMs?:number, searchPath?:string, healthPath?:string, sourcesPath?:string}} cfg
    *   baseUrl: 知识库服务根地址，如 http://localhost:8000
    */
   constructor(cfg = {}) {
@@ -97,8 +97,8 @@ export class LocalKbConnector extends KnowledgeBaseConnector {
   /**
    * 检索：GET /api/v1/search?q=&top_k=&knowledge_base=
    * @param {string} query
-   * @param {object} [opts] { topK, knowledgeBaseId }
-   * @returns {Promise<KbChunk[]>}
+   * @param {{topK?:number, knowledgeBaseId?:string}} [opts] { topK, knowledgeBaseId }
+   * @returns {Promise<import('./knowledge-base.js').KbChunk[]>}
    */
   async search(query, opts = {}) {
     if (!this.baseUrl) {

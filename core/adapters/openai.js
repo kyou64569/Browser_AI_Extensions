@@ -17,7 +17,7 @@ export class OpenAIAdapter extends ModelClient {
     return req.messages.map(m => {
       if (m.attachments && m.attachments.length) {
         // 多模态：content 变成 parts
-        const parts = [{ type: 'text', text: m.content }];
+        const parts = /** @type {Array<Object>} */ ([{ type: 'text', text: m.content }]);
         for (const a of m.attachments) {
           parts.push({
             type: 'image_url',

@@ -27,10 +27,11 @@ function base64ToBytes(b64) {
   return out;
 }
 
+/** @returns {Promise<{name?:string, palette?:any, layoutPhs?:any, raw?:Uint8Array}|null>} 存储的自定义模板原始数据 */
 async function loadCustomTemplate() {
   try {
     const r = await chrome.storage.local.get(PPT_CUSTOM_KEY);
-    return r[PPT_CUSTOM_KEY] || null;
+    return /** @type {any} */ (r[PPT_CUSTOM_KEY]) || null;
   } catch (_) { return null; }
 }
 
@@ -78,8 +79,8 @@ export async function getPptThemes() {
   const raw = await loadCustomTemplate();
   let customInfo = null;
   if (raw) {
-    const parsed = await reviveCustomTemplate(raw);
-    customInfo = {
+    const parsed = /** @type {any} */ (await reviveCustomTemplate(raw));
+    customInfo = /** @type {any} */ ({
       name: raw.name,
       palette: raw.palette,
       layoutPhs: raw.layoutPhs,
@@ -88,7 +89,7 @@ export async function getPptThemes() {
         hasBody: !!(l.phs && l.phs.body),
         hasTitle: !!(l.phs && l.phs.title),
       })),
-    };
+    });
   }
   return { ok: true, themes: PPT_THEMES, custom: customInfo };
 }
@@ -115,7 +116,7 @@ export async function importPptTemplate({ data, name }) {
   return {
     ok: true, name: stored.name, palette: parsed.palette, layoutPhs: parsed.layoutPhs,
     mediaCount: Object.keys(parsed.media).length,
-    layouts: (parsed.layouts || []).map(l => ({ num: l.num, type: l.type, name: l.layoutName, hasBody: !!(l.phs && l.phs.body) })),
+    layouts: (/** @type {any} */ (parsed).layouts || []).map(l => ({ num: l.num, type: l.type, name: l.layoutName, hasBody: !!(l.phs && l.phs.body) })),
   };
 }
 
@@ -140,7 +141,7 @@ function blobToDataUrl(blob) {
 
 /**
  * PPT_EXPORT：结构化大纲 JSON / markdown → .pptx 文件（dataURL 形式返回给侧边栏）。
- * @param {{outline?:object, markdown?:string, template?:string}} msg
+ * @param {{outline?:{title?:string, slides?:Array<any>}, markdown?:string, template?:string}} msg
  * @returns {Promise<{ok:true, dataUrl:string, filename:string}|{ok:false, error:string}>}
  */
 export async function exportPpt(msg = {}) {
@@ -159,7 +160,7 @@ export async function exportPpt(msg = {}) {
 
 /**
  * AUTOMATE 分支里的 export_ppt 工具：直接触发 chrome.downloads.download 下载。
- * @param {{title?:string, slides?:Array}} args
+ * @param {{title?:string, slides?:Array<any>, template?:string}} args
  */
 export async function exportPptForAutomate(args = {}) {
   try {

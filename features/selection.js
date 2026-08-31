@@ -28,7 +28,7 @@ const PROMPTS = {
  * @param {object} ctx { models }
  * @param {string} text
  * @param {SelectionAction} action
- * @param {object} [opts]
+ * @param {{thinkingStrength?:string, onFallback?:(i:number,cfg:object,reason:string)=>void, signal?:AbortSignal, [k:string]:any}} [opts]
  * @returns {Promise<{text:string, used:object, tried:number}>}
  */
 export async function processSelection(ctx, text, action, opts = {}) {

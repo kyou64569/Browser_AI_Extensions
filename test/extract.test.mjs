@@ -13,7 +13,7 @@ import { extractMainTextInPage, extractMainPageInPage } from '../shared/extract.
 
 /**
  * 极简 DOM 替身。
- * @param {{root?: 'article'|'main'|'body'|null, nodes: {tag:string, text:string}[]}} cfg
+ * @param {{root?: 'article'|'main'|'body'|null, nodes?: {tag:string, text:string}[], title?: string}} [cfg]
  */
 function makeDoc({ root = 'article', nodes = [], title = '测试页面标题' } = {}) {
   const mkClone = () => {

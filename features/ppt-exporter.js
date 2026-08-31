@@ -317,7 +317,7 @@ export async function parseTemplate(buffer) {
     if (!media[f.name]) media[f.name] = await reader.read(f);
   }
 
-  return {
+  return /** @type {any} */ ({
     theme, master, masterRels, themeRels,
     media, mediaExts: [...mediaExts],
     layouts, cover, content,
@@ -327,7 +327,7 @@ export async function parseTemplate(buffer) {
     layoutPhs: cover ? cover.phs : { title: { type: 'title', idx: null }, body: { type: 'body', idx: '1' } },
     palette: parsePalette(theme),
     sldSz: presentation ? parseSldSz(presentation) : null,
-  };
+  });
 }
 
 class Crc32 {
@@ -1121,7 +1121,8 @@ function buildAppProps(slideCount) {
  */
 export class PptExporter {
   /**
-   * @param {object} outline { title: string, slides: [{ heading, bullets: string[] }] }
+   * @param {{title?:string, slides?:Array<{heading?:string, bullets?:string[], layout?:string}>}} outline PPT 大纲
+   * @param {{template?:string, [k:string]:any}} [opts] 导出选项（可指定自定义模板）
    * @returns {Promise<Blob>} pptx 文件 Blob
    */
   async export(outline, opts = {}) {

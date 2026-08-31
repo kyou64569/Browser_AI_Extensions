@@ -12,6 +12,7 @@
  * @property {string} content 片段正文
  * @property {number} [score]  相关度（0~1），可选
  * @property {string} [source] 来源（文档名/URL），可选
+ * @property {string} [title]  文档标题（部分连接器提供），可选
  */
 
 /**

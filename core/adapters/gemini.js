@@ -38,8 +38,8 @@ export class GeminiAdapter extends ModelClient {
       if (m.attachments && m.attachments.length) {
         for (const a of m.attachments) {
           const m2 = a.data.match(/^data:(.+?);base64,(.+)$/);
-          if (m2) parts.push({ inlineData: { mimeType: m2[1], data: m2[2] } });
-          else if (/^https?:\/\//.test(a.data)) parts.push({ fileData: { fileUri: a.data } });
+          if (m2) /** @type {any} */ (parts).push({ inlineData: { mimeType: m2[1], data: m2[2] } });
+          else if (/^https?:\/\//.test(a.data)) /** @type {any} */ (parts).push({ fileData: { fileUri: a.data } });
         }
       }
       contents.push({ role, parts });

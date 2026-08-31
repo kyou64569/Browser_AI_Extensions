@@ -9,11 +9,13 @@ const KEYS = {
   SETTINGS: 'settings',    // 杂项
 };
 
+/** 读取全部模型配置（ModelConfig[]，结构见 core/model-config.js） */
 export async function getModels() {
   const r = await chrome.storage.local.get(KEYS.MODELS);
-  return r[KEYS.MODELS] || [];
+  return /** @type {import('../core/model-config.js').ModelConfig[]} */ (r[KEYS.MODELS]) || [];
 }
 
+/** 保存全部模型配置 */
 export async function saveModels(models) {
   await chrome.storage.local.set({ [KEYS.MODELS]: models });
 }
@@ -83,7 +85,7 @@ export async function getKbConfig() {
  */
 export async function getWhisperModels() {
   const r = await chrome.storage.local.get(KEYS.WHISPER);
-  return r[KEYS.WHISPER] || [];
+  return /** @type {any[]} */ (r[KEYS.WHISPER]) || [];
 }
 
 /**
@@ -92,7 +94,7 @@ export async function getWhisperModels() {
  */
 export async function getMultimodalModels() {
   const r = await chrome.storage.local.get(KEYS.MULTIMODAL);
-  return r[KEYS.MULTIMODAL] || [];
+  return /** @type {any[]} */ (r[KEYS.MULTIMODAL]) || [];
 }
 
 /**

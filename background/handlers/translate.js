@@ -203,7 +203,7 @@ async function translateChunkWithRetry(client, baseOptions, units, targetLang, o
 
 /**
  * 批量翻译文本段。
- * @param {object} model 模型配置
+ * @param {import('../../core/model-config.js').ModelConfig} model 模型配置
  * @param {string[]} texts 原文数组
  * @param {string} targetLang 目标语言
  * @param {object} [opts]
@@ -226,7 +226,7 @@ export async function translateSegments(model, texts, targetLang, opts = {}) {
 
   // 翻译专用参数：temperature 强制调低（不读取模型配置），其余采样参数沿用配置。
   // 注意：故意不读模型配置的 maxTokens —— 弱模型若未配置会落到厂商默认的小值，已用动态估算替代。
-  const baseOptions = { ...optionsFromModel(model), temperature: TRANSLATE_TEMPERATURE };
+  const baseOptions = /** @type {Record<string, any>} */ ({ ...optionsFromModel(model), temperature: TRANSLATE_TEMPERATURE });
   // 翻译是确定性任务，强制关闭"思考/推理"：推理模型的 CoT token 同样计入 TPM，
   // 会瞬间吃光低配额模型额度 → 大量 429。关闭后既省 token 又不影响翻译速度。
   delete baseOptions.thinkingStrength;
@@ -275,7 +275,7 @@ export async function translateSegments(model, texts, targetLang, opts = {}) {
 
   if (onProgress) onProgress({ phase: 'start', done: 0, total: totalUnits, message: '准备翻译…', indeterminate: true });
 
-  await new Promise((resolve) => {
+  await /** @type {Promise<void>} */ (new Promise((resolve) => {
     const pump = () => {
       while (activeCount < currentMax && nextIdx < total) {
         const idx = nextIdx++;
@@ -335,7 +335,7 @@ export async function translateSegments(model, texts, targetLang, opts = {}) {
     }
 
     pump();
-  });
+  }));
 
   if (onProgress) onProgress({ phase: 'done', done: totalUnits, total: totalUnits, message: '翻译完成' });
 

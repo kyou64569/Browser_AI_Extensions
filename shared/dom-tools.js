@@ -145,7 +145,7 @@ export async function pageTool(tool, args) {
         return { count: els.length, text: texts.join('\n---\n') };
       }
       const root = document.querySelector('article') || document.querySelector('main') || document.body;
-      const clone = root.cloneNode(true);
+      const clone = /** @type {HTMLElement} */ (root.cloneNode(true));
       clone.querySelectorAll('script,style,noscript,nav,header,footer,aside').forEach(e => e.remove());
       return { count: 1, text: (clone.innerText || clone.textContent || '').replace(/\s+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim() };
     },
@@ -178,7 +178,7 @@ export async function pageTool(tool, args) {
         try { Object.defineProperty(ev, 'keyCode', { get: () => kc }); Object.defineProperty(ev, 'which', { get: () => kc }); } catch (_) {}
         el.dispatchEvent(ev);
       };
-      try { el.focus(); } catch (_) {}
+      try { /** @type {HTMLElement} */ (el).focus(); } catch (_) {}
       fire('keydown'); fire('keypress'); fire('keyup');
       return { key, code, modifiers: mods, target: el.tagName || 'body' };
     },

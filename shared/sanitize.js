@@ -45,7 +45,7 @@ function safeCodePoint(n) {
  * 重新变成完整标签，一旦下游改用 innerHTML 注入即被利用。
  * 因此这里迭代到稳定（最多 3 轮），最后把残留的标签起始符降级为全角，彻底断根。
  *
- * @param {string} s
+ * @param {*} s 任意输入；非字符串按 String() 容错处理
  * @returns {string} 纯文本；保证不含可执行的标签结构
  */
 export function stripHtmlText(s) {

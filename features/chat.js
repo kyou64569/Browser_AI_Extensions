@@ -12,18 +12,6 @@ import { FallbackManager } from '../core/fallback.js';
 import { createClient } from '../core/model-client.js';
 import { hasCred, optionsFromModel } from '../shared/utils.js';
 
-/**
- * 流式聊天。
- * @param {object} ctx { models } 全部已配置模型（用于发现视觉模型、主模型）
- * @param {import('../core/message.js').Message[]} messages 完整对话历史（user 消息可带 attachments）
- * @param {object} [opts]
- * @param {'single'|'collab'} [opts.mode] 单模型 / 多模型协作
- * @param {string} [opts.selectedId] 单模型模式下所选模型 id（不传则用 models[0]）
- * @param {string} [opts.thinkingStrength] 聊天所选模型的思考强度（覆盖模型配置）
- * @param {(i:number,cfg:object,reason:string)=>void} [opts.onFallback] UI 提示回调
- * @param {AbortSignal} [opts.signal]
- * @yields {{delta:string, model?:string, index?:number, error?:string}}
- */
 function buildDemoReply(prompt) {
   const p = (prompt || '').trim();
   if (!p) {
@@ -32,7 +20,9 @@ function buildDemoReply(prompt) {
   return `（演示模式）你问的是：“${p.slice(0, 80)}”。\n\n这是一个由本地代码生成的示例回复，用于演示侧边栏的流式输出与紧凑布局。\n\n要在真实模型下运行，请点右上角「设置」添加模型：推荐使用 OpenRouter 或本地 Ollama——二者都支持浏览器直连，无需本地代理。`;
 }
 
-/** 本地模拟流式输出：保证未配置密钥时也能看到可运行的聊天效果 */
+/**
+ * 本地模拟流式输出：保证未配置密钥时也能看到可运行的聊天效果
+ */
 async function* simulateStream(messages, errNote, signal) {
   const prompt = messages.filter(m => m.role === 'user').pop()?.content || '';
   let reply = buildDemoReply(prompt);
@@ -109,8 +99,11 @@ function buildSynthesis(messages, results) {
   return base;
 }
 
-/** 多模型协作：子模型各自非流式回答，主模型收集整合后流式输出。 */
-async function* collabStream({ models, primary, visionModel, thinkingStrength, messages, opts }) {
+/** 多模型协作：子模型各自非流式回答，主模型收集整合后流式输出。
+ * @param {{models:import('../core/model-config.js').ModelConfig[], primary:import('../core/model-config.js').ModelConfig, visionModel?:import('../core/model-config.js').ModelConfig, thinkingStrength?:string, messages:import('../core/message.js').Message[], opts:{signal?:AbortSignal, thinkingStrength?:string, [k:string]:any}}} args
+ */
+async function* collabStream(args) {
+  const { models, primary, visionModel, thinkingStrength, messages, opts } = args;
   const subs = models.filter(m => m !== primary && m.enabled !== false);
   const subResults = [];
   for (const m of subs) {
@@ -140,6 +133,18 @@ async function* collabStream({ models, primary, visionModel, thinkingStrength, m
   }
 }
 
+/**
+ * 流式聊天。
+ * @param {{models?:Array<import('../core/model-config.js').ModelConfig>, backupModels?:Array<import('../core/model-config.js').ModelConfig>, [k:string]:any}} ctx 已配置模型（用于发现视觉模型、主模型）+ 可选备用模型
+ * @param {import('../core/message.js').Message[]} messages 完整对话历史（user 消息可带 attachments）
+ * @param {object} [opts]
+ * @param {'single'|'collab'} [opts.mode] 单模型 / 多模型协作
+ * @param {string} [opts.selectedId] 单模型模式下所选模型 id（不传则用 models[0]）
+ * @param {string} [opts.thinkingStrength] 聊天所选模型的思考强度（覆盖模型配置）
+ * @param {(i:number,cfg:object,reason:string)=>void} [opts.onFallback] UI 提示回调
+ * @param {AbortSignal} [opts.signal]
+ * @yields {{delta:string, model?:string, index?:number, error?:string}}
+ */
 export async function* chatStream(ctx, messages, opts = {}) {
   const models = (ctx.models || []).filter(Boolean);
   const hasAnyCred = models.some(hasCred);
@@ -194,12 +199,15 @@ export async function* chatStream(ctx, messages, opts = {}) {
 
 /**
  * 非流式聊天（一次性返回全文）。透传 chatStream 收集增量，便于上层统一处理模式/视觉/协作。
+ * @param {{models?:Array<import('../core/model-config.js').ModelConfig>, backupModels?:Array<import('../core/model-config.js').ModelConfig>, [k:string]:any}} ctx
+ * @param {import('../core/message.js').Message[]} messages
+ * @param {object} [opts]
  * @returns {Promise<{text:string, used:object, tried:number}>}
  */
 export async function chatOnce(ctx, messages, opts = {}) {
   let text = '';
   let used = { name: '演示模式（本地）' };
-  for await (const c of chatStream(ctx, messages, opts)) {
+  for await (const c of /** @type {AsyncGenerator<{delta?:string, model?:string, error?:string}>} */ (chatStream(ctx, messages, opts))) {
     if (c.error === 'NO_PRIMARY') throw new Error('NO_PRIMARY');
     text += c.delta || '';
     if (c.model) used = { name: c.model };

@@ -7,6 +7,24 @@
 // tool 消息为自动化 Agent 的工具调用记录 {name, args, ok, summary?, error?}。
 
 /**
+ * 会话消息（与 preview.js 持久化格式对齐）
+ * @typedef {Object} ConvMessage
+ * @property {string} role         'user' | 'assistant'
+ * @property {string} [content]    文本内容（tool 消息可为空）
+ * @property {{name?:string, args?:Object, ok?:boolean, summary?:string, error?:string}} [tool] 工具调用记录
+ */
+
+/**
+ * 会话对象（与 preview.js 持久化格式对齐）
+ * @typedef {Object} Conversation
+ * @property {string} [id]
+ * @property {string} [title]
+ * @property {number|string} [createdAt] 创建时间（时间戳或 ISO 字符串）
+ * @property {number|string} [updatedAt] 更新时间（时间戳或 ISO 字符串）
+ * @property {ConvMessage[]} [messages]
+ */
+
+/**
  * 生成文件名安全的一段文本：去掉文件系统非法字符与首尾空白。
  * @param {string} s
  * @returns {string}
@@ -21,7 +39,7 @@ export function safeFilename(s) {
 
 /**
  * 把单条消息渲染为 Markdown 行数组。
- * @param {{role:string, content?:string, tool?:object}} m
+ * @param {ConvMessage} m
  * @returns {string[]}
  */
 function messageToLines(m) {
@@ -37,7 +55,7 @@ function messageToLines(m) {
 
 /**
  * 会话 -> Markdown 文本。
- * @param {object} conv 会话对象（可为空字段，函数需健壮）
+ * @param {Conversation|null} conv 会话对象（可为空字段，函数需健壮）
  * @param {object} [opts]
  * @param {Date|number|string} [opts.exportedAt] 导出时间（默认取当前时间）
  * @returns {string}

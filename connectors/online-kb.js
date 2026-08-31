@@ -47,8 +47,10 @@ async function inflateBytes(buf, fmt) {
   // 守卫：Node/部分环境里解压失败会以未捕获的 'error' 事件抛出，
   // 这里把它转成 Promise 拒绝，避免进程崩溃（浏览器中 read() 通常直接 reject）。
   let streamErr = null;
-  if (typeof ds.readable.on === 'function') {
-    ds.readable.on('error', (e) => { streamErr = e || new Error('inflate error'); });
+  // Node 的 ReadableStream 没有 .on()，浏览器才有；防御性判断后按任意对象处理
+  const readableWithOn = /** @type {any} */ (ds.readable);
+  if (typeof readableWithOn.on === 'function') {
+    readableWithOn.on('error', (e) => { streamErr = e || new Error('inflate error'); });
   }
   const writer = ds.writable.getWriter();
   const reader = ds.readable.getReader();
@@ -217,7 +219,7 @@ function deriveRecallQueries(titles, originalQuery) {
 
 export class OnlineKbConnector extends KnowledgeBaseConnector {
   /**
-   * @param {object} cfg { provider:'ima', clientId, apiKey, knowledgeBaseId? }
+   * @param {{provider?:string, clientId?:string, apiKey?:string, knowledgeBaseId?:string, timeoutMs?:number}} cfg ima OpenAPI 连接配置
    */
   constructor(cfg = {}) {
     super();
@@ -303,8 +305,8 @@ export class OnlineKbConnector extends KnowledgeBaseConnector {
   /**
    * 检索指定知识库（游标分页聚合，最多取 limit 条去重结果）。
    * @param {string} query
-   * @param {object} [opts] { knowledgeBaseId, limit }
-   * @returns {Promise<KbChunk[]>}
+   * @param {{knowledgeBaseId?:string, limit?:number}} [opts]
+   * @returns {Promise<import('./knowledge-base.js').KbChunk[]>}
    */
   async search(query, opts = {}) {
     const kbId = (opts && opts.knowledgeBaseId) || this.cfg.knowledgeBaseId;
@@ -626,8 +628,11 @@ export class OnlineKbConnector extends KnowledgeBaseConnector {
   /**
    * 写入知识库（ima 暂无稳定的公开写入接口，待调研）。
    * 保持与基类同一契约，未来接入 import_doc 等接口即可启用。
+   * @param {string} content
+   * @param {Object} [meta]
+   * @returns {Promise<boolean>}
    */
-  async add() {
+  async add(content, meta) {
     throw new Error('[online-kb] ima 暂不支持从插件直接写入知识库');
   }
 }

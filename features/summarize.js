@@ -11,14 +11,6 @@ import { hasCred, optionsFromModel } from '../shared/utils.js';
 import { chatStream } from './chat.js';
 
 /**
- * 生成总结 prompt
- * @param {string} title
- * @param {string} text
- * @param {import('../connectors/knowledge-base.js').KbChunk[]} kbChunks
- * @param {string} [instruction] 用户额外指令（如“用一句话概括”），为空时默认“请总结要点”
- * @returns {import('../core/message.js').Message[]}
- */
-/**
  * 取知识库片段的可读来源标签（优先 source/title，缺失则回退为内容片段）。
  * 部分连接器（如本地知识库）可能不返回 source，此时用内容前若干字兜底，保证来源可见。
  * @param {import('../connectors/knowledge-base.js').KbChunk} chunk
@@ -52,6 +44,15 @@ export function buildKbSourcesFooter(chunks, kbName = '') {
     '\n\n（回答中的 [N] 对应上述编号；未标注 [N] 的内容可能来自模型自身知识，而非知识库。）';
 }
 
+/**
+ * 组装总结 prompt（system + user 两条消息）。
+ * @param {string} title
+ * @param {string} text
+ * @param {import('../connectors/knowledge-base.js').KbChunk[]} [kbChunks]
+ * @param {string} [instruction] 用户额外指令（如“用一句话概括”），为空时默认“请总结要点”
+ * @param {string} [kbName]
+ * @returns {import('../core/message.js').Message[]}
+ */
 function buildMessages(title, text, kbChunks = [], instruction = '', kbName = '') {
   let sys = '你是一个网页内容总结助手，用中文输出结构清晰、要点明确的总结。';
   let user = `网页标题：${title}\n\n正文：\n${text.slice(0, 12000)}`;
@@ -71,14 +72,17 @@ function buildMessages(title, text, kbChunks = [], instruction = '', kbName = ''
 }
 
 /**
- * 执行网页总结
+ * 执行网页总结（非流式）。
  * @param {object} ctx
- * @param {import('./model-config.js').ModelConfig[]} ctx.models
- * @param {object} page { title, text }
+ * @param {import('../core/model-config.js').ModelConfig[]} ctx.models
+ * @param {{title?: string, text?: string}} page 网页标题与正文
  * @param {object} [opts]
  * @param {import('../connectors/knowledge-base.js').KnowledgeBaseConnector} [opts.kb] 可选知识库
  * @param {(i:number,cfg:object,reason:string)=>void} [opts.onFallback] UI 提示
  * @param {boolean} [opts.stream]
+ * @param {string} [opts.instruction] 用户额外指令
+ * @param {string} [opts.kbName] 知识库名称（用于来源区块）
+ * @param {AbortSignal} [opts.signal] 取消信号
  * @returns {Promise<{text:string, used:object, tried:number}>}
  */
 export async function summarizePage(ctx, page, opts = {}) {
@@ -109,7 +113,7 @@ export async function summarizePage(ctx, page, opts = {}) {
 /**
  * 本地抽取式总结（未配置模型密钥时的兜底）：从「当前网页」真实正文中挑选代表性句子作为要点。
  * 关键点：内容完全来自用户实际访问的网页正文，绝非代码中预设的示例文本。
- * @param {object} page { title, text }
+ * @param {{title?: string, text?: string}} page { title, text }
  * @param {string} [instruction] 用户额外指令
  * @returns {string}
  */
@@ -156,11 +160,15 @@ async function* simulateSummaryStream(page, instruction = '') {
 /**
  * 流式执行网页总结（供聊天界面内联展示）。
  * @param {object} ctx
- * @param {import('./model-config.js').ModelConfig[]} ctx.models
- * @param {object} page { title, text }
+ * @param {import('../core/model-config.js').ModelConfig[]} ctx.models
+ * @param {{title?: string, text?: string}} page 网页标题与正文
  * @param {object} [opts]
  * @param {string} [opts.instruction] 用户额外指令
  * @param {import('../connectors/knowledge-base.js').KnowledgeBaseConnector} [opts.kb]
+ * @param {string} [opts.kbName] 知识库名称（用于来源区块）
+ * @param {'single'|'collab'} [opts.mode] 单模型 / 多模型协作
+ * @param {string} [opts.modelId] 指定模型 id（优先于路由选择）
+ * @param {string} [opts.thinkingStrength] 思考强度
  * @param {(i:number,cfg:object,reason:string)=>void} [opts.onFallback]
  * @param {AbortSignal} [opts.signal]
  * @yields {{delta:string, model?:string, index?:number}}

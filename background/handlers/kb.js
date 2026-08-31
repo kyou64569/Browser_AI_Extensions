@@ -55,7 +55,7 @@ function scheduleKbListCachePersist() {
 
 /**
  * KB_TEST / KB_LIST / KB_SEARCH 统一入口。
- * @param {object} msg
+ * @param {{type?:string, provider?:string, query?:string, knowledgeBaseId?:string, topK?:number, [k:string]:any}} msg
  * @param {{respond:(payload:object)=>void}} ctx
  */
 export function handleKbMessage(msg, { respond }) {

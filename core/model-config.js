@@ -23,6 +23,9 @@
  * @property {string}  [thinkingStrength] 思考强度：'off'|'low'|'medium'|'high'（默认 'off'）
  * @property {boolean} [reasoningEffortSupported] OpenAI 兼容厂商专用：模型是否接受 reasoning_effort 参数（o1/o3 等推理模型）。
  *   仅当此标志为真时，openai/ollama 适配器才会发送 reasoning_effort；普通模型（gpt-4o 等）置 false 以避免 HTTP 400。
+ * @property {number}  [temperature] 采样温度（可选，透传厂商 API）
+ * @property {number}  [top_p] 核采样阈值（可选，透传厂商 API）
+ * @property {number}  [maxTokens] 单次回复最大 token 数（可选，透传厂商 API）
  * @property {number}  [tpm] 翻译限速用：该模型每分钟 Token 上限（TPM）。留空则由限流器用宽松默认 + 429 自适应学习。
  * @property {number}  [rpm] 翻译限速用：该模型每分钟请求数上限（RPM）。留空同上。
  */

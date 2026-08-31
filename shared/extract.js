@@ -18,7 +18,7 @@ export function extractMainTextInPage() {
     document.querySelector('main') ||
     document.body;
   if (!root) return '';
-  const clone = root.cloneNode(true);
+  const clone = /** @type {HTMLElement} */ (root.cloneNode(true));
   clone.querySelectorAll('script,style,noscript,nav,header,footer,aside').forEach(e => e.remove());
   return (clone.innerText || clone.textContent || '')
     .replace(/\s+\n/g, '\n')
@@ -38,7 +38,7 @@ export function extractMainPageInPage() {
     document.body;
   let text = '';
   if (root) {
-    const clone = root.cloneNode(true);
+    const clone = /** @type {HTMLElement} */ (root.cloneNode(true));
     clone.querySelectorAll('script,style,noscript,nav,header,footer,aside').forEach(e => e.remove());
     text = (clone.innerText || clone.textContent || '')
       .replace(/\s+\n/g, '\n')

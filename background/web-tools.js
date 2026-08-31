@@ -23,7 +23,7 @@ async function loadNavApprovals() {
   _navApprovedLoaded = true;
   try {
     const r = await chrome.storage.session.get(NAV_APPROVE_KEY);
-    for (const h of r[NAV_APPROVE_KEY] || []) _navApproved.add(String(h));
+    for (const h of /** @type {any[]} */ (r[NAV_APPROVE_KEY] || [])) _navApproved.add(String(h));
   } catch (_) { /* 该浏览器版本无 storage.session，退化为仅内存缓存 */ }
   return _navApproved;
 }
@@ -395,7 +395,7 @@ async function openUrl(tab, a) {
 
 /**
  * 统一入口：执行某个网页自动化工具。
- * @param {{id:number, windowId:number}} tab 已解析的活动标签页
+ * @param {{id?:number, windowId?:number, url?:string, title?:string, [k:string]:any}} tab 活动标签页（chrome Tab 的超集字段可选）
  * @param {string} tool 工具名
  * @param {object} args 参数
  * @returns {Promise<{ok:boolean, result?:any, error?:string}>}

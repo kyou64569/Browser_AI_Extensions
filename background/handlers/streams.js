@@ -60,7 +60,7 @@ async function runSummarize(port) {
       page,
       { kb, onFallback, stream: false }
     );
-    port?.postMessage({ type: 'RESULT', text: result.text, used: result.used.name, tried: result.tried });
+    port?.postMessage({ type: 'RESULT', text: result.text, used: (result.used && /** @type {any} */ (result.used).name) || '', tried: result.tried });
   } catch (e) {
     port?.postMessage({ type: 'ERROR', message: (e && e.message) ? e.message : String(e) });
   }

@@ -1,0 +1,27 @@
+{
+  "//": "类型检查配置：不迁移 TypeScript，只开 checkJs 对现有 JS + JSDoc 做静态检查（noEmit）。",
+  "//2": "strict 保持关闭：JS 代码里隐式 any / 可能空值遍地都是，全开会产生数千条噪音；",
+  "//3": "这一步的目的是让「字段名拼错、JSDoc 类型与实现不符、chrome API 用错」这类真问题浮出来。",
+  "//4": "范围说明：当前纳入逻辑层（background/core/features/shared/connectors/test）。",
+  "//5": "UI/DOM 层（preview/ui/content/offscreen）的 Element 类型噪音需要逐处 cast，暂未纳入，",
+  "//6": "后续可按文件逐步加回 include 并配合局部 /** @type */ 修正。",
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "allowJs": true,
+    "checkJs": true,
+    "noEmit": true,
+    "strict": false,
+    "types": ["chrome", "node"],
+    "skipLibCheck": true
+  },
+  "include": [
+    "background/**/*.js",
+    "connectors/**/*.js",
+    "core/**/*.js",
+    "features/**/*.js",
+    "shared/**/*.js",
+    "test/**/*.mjs"
+  ]
+}

@@ -8,10 +8,14 @@
     "start": "node dev-server.mjs",
     "start:py": "python dev-server.py",
     "test": "node --test test/*.test.mjs",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "typecheck": "tsc -p tsconfig.json"
   },
   "devDependencies": {
+    "@types/chrome": "^0.2.7",
+    "@types/node": "^26.4.0",
     "eslint": "^10.9.1",
-    "globals": "^17.11.0"
+    "globals": "^17.11.0",
+    "typescript": "^7.0.2"
   }
 }

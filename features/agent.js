@@ -66,12 +66,12 @@ const REFLECT_PROMPT = `请评估当前执行进展：
  */
 export class Agent {
   /**
-   * @param {object} deps
-   * @param {object} deps.models 可用模型列表
-   * @param {(messages: Array, opts?: object) => AsyncGenerator} deps.chatFn 聊天函数（经 service-worker）
-   * @param {(tool: string, args: object) => Promise<{ok:boolean,result?:any,error?:string}>} deps.execTool 工具执行函数
+   * @param {object} [deps] 缺少必需依赖时构造函数内会抛错
+   * @param {Array<{id?:string,name?:string,vendor?:string,model?:string,enabled?:boolean}>} [deps.models] 可用模型列表
+   * @param {(messages: import('../core/message.js').Message[], opts?: object) => Promise<AsyncGenerator<{delta?:string,done?:boolean,model?:string,index?:number}>>} [deps.chatFn] 聊天函数（返回生成器的 Promise，经 service-worker）
+   * @param {(tool: string, args: object) => Promise<{ok:boolean,result?:any,error?:string}>} [deps.execTool] 工具执行函数
    * @param {number} [deps.maxSteps=15] 最大执行步数
-   * @param {(event: object) => void} [deps.onEvent] 事件回调（进度/思考/工具调用）
+   * @param {(event: {phase?:string,message?:string,type?:string,[k:string]:any}) => void} [deps.onEvent] 事件回调（进度/思考/工具调用）
    */
   constructor({ models, chatFn, execTool, maxSteps = 15, onEvent } = {}) {
     if (!models || !models.length) throw new Error('Agent 需要至少一个可用模型');
@@ -90,7 +90,7 @@ export class Agent {
   /**
    * 运行 Agent 完成目标
    * @param {string} goal 用户目标
-   * @param {object} [context] 上下文（如当前页面信息）
+   * @param {{pageInfo?: {title?:string, url?:string, text?:string}, [k:string]:any}} [context] 上下文（如当前页面信息）
    * @returns {Promise<{answer: string, steps: Array, success: boolean}>}
    */
   async run(goal, context = {}) {
@@ -98,9 +98,9 @@ export class Agent {
     const steps = [];
     const toolSystemPrompt = buildToolSystemPrompt();
 
-    const messages = [
+    const messages = /** @type {import('../core/message.js').Message[]} */ ([
       { role: 'system', content: AGENT_SYSTEM_PROMPT + '\n\n' + toolSystemPrompt },
-    ];
+    ]);
 
     if (context.pageInfo?.text) {
       console.log('[Agent] 使用预提取页面内容，长度:', context.pageInfo.text.length);
@@ -161,7 +161,7 @@ export class Agent {
       // 获取下一步动作
       let assistantText = '';
       try {
-        for await (const chunk of this.chatFn(messages, { stream: false })) {
+        for await (const chunk of await this.chatFn(messages, { stream: false })) {
           assistantText += chunk.delta || '';
         }
       } catch (e) {
@@ -241,7 +241,7 @@ export class Agent {
     }]);
 
     let planText = '';
-    for await (const chunk of this.chatFn(planMessages, { stream: false })) {
+    for await (const chunk of await this.chatFn(planMessages, { stream: false })) {
       planText += chunk.delta || '';
     }
     return planText || `1. 观察当前页面状态\n2. 逐步执行操作\n3. 收集结果\n4. 输出最终回答`;
@@ -252,7 +252,7 @@ export class Agent {
 
     let reflectText = '';
     try {
-      for await (const chunk of this.chatFn(reflectMessages, { stream: false })) {
+      for await (const chunk of await this.chatFn(reflectMessages, { stream: false })) {
         reflectText += chunk.delta || '';
       }
     } catch (_) {
@@ -282,7 +282,7 @@ export class Agent {
 
     let summary = '';
     try {
-      for await (const chunk of this.chatFn(summaryMessages, { stream: false })) {
+      for await (const chunk of await this.chatFn(summaryMessages, { stream: false })) {
         summary += chunk.delta || '';
       }
     } catch (_) { /* 忽略 */ }

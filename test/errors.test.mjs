@@ -9,7 +9,7 @@ import { classifyError, describeError, formatErrorLine, ERROR_KIND } from '../sh
 
 /** 构造一个 HttpError 形态的错误（core/http.js 的实际结构） */
 function httpError(status, message, kind) {
-  const e = new Error(message);
+  const e = /** @type {any} */ (new Error(message));
   e.name = 'HttpError';
   e.status = status;
   if (kind) e.kind = kind;

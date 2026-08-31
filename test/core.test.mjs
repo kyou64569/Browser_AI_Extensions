@@ -43,7 +43,7 @@ test('optionsFromModel: 只透传合法数值', () => {
   assert.deepEqual(optionsFromModel({ temperature: 0.5, top_p: 0.9, maxTokens: 100 }),
     { temperature: 0.5, top_p: 0.9, maxTokens: 100 });
   assert.deepEqual(optionsFromModel({}), {});
-  assert.deepEqual(optionsFromModel({ temperature: 'hot' }), {});
+  assert.deepEqual(optionsFromModel(/** @type {any} */ ({ temperature: 'hot' })), {});
 });
 
 test('optionsFromModel: reasoning_effort 仅对显式支持的厂商发送', () => {

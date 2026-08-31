@@ -67,7 +67,7 @@ const MESSAGES = {
  * 优先用 HttpError 自带的 kind/status（core/http.js 已分类），
  * 退化到按消息文本匹配——因为很多错误来自 fetch 之外的路径（FormData、Whisper、storage）。
  *
- * @param {unknown} e
+ * @param {*} e 任意输入（Error / HttpError / 字符串 / null），函数内自行容错
  * @returns {string} ERROR_KIND 之一
  */
 export function classifyError(e) {
@@ -112,7 +112,7 @@ export function classifyError(e) {
 /**
  * 生成展示用的错误描述。
  *
- * @param {unknown} e 任意错误（Error / HttpError / 字符串 / null）
+ * @param {*} e 任意错误（Error / HttpError / 字符串 / null），函数内自行容错
  * @param {object} [opts]
  * @param {string} [opts.fallbackTitle] 无法归类时的兜底主文案（默认"请求失败"）
  * @returns {{kind:string, title:string, hint:string, detail:string, status:number}}
@@ -148,7 +148,7 @@ export function describeError(e, opts = {}) {
  * 单行紧凑版本（用于状态条、toast 等只能放一行文字的地方）。
  * 有技术细节时以「（详情：…）」截断追加，避免整屏 JSON。
  *
- * @param {unknown} e
+ * @param {*} e 任意错误
  * @param {number} [detailMax=60] 追加的技术细节最大长度，0 表示不追加
  */
 export function formatErrorLine(e, detailMax = 60) {

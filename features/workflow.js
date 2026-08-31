@@ -318,7 +318,7 @@ export async function conditionNode(input, config, ctx) {
     case 'eq': result = targetValue === value; break;
     case 'neq': result = targetValue !== value; break;
     case 'contains': result = String(targetValue).includes(value); break;
-    case 'not_empty': result = !!targetValue && (typeof targetValue !== 'string' || targetValue.trim()); break;
+    case 'not_empty': result = !!(targetValue && (typeof targetValue !== 'string' || targetValue.trim())); break;
     case 'gt': result = Number(targetValue) > Number(value); break;
     case 'lt': result = Number(targetValue) < Number(value); break;
     default: result = !!targetValue;
