@@ -12,6 +12,7 @@ import { postJson, fetchWithTimeout } from '../core/http.js';
 import { normalizeKbState, defaultKbState } from '../shared/storage.js';
 import { safeImageSrc } from '../shared/sanitize.js';
 import { describeError, formatErrorLine } from '../shared/errors.js';
+import { extractCodeBlocks, highlightCode } from '../shared/code-highlight.js';
 import { KB_PROVIDERS, createKbConnector } from '../connectors/kb-registry.js';
 
 const $ = (s) => document.querySelector(s);
@@ -749,7 +750,9 @@ function loadConversation(id) {
             bubble.innerHTML = multimodalInnerHtml(legacy.type, escapeHtml(legacy.url), '');
             wireMultimodalMedia(bubble);
           } else {
-            bubble.textContent = m.content || '';
+            // 历史恢复同样走富文本渲染（代码块高亮 + 复制/折叠）
+            bubble.innerHTML = renderRichText(m.content || '');
+            wireCodeBlocks(bubble);
           }
         }
         chatScroll.appendChild(el);
@@ -885,6 +888,80 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
 }
 
+/**
+ * 富文本渲染（最终态）：围栏代码块高亮 + 复制 / 折叠。
+ * 普通文本仍按纯文本处理（bubble 自带 pre-wrap 保留换行），只有代码块走 HTML 渲染。
+ *
+ * 安全约定：所有动态内容必须经 escapeHtml()（文本）或 highlightCode()（代码，内部已转义）
+ * 处理后才允许进 innerHTML。
+ *
+ * @param {string} text AI 回复全文
+ * @returns {string} HTML 片段
+ */
+function renderRichText(text) {
+  if (typeof text !== 'string' || !text) return '';
+  const segs = extractCodeBlocks(text);
+  if (segs.length === 1 && segs[0].type === 'text') return escapeHtml(text); // 无代码块：纯文本快速路径
+  let html = '';
+  for (const seg of segs) {
+    if (seg.type === 'code') {
+      const id = 'cb' + Math.random().toString(36).slice(2, 8);
+      html += `<div class="code-block" data-code-id="${id}">`
+        + `<div class="code-block-head">`
+        + `<span class="code-lang">${escapeHtml(seg.lang || '代码')}</span>`
+        + `<button type="button" class="code-fold" hidden title="展开/收起"></button>`
+        + `<button type="button" class="code-copy" data-code-id="${id}" title="复制代码">复制</button>`
+        + `</div>`
+        + `<pre class="code-body"><code>${highlightCode(seg.content, seg.lang)}</code></pre>`
+        + `</div>`;
+    } else if (seg.content) {
+      html += escapeHtml(seg.content); // pre-wrap 保留换行，不转 <br>
+    }
+  }
+  return html;
+}
+
+/**
+ * 给一段 HTML 里的代码块绑定 复制 / 折叠 行为。
+ * 复制优先走剪贴板 API；不可用时退化为选中文本让用户手动 Ctrl+C。
+ * 超过 40 行的代码块默认折叠，头部提供展开/收起切换。
+ */
+function wireCodeBlocks(root) {
+  root.querySelectorAll('.code-block').forEach(block => {
+    const pre = block.querySelector('.code-body');
+    const copyBtn = block.querySelector('.code-copy');
+    const foldBtn = block.querySelector('.code-fold');
+    if (!pre || !copyBtn) return;
+
+    copyBtn.onclick = async () => {
+      try {
+        await navigator.clipboard.writeText(pre.textContent || '');
+        copyBtn.textContent = '已复制 ✓';
+      } catch (_) {
+        const range = document.createRange();
+        range.selectNodeContents(pre);
+        const sel = getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+        copyBtn.textContent = '已选中，Ctrl+C 复制';
+      }
+      setTimeout(() => { copyBtn.textContent = '复制'; }, 1600);
+    };
+
+    const lines = (pre.textContent || '').split('\n').length;
+    if (foldBtn && lines > 12) {
+      foldBtn.hidden = false;
+      const sync = () => {
+        const folded = block.classList.contains('folded');
+        foldBtn.textContent = folded ? `展开（${lines} 行）` : '收起';
+      };
+      if (lines > 40) block.classList.add('folded'); // 超长代码默认收起
+      sync();
+      foldBtn.onclick = () => { block.classList.toggle('folded'); sync(); };
+    }
+  });
+}
+
 function pushUser(text, images) {
   const welcome = $('#welcome');
   if (welcome) welcome.remove();
@@ -944,7 +1021,16 @@ function newAssistant() {
   const bubble = el.querySelector('.bubble');
   return {
     el,
-    setText(t) { bubble.textContent = t; },
+    setText(t) { bubble.textContent = t; this._last = t; },
+    /**
+     * 最终态富文本渲染：把气泡内容里的 ``` 代码块转为高亮卡片（复制/折叠）。
+     * 流式期间保持 setText 纯文本以保证性能，仅在流结束/历史恢复时调用。
+     */
+    setRich(t) {
+      const text = (t !== undefined) ? t : this._last;
+      bubble.innerHTML = renderRichText(text || '');
+      wireCodeBlocks(bubble);
+    },
     stopTyping() { bubble.innerHTML = ''; },
   };
 }
@@ -1280,12 +1366,14 @@ async function send() {
     }
     messages.push(userMsg);                 // 含图片附件，确保会话持久化保留原图数据
     messages.push({ role: 'assistant', content: acc });
+    a.setRich();   // 最终态：代码块高亮渲染
     setStatus('');
   } catch (e) {
     a.stopTyping();
     if (activeAbort && activeAbort.signal.aborted) {
       // 用户主动停止：保留已生成的部分并写入历史（下轮可继续追问）
       a.setText(acc ? acc + '\n\n（已停止）' : '（已停止，未收到回复内容）');
+      a.setRich();
       setStatus('已停止生成');
       if (acc) {
         messages.push(userMsg);
@@ -1665,6 +1753,7 @@ async function runAutomation(userText) {
         messages[messages.length - 1].content += note;
         if (a && a.el) a.setText(messages[messages.length - 1].content);
       }
+      if (a && a.el) a.setRich();   // 最终态：代码块高亮渲染
       setStatus('');
       finished = true;
       break;
@@ -1686,6 +1775,7 @@ async function runAutomation(userText) {
       if (a) {
         a.stopTyping();
         a.setText(acc ? acc + '\n\n（已停止）' : '（已停止）');
+        a.setRich();
       }
       setStatus('已停止任务');
     } else {
@@ -2385,12 +2475,14 @@ async function runSummarizeInChat(instruction) {
     }
     messages.push({ role: 'user', content: prompt });
     messages.push({ role: 'assistant', content: acc });
+    a.setRich();   // 最终态：代码块高亮渲染
     setStatus('');
   } catch (e) {
     a.stopTyping();
     if (activeAbort && activeAbort.signal.aborted) {
       // 用户主动停止：保留已生成的部分并写入历史
       a.setText(acc ? acc + '\n\n（已停止）' : '（已停止，未收到回复内容）');
+      a.setRich();
       setStatus('已停止生成');
       if (acc) {
         messages.push({ role: 'user', content: prompt });
@@ -2571,12 +2663,14 @@ async function runWebSearchInChat(query) {
     // 持久化：用户消息只记原始问题（不含长搜索上下文），保持会话清爽
     messages.push({ role: 'user', content: query });
     messages.push({ role: 'assistant', content: acc });
+    a.setRich();   // 最终态：代码块高亮渲染
     setStatus('');
   } catch (e) {
     a.stopTyping();
     if (activeAbort && activeAbort.signal.aborted) {
       // 用户主动停止：保留已生成的部分并写入历史
       a.setText(acc ? acc + '\n\n（已停止）' : '（已停止，未收到回复内容）');
+      a.setRich();
       setStatus('已停止生成');
       if (acc) {
         messages.push({ role: 'user', content: query });

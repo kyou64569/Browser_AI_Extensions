@@ -20,6 +20,7 @@
   --code-bg: rgba(255,255,255,.08);
   --pre-bg: rgba(0,0,0,.35);
   --switch-bg: #2c323e;
+  --tok-com: #7d8799; --tok-str: #98c379; --tok-num: #d19a66; --tok-kw: #c678dd; --tok-fn: #61afef;
   font-size: 14px;
 }
 
@@ -46,6 +47,7 @@
     --code-bg: rgba(0,0,0,.06);
     --pre-bg: rgba(0,0,0,.05);
     --switch-bg: #c9ced8;
+    --tok-com: #8792a2; --tok-str: #1a7f37; --tok-num: #b35900; --tok-kw: #8250df; --tok-fn: #0550ae;
   }
 }
 
@@ -71,6 +73,7 @@
   --code-bg: rgba(0,0,0,.06);
   --pre-bg: rgba(0,0,0,.05);
   --switch-bg: #c9ced8;
+  --tok-com: #8792a2; --tok-str: #1a7f37; --tok-num: #b35900; --tok-kw: #8250df; --tok-fn: #0550ae;
 }
 
 /* 显式深色模式 */
@@ -95,6 +98,7 @@
   --code-bg: rgba(255,255,255,.08);
   --pre-bg: rgba(0,0,0,.35);
   --switch-bg: #2c323e;
+  --tok-com: #7d8799; --tok-str: #98c379; --tok-num: #d19a66; --tok-kw: #c678dd; --tok-fn: #61afef;
 }
 
 * { box-sizing: border-box; }
@@ -254,6 +258,33 @@ body {
   background: var(--pre-bg); padding: 10px; border-radius: 8px;
   overflow: auto; font-size: 12px; margin: 6px 0;
 }
+
+/* ---------- 代码块卡片（AI 回复富文本渲染） ---------- */
+.code-block {
+  margin: 8px 0; border: 1px solid var(--line); border-radius: 10px;
+  background: var(--pre-bg); overflow: hidden;
+}
+.code-block-head {
+  display: flex; align-items: center; gap: 6px;
+  padding: 4px 8px 4px 12px; background: var(--code-bg);
+}
+.code-lang { flex: 1; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+.code-fold, .code-copy {
+  border: none; background: transparent; color: var(--accent);
+  font-size: 11px; cursor: pointer; padding: 2px 8px; border-radius: 6px;
+}
+.code-fold:hover, .code-copy:hover { background: var(--icon-hover); }
+/* 覆盖 .bubble pre 的通用底样式：卡片自带头部与边框，内层不再重复 */
+.bubble .code-block pre.code-body {
+  background: transparent; margin: 0; border-radius: 0;
+  padding: 10px 12px; overflow-x: auto;
+}
+.code-block.folded .code-body { display: none; }
+.tok-com { color: var(--tok-com); font-style: italic; }
+.tok-str { color: var(--tok-str); }
+.tok-num { color: var(--tok-num); }
+.tok-kw { color: var(--tok-kw); font-weight: 600; }
+.tok-fn { color: var(--tok-fn); }
 
 /* 打字指示器 */
 .typing { display: inline-flex; gap: 4px; padding: 4px 2px; }
