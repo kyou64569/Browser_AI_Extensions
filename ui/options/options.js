@@ -6,6 +6,39 @@
 import { getModels, saveModels, getKbState, saveKbState } from '../../shared/storage.js';
 import { createModelConfig } from '../../core/model-config.js';
 import { KB_PROVIDERS } from '../../connectors/kb-registry.js';
+import { aggregateUsage } from '../../shared/usage.js';
+
+const kFmt = (n) => n >= 10000 ? (n / 1000).toFixed(1) + 'k' : String(n);
+
+/** 渲染用量统计（近 7 天）：总计 + 按模型列表 + 按天迷你条形图 */
+async function renderUsage() {
+  const box = document.getElementById('usageSummary');
+  if (!box) return;
+  let log = [];
+  try {
+    const r = await chrome.storage.local.get('usageLog');
+    log = Array.isArray(r.usageLog) ? r.usageLog : [];
+  } catch (_) { box.textContent = '无法读取用量数据'; return; }
+  const agg = aggregateUsage(log, { days: 7 });
+  if (!agg.total.calls) { box.textContent = '暂无调用记录（使用聊天 / 翻译后自动累计）'; return; }
+
+  const t = agg.total;
+  const maxTok = Math.max(1, ...agg.byDay.map(d => d.inTok + d.outTok));
+  const bars = agg.byDay.map(d => {
+    const h = Math.round(((d.inTok + d.outTok) / maxTok) * 100);
+    return `<div class="usage-bar-col" title="${d.day}：${d.calls} 次，${kFmt(d.inTok + d.outTok)} tokens">`
+      + `<div class="usage-bar" style="height:${Math.max(h, 2)}%"></div></div>`;
+  }).join('');
+
+  const rows = agg.byModel.map(m =>
+    `<tr><td>${escapeHtml(m.model)}</td><td>${m.calls}</td>`
+    + `<td>${kFmt(m.inTok)}</td><td>${kFmt(m.outTok)}</td></tr>`).join('');
+
+  box.innerHTML =
+    `<div class="usage-total">调用 <b>${t.calls}</b> 次（失败 ${t.calls - t.ok}）· 输入 ≈<b>${kFmt(t.inTok)}</b> · 输出 ≈<b>${kFmt(t.outTok)}</b> tokens</div>`
+    + `<div class="usage-bars">${bars}</div>`
+    + `<table class="usage-table"><thead><tr><th>模型</th><th>调用</th><th>输入 tok</th><th>输出 tok</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
 
 const listEl = document.getElementById('modelList');
 
@@ -145,6 +178,7 @@ async function render() {
   listEl.querySelectorAll('.del').forEach(b => b.onclick = async () => {
     models.splice(+b.closest('.model-card').dataset.idx, 1);
     await saveModels(models); render();
+renderUsage();
   });
 
   // 复选框联动：改变即同步内存态并刷新禁用/选中态
@@ -173,6 +207,7 @@ async function render() {
 document.getElementById('addModel').onclick = async () => {
   models.push(createModelConfig({ name: '新模型', vendor: 'openai', apiBase: '', model: '' }));
   await saveModels(models); render();
+renderUsage();
 };
 
 document.getElementById('save').onclick = async () => {
@@ -197,6 +232,7 @@ document.getElementById('save').onclick = async () => {
 };
 
 render();
+renderUsage();
 
 // ---------- 复选框悬停提示：浮动提示框，自动夹在视口内避免溢出屏幕外 ----------
 (function initTips() {

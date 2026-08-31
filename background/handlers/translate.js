@@ -11,6 +11,7 @@
 import { getModels } from '../../shared/storage.js';
 import { createClient } from '../../core/model-client.js';
 import { chunkUnits, RateGate } from '../../core/translate-rate.js';
+import { recordCall } from '../../shared/usage.js';
 import { hasCred, optionsFromModel } from '../../shared/utils.js';
 import { withRateLimitRetry, isTokenRateLimit } from '../../core/retry.js';
 import { parseTranslateResponse, countClosedUnits, parseRefine } from '../../shared/text-parse.js';
@@ -429,6 +430,16 @@ export async function handleTranslateBatch(modelId, targetLang, items, opts = {}
     || models.find(m => m.enabled !== false);
   if (!model) return { ok: false, error: '未找到可用翻译模型，请先在设置添加模型' };
   if (!hasCred(model)) return { ok: false, error: '翻译模型缺少有效凭证（API Key）' };
-  const translations = await translateSegments(model, items, targetLang || '中文（简体）', opts);
-  return { ok: true, translations };
+  const t0 = Date.now();
+  try {
+    const translations = await translateSegments(model, items, targetLang || '中文（简体）', opts);
+    recordCall({ model: model.name, vendor: model.vendor, kind: 'translate', ok: true,
+      messages: [{ role: 'user', content: items.join('\n') }],
+      completion: (translations || []).join('\n'), durationMs: Date.now() - t0 });
+    return { ok: true, translations };
+  } catch (e) {
+    recordCall({ model: model.name, vendor: model.vendor, kind: 'translate', ok: false,
+      messages: [{ role: 'user', content: items.join('\n') }], completion: '', durationMs: Date.now() - t0 });
+    throw e;
+  }
 }

@@ -25,3 +25,14 @@ button { padding: 8px 12px; cursor: pointer; }
 .kb-provider-tab:hover { border-color: #888; }
 .kb-provider-tab.active { background: #2563eb; color: #fff; border-color: #2563eb; }
 .kb-provider-tab.placeholder { opacity: .55; cursor: not-allowed; }
+
+/* ---------- 用量统计 ---------- */
+.usage-summary { font-size: 13px; color: #374151; }
+.usage-total { margin: 6px 0 10px; }
+.usage-total b { color: #111; }
+.usage-bars { display: flex; align-items: flex-end; gap: 4px; height: 64px; margin: 8px 0 14px; }
+.usage-bar-col { flex: 1; height: 100%; display: flex; align-items: flex-end; }
+.usage-bar { width: 100%; background: #4f6bed; border-radius: 3px 3px 0 0; opacity: .85; }
+.usage-table { border-collapse: collapse; width: 100%; max-width: 480px; font-size: 12.5px; }
+.usage-table th, .usage-table td { border: 1px solid #e1e4ea; padding: 5px 8px; text-align: left; }
+.usage-table th { background: #f3f4f6; font-weight: 600; }

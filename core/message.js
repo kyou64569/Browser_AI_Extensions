@@ -30,6 +30,7 @@
  * @property {Object}   [options]  可选参数：temperature / maxTokens 等，adapter 自行忽略不支持的
  * @property {boolean}  [stream]   是否要求流式
  * @property {AbortSignal} [signal] 取消信号
+ * @property {string} [kind] 调用类型标注（chat/summarize/translate/agent…），仅用于用量统计
  */
 
 /**

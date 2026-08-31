@@ -7,6 +7,7 @@
 
 import { createClient } from './model-client.js';
 import { HttpError } from './http.js';
+import { recordCall } from '../shared/usage.js';
 
 /** 失败冷却时间：10 分钟内不再重试该模型 */
 export const COOLDOWN_MS = 10 * 60 * 1000;
@@ -60,6 +61,7 @@ export class FallbackManager {
     let lastErr;
     for (let i = 0; i < pool.length; i++) {
       const cfg = pool[i];
+      const t0 = Date.now();
       try {
         const client = createClient(cfg);
         let text = '';
@@ -73,13 +75,17 @@ export class FallbackManager {
           throw new Error('模型返回空响应');
         }
         if (i > 0) this.onFallback(i, cfg, '自动降级');
+        recordCall({ model: cfg.name, vendor: cfg.vendor, kind: req && req.kind, ok: true,
+          messages: req && req.messages, completion: text, durationMs: Date.now() - t0 });
         return { text, used, tried: i + 1 };
       } catch (e) {
-        // 用户主动中止：不属于模型故障，不记冷却、不降级，直接上抛
+        // 用户主动中止：不属于模型故障，不记冷却、不降级、不记用量，直接上抛
         if (req && req.signal && req.signal.aborted) throw e;
         const reason = e instanceof HttpError ? `${e.kind}(${e.status})` : (e?.message || 'unknown error');
         this._recordFailure(cfg.id, reason);
         lastErr = e;
+        recordCall({ model: cfg.name, vendor: cfg.vendor, kind: req && req.kind, ok: false,
+          messages: req && req.messages, completion: '', durationMs: Date.now() - t0 });
         if (i < pool.length - 1) this.onFallback(i + 1, pool[i + 1], `上一模型失败: ${reason}`);
         // 继续尝试下一个
       }
@@ -103,20 +109,27 @@ export class FallbackManager {
     for (let i = 0; i < pool.length; i++) {
       const cfg = pool[i];
       let produced = false;
+      let text = '';
+      const t0 = Date.now();
       try {
         const client = createClient(cfg);
         for await (const chunk of client.chat(req)) {
           produced = true;
+          text += chunk.delta || '';
           yield { ...chunk, model: cfg.name, index: i };
         }
         if (i > 0) this.onFallback(i, cfg, '自动降级');
+        recordCall({ model: cfg.name, vendor: cfg.vendor, kind: req && req.kind, ok: true,
+          messages: req && req.messages, completion: text, durationMs: Date.now() - t0 });
         return;
       } catch (e) {
-        // 用户主动中止：不属于模型故障，不记冷却、不降级，直接上抛
+        // 用户主动中止：不属于模型故障，不记冷却、不降级、不记用量，直接上抛
         if (req && req.signal && req.signal.aborted) throw e;
         const reason = e instanceof HttpError ? `${e.kind}(${e.status})` : (e?.message || 'unknown error');
         this._recordFailure(cfg.id, reason);
         lastErr = e;
+        recordCall({ model: cfg.name, vendor: cfg.vendor, kind: req && req.kind, ok: false,
+          messages: req && req.messages, completion: text, durationMs: Date.now() - t0 });
         if (produced) {
           // 已产出内容，不能安全降级
           throw e;
