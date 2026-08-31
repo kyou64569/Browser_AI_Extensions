@@ -14,6 +14,10 @@ import { safeImageSrc } from '../shared/sanitize.js';
 import { describeError, formatErrorLine } from '../shared/errors.js';
 import { extractCodeBlocks, highlightCode } from '../shared/code-highlight.js';
 import { conversationToMarkdown, safeFilename } from '../shared/conv-export.js';
+import {
+  applyTemplate, listTemplateVars, cloneTemplate, validateTemplate,
+  BUILTIN_TEMPLATES, TEMPLATE_VARS,
+} from '../shared/prompt-templates.js';
 import { KB_PROVIDERS, createKbConnector } from '../connectors/kb-registry.js';
 
 const $ = (s) => document.querySelector(s);
@@ -1883,6 +1887,7 @@ funcMenu.querySelectorAll('.func-item').forEach(b => {
   b.onclick = (e) => {
     e.stopPropagation();
     closeFuncMenu();
+    if (b.dataset.act === 'templates') { renderTplList(); openTplPicker(); return; }
     activateFunc(b.dataset.act);
   };
 });
@@ -1890,9 +1895,147 @@ funcMenu.querySelectorAll('.func-item').forEach(b => {
 document.addEventListener('click', (e) => {
   if (!funcMenu.hidden && !plusWrap.contains(e.target)) closeFuncMenu();
   if (!pptThemePicker.hidden && !plusWrap.contains(e.target)) closePptThemePicker();
+  if (!tplPicker.hidden && !plusWrap.contains(e.target)) closeTplPicker();
 });
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !funcMenu.hidden) closeFuncMenu(); });
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !pptThemePicker.hidden) closePptThemePicker(); });
+
+// ============================================================
+// Prompt 模板库：内置 + 自定义（存 chrome.storage.local，key = promptTemplates）
+// 选择模板后做变量插值填入输入框；内置模板只读、可复制为副本后修改。
+// ============================================================
+let promptTemplates = [];      // 自定义模板（不含内置；渲染时与 BUILTIN_TEMPLATES 合并）
+let editingTplId = null;       // 当前正在编辑的模板 id（null = 新建 / 关闭编辑器）
+const tplPicker = $('#tplPicker');
+
+async function loadPromptTemplates() {
+  if (hasChromeStorage()) {
+    try {
+      const r = await chrome.storage.local.get('promptTemplates');
+      if (Array.isArray(r.promptTemplates)) { promptTemplates = r.promptTemplates; return; }
+    } catch (_) { /* 退回 localStorage */ }
+  }
+  promptTemplates = LS.get('preview.promptTemplates', []);
+}
+async function persistPromptTemplates() {
+  LS.set('preview.promptTemplates', promptTemplates);
+  if (hasChromeStorage()) {
+    try { await chrome.storage.local.set({ promptTemplates }); } catch (_) {}
+  }
+}
+/** 全部模板 = 内置在前 + 自定义在后 */
+function allTemplates() {
+  return [...BUILTIN_TEMPLATES, ...promptTemplates];
+}
+function openTplPicker() { tplPicker.hidden = false; plusWrap.classList.add('open'); }
+function closeTplPicker() {
+  tplPicker.hidden = true;
+  $('#tplEditor').hidden = true;
+  if (funcMenu.hidden) plusWrap.classList.remove('open');
+}
+
+/** 当前网页标题（扩展环境取 activeTab 标题；独立预览为空串） */
+async function getCurrentTabTitle() {
+  try {
+    if (typeof chrome !== 'undefined' && chrome.tabs && chrome.tabs.query) {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      return (tab && tab.title) || '';
+    }
+  } catch (_) {}
+  return '';
+}
+
+/** 渲染模板列表（内置标记 📌；自定义带 编辑/删除） */
+function renderTplList() {
+  const list = $('#tplList');
+  const items = allTemplates().map(t => {
+    const vars = listTemplateVars(t.content)
+      .map(v => TEMPLATE_VARS[v] || v).join('、');
+    const acts = t.builtin
+      ? `<button type="button" class="tpl-act" data-copy="${t.id}" title="复制为可编辑副本">复制</button>`
+      : `<button type="button" class="tpl-act" data-edit="${t.id}">编辑</button>`
+        + `<button type="button" class="tpl-act tpl-danger" data-del="${t.id}">删除</button>`;
+    return `<div class="tpl-item" data-use="${t.id}">
+        <div class="tpl-item-main">
+          <div class="tpl-item-name">${escapeHtml(t.name)}${t.builtin ? ' <span class="tpl-builtin">内置</span>' : ''}</div>
+          <div class="tpl-item-vars">${escapeHtml(vars || '无变量')}</div>
+        </div>
+        <div class="tpl-item-acts">${acts}</div>
+      </div>`;
+  }).join('');
+  list.innerHTML = items;
+  // 使用：插值后填入输入框
+  list.querySelectorAll('.tpl-item').forEach(it => {
+    it.onclick = async (e) => {
+      if (e.target.closest('.tpl-act')) return;
+      const t = allTemplates().find(x => x.id === it.dataset.use);
+      if (!t) return;
+      const title = await getCurrentTabTitle();
+      const r = applyTemplate(t.content, {
+        page_title: title,
+        date: new Date().toLocaleDateString('zh-CN'),
+        selection: '',
+        input: input.value.trim(),
+      });
+      input.value = r.text; autosize(); updateSendState(); input.focus();
+      closeTplPicker();
+    };
+  });
+  // 复制内置 → 生成可编辑副本
+  list.querySelectorAll('[data-copy]').forEach(b => b.onclick = (e) => {
+    e.stopPropagation();
+    const t = BUILTIN_TEMPLATES.find(x => x.id === b.dataset.copy);
+    if (!t) return;
+    const copy = cloneTemplate(t);
+    promptTemplates.push(copy);
+    persistPromptTemplates();
+    renderTplList();
+    openTplEditor(copy.id);
+  });
+  // 编辑 / 删除（仅自定义）
+  list.querySelectorAll('[data-edit]').forEach(b => b.onclick = (e) => {
+    e.stopPropagation(); openTplEditor(b.dataset.edit);
+  });
+  list.querySelectorAll('[data-del]').forEach(b => b.onclick = (e) => {
+    e.stopPropagation();
+    if (!confirm('删除该模板？此操作不可恢复。')) return;
+    promptTemplates = promptTemplates.filter(t => t.id !== b.dataset.del);
+    persistPromptTemplates();
+    renderTplList();
+  });
+}
+
+/** 打开编辑器（id 为空 = 新建） */
+function openTplEditor(id = null) {
+  editingTplId = id;
+  const t = id ? promptTemplates.find(x => x.id === id) : null;
+  $('#tplNameInput').value = t ? t.name : '';
+  $('#tplContentInput').value = t ? t.content : '';
+  $('#tplEditor').hidden = false;
+  $('#tplNameInput').focus();
+}
+$('#tplNewBtn').onclick = (e) => { e.stopPropagation(); openTplEditor(null); };
+$('#tplCancelBtn').onclick = (e) => { e.stopPropagation(); $('#tplEditor').hidden = true; };
+$('#tplSaveBtn').onclick = (e) => {
+  e.stopPropagation();
+  const tpl = { id: editingTplId || '', name: $('#tplNameInput').value, content: $('#tplContentInput').value };
+  const errs = validateTemplate(tpl);
+  if (errs.length) { setStatus(errs[0], 'err'); return; }
+  if (editingTplId) {
+    const t = promptTemplates.find(x => x.id === editingTplId);
+    if (t) { t.name = tpl.name.trim(); t.content = tpl.content; }
+  } else {
+    promptTemplates.push({
+      id: 'tpl-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+      name: tpl.name.trim(), content: tpl.content, builtin: false,
+    });
+  }
+  persistPromptTemplates();
+  $('#tplEditor').hidden = true;
+  renderTplList();
+};
+// Esc / 点击外部关闭（与 funcMenu 一致）
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !tplPicker.hidden) closeTplPicker(); });
 
 // PPT 模板选择器
 const pptThemePicker = $('#pptThemePicker');
@@ -4686,6 +4829,9 @@ syncConfigFromStorage();
 if (hasChromeStorage()) {
   loadConversationsFromStorage().then(arr => { conversations = arr || []; });
 }
+
+// Prompt 模板：加载自定义模板（内置模板随代码内置，无需存储）
+loadPromptTemplates();
 
 // ---------- 复选框悬停提示：浮动提示框，自动夹在视口内避免溢出屏幕外 ----------
 (function initTips() {

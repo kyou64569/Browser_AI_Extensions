@@ -84,6 +84,26 @@
                   <button type="button" class="func-item" role="menuitem" data-act="kb">
                     <span class="fi-ico">📚</span><span class="fi-label">知识库</span>
                   </button>
+                  <button type="button" class="func-item" role="menuitem" data-act="templates">
+                    <span class="fi-ico">📝</span><span class="fi-label">Prompt 模板</span>
+                  </button>
+                </div>
+                <!-- Prompt 模板弹层 -->
+                <div class="tpl-picker" id="tplPicker" hidden>
+                  <div class="tpl-head">
+                    <span class="tpl-title">Prompt 模板</span>
+                    <button type="button" class="tpl-new" id="tplNewBtn">+ 新建</button>
+                  </div>
+                  <div class="tpl-list" id="tplList"></div>
+                  <!-- 编辑区（新建/编辑共用） -->
+                  <div class="tpl-editor" id="tplEditor" hidden>
+                    <input type="text" id="tplNameInput" maxlength="40" placeholder="模板名称" />
+                    <textarea id="tplContentInput" rows="5" placeholder="模板内容，支持变量：{{input}} 用户输入、{{page_title}} 网页标题、{{selection}} 选中文本、{{date}} 日期"></textarea>
+                    <div class="tpl-editor-acts">
+                      <button type="button" class="tpl-save" id="tplSaveBtn">保存</button>
+                      <button type="button" class="tpl-cancel" id="tplCancelBtn">取消</button>
+                    </div>
+                  </div>
                 </div>
                 <!-- PPT 模板选择器 -->
                 <div class="ppt-theme-picker" id="pptThemePicker" role="menu" hidden>
