@@ -193,7 +193,7 @@ body {
 .welcome h2 { margin: 0 0 6px; color: var(--text); font-weight: 600; }
 .welcome p { margin: 0; font-size: 13px; }
 
-.msg { display: flex; gap: 10px; max-width: 100%; animation: rise .2s ease; }
+.msg { display: flex; gap: 10px; max-width: 100%; min-width: 0; animation: rise .2s ease; }
 @keyframes rise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 .msg .avatar {
   width: 30px; height: 30px; flex: 0 0 auto; border-radius: 9px;
@@ -202,6 +202,10 @@ body {
 .msg.user { flex-direction: row-reverse; }
 .msg.user .avatar { background: var(--user-bubble); color: #fff; }
 .msg.assistant .avatar { background: var(--panel-2); color: var(--accent); border: 1px solid var(--line); }
+/* min-width:0 + max-width:100%：气泡是 flex 子项，默认 min-width:auto 会被
+   white-space:pre 的长代码行撑出容器（聊天区出现横向滚动条）。
+   约束住气泡宽度后，横向滚动才会下沉到 pre.code-body 自己的 overflow-x 上。
+   text 段落仍按 pre-wrap 正常换行，不受影响。 */
 .bubble {
   padding: 10px 13px;
   border-radius: 14px;
@@ -209,6 +213,8 @@ body {
   font-size: 13.5px;
   white-space: pre-wrap;
   word-break: break-word;
+  min-width: 0;
+  max-width: 100%;
 }
 .msg.user .bubble {
   background: var(--user-bubble); color: #fff;
