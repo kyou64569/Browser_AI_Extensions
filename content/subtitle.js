@@ -37,7 +37,6 @@
   let captionWindow = null;
   let captionPoller = null;
   let trackWatch = null;     // 原生 textTracks 监听
-  let prefetchTimer = null;
 
   // Whisper 转写（音频捕获在 Offscreen 文档完成；这里只把收到的音频片段送转写 + 渲染）
   let whisperQueue = [];          // 待转写的音频 Blob 队列（带序号，按序显示避免字幕错乱）
@@ -589,7 +588,12 @@
     if (!active) return; // 防止 stop() 后还塞入队列
     if (whisperQueue.length >= MAX_WHISPER_QUEUE) {
       console.warn('[whisper] Queue full, dropping oldest slice');
-      whisperQueue.shift();
+      const dropped = whisperQueue.shift();
+      // 关键：被丢的片已占用 seq，且 flushInOrder 严格按 seq 顺序冲刷——
+      // 不把丢弃标记成「已完成空结果」的话，whisperNextShow 会永远等这个 seq，
+      // 从丢片处起所有后续字幕全部卡死（字幕永久冻结）。
+      whisperDone.set(dropped.seq, '');
+      flushInOrder();
     }
     whisperQueue.push({ seq: whisperSeq++, audio, mime });
     pumpWhisper();
@@ -607,7 +611,9 @@
       const item = whisperQueue.shift();
       whisperActive++;
       runOneWhisper(item).finally(() => {
-        whisperActive--;
+        // stop() 会把 whisperActive 归零，晚到的 finally 若直接自减会减成负数，
+        // 挤占下一次会话的并发预算（并发槽变相增大）
+        whisperActive = Math.max(0, whisperActive - 1);
         pumpWhisper();
       });
     }
@@ -770,26 +776,32 @@
       bilingual: msg.bilingual !== false,
     };
     active = true;
-    ensureOverlay();
-    setCaptionRunning(true, cfg.targetLang);
+    try {
+      ensureOverlay();
+      setCaptionRunning(true, cfg.targetLang);
+      const video = document.querySelector('video');
+      const mode = cfg.sourceMode;
 
-    const video = document.querySelector('video');
-    const mode = cfg.sourceMode;
-
-    if (mode === 'platform') {
-      if (!tryPlatform(video)) throw new Error('未找到平台字幕（请确认视频已开启字幕 CC）');
-      return true;
-    }
-    if (mode === 'whisper') {
+      if (mode === 'platform') {
+        if (!tryPlatform(video)) throw new Error('未找到平台字幕（请确认视频已开启字幕 CC）');
+        return true;
+      }
+      if (mode === 'whisper') {
+        const ok = await setupWhisper();
+        if (!ok) throw new Error('无法捕获标签页音频（Whisper 模式需要标签页音频权限）');
+        return true;
+      }
+      // auto：先试平台字幕，失败再回退 Whisper
+      if (tryPlatform(video)) return true;
       const ok = await setupWhisper();
-      if (!ok) throw new Error('无法捕获标签页音频（Whisper 模式需要标签页音频权限）');
+      if (!ok) throw new Error('未检测到平台字幕，且无法启用 Whisper 音频捕获');
       return true;
+    } catch (e) {
+      // 启动失败必须回滚：否则 active=true 且 captionRunning=true 会永久卡住——
+      // UI 显示「字幕运行中」但实际什么都没有，下次 start 也无法正确重置
+      stop();
+      throw e;
     }
-    // auto：先试平台字幕，失败再回退 Whisper
-    if (tryPlatform(video)) return true;
-    const ok = await setupWhisper();
-    if (!ok) throw new Error('未检测到平台字幕，且无法启用 Whisper 音频捕获');
-    return true;
   }
 
   function tryPlatform(video) {
@@ -829,7 +841,6 @@
     if (captionObserver) { captionObserver.disconnect(); captionObserver = null; }
     if (captionPoller) { clearInterval(captionPoller); captionPoller = null; }
     if (trackWatch) { try { trackWatch.track.removeEventListener('cuechange', trackWatch.onCue); } catch (_) {} trackWatch = null; }
-    if (prefetchTimer) { clearInterval(prefetchTimer); prefetchTimer = null; }
     // 通知后台停止 offscreen 音频捕获并关闭离屏文档，释放标签页音频、恢复原生声音
     try { chrome.runtime.sendMessage({ type: 'LIVE_CAPTION_STOP_CAPTURE' }); } catch (_) {}
     whisperQueue = []; whisperActive = 0; whisperRunning = false;
@@ -843,9 +854,10 @@
     liveTrans = ''; liveTransRaw = '';
     if (liveTransTimer) { clearTimeout(liveTransTimer); liveTransTimer = null; }
     cacheKeys.length = 0; translationCache.clear();
-    // 本次字幕会话结束：将累积字幕作为一条记录存入“字幕管理”列表（持久化），随后清空内存中的 live 转录
+    // 本次字幕会话结束：将累积字幕作为一条记录存入“字幕管理”列表（持久化）。
+    // 注意：内存中的 historyLines 保留不清——「事后总结字幕」依赖 stop 之后
+    // LIVE_CAPTION_GET_TRANSCRIPT 仍能读到本页累积的转录；下次 start() 会重新清空。
     commitCurrentSubtitle();
-    historyLines.length = 0;
     if (overlay && overlay.parentNode) overlay.parentNode.removeChild(overlay);
     overlay = null; boxHeader = null; historyEl = null; draftEl = null; captionWindow = null;
   }

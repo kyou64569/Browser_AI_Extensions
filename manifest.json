@@ -3,6 +3,7 @@
   "name": "AI 助手（个人）",
   "version": "0.1.0",
   "description": "个人用 AI 助手扩展：模型适配层 + 备用降级 + 网页总结。",
+  "minimum_chrome_version": "116",
   "permissions": ["storage", "activeTab", "sidePanel", "scripting", "tabs", "tabCapture", "contextMenus", "offscreen"],
   "host_permissions": ["<all_urls>"],
   "background": {

@@ -12,9 +12,11 @@ const LOG_KEY = 'usageLog';
 const MAX_ENTRIES = 2000;   // 日志条数上限（超出丢最旧）
 const FLUSH_INTERVAL_MS = 4000;
 
-/** 内存缓冲 + 最近一次 flush 时间 */
+/** 内存缓冲 + 最近一次 flush 时间 + 兜底定时器句柄 */
 let _buf = [];
 let _lastFlush = 0;
+/** @type {ReturnType<typeof setTimeout>|null} */
+let _flushTimer = null;
 
 /**
  * 估算一段文本的 token 数（粗估：CJK 字符 ≈ 1 token/字，其他 ≈ 1 token/4 字符）。
@@ -62,13 +64,33 @@ export function recordCall(entry) {
     outTok: est.outTok,
     ms: Math.max(0, Math.round(entry.durationMs || 0)),
   });
-  if (_buf.length >= 20) void flushUsage();
+  if (_buf.length >= 20) { void flushUsage(); return; }
+  // 兜底调度：普通聊天一次只产生 1~2 条记录，若只在攒满 20 条时 flush，
+  // MV3 service worker 约 30 秒被杀，缓冲里的少量记录会随之丢失，
+  // 用量统计页面将长期接近空白。调度一个定时器保证记录最迟 FLUSH_INTERVAL_MS 落盘。
+  scheduleFlush();
 }
 
-/** 把缓冲写入 storage.local（节流：距上次 flush 不足 FLUSH_INTERVAL_MS 则等待下批）。非 chrome 环境丢弃缓冲。 */
+/** 安排一次延迟 flush（已有定时器在跑则不重复）。 */
+function scheduleFlush() {
+  if (_flushTimer != null) return;
+  _flushTimer = setTimeout(() => {
+    _flushTimer = null;
+    void flushUsage();
+  }, FLUSH_INTERVAL_MS);
+}
+
+/**
+ * 把缓冲写入 storage.local。距上次落盘不足 FLUSH_INTERVAL_MS 时不再立即写，
+ * 但一定安排一个到点必执行的兜底定时器——缓冲里的记录最迟延迟一个窗口落盘，
+ * 不会因「等下一批」而随 SW 死亡丢失。非 chrome 环境（单测/预览）到达此处时清空缓冲即可。
+ */
 export function flushUsage() {
   const now = Date.now();
-  if (_buf.length && now - _lastFlush < FLUSH_INTERVAL_MS) return; // 攒批，下次再写
+  if (_buf.length && now - _lastFlush < FLUSH_INTERVAL_MS) {
+    scheduleFlush(); // 仍在节流窗口内：延迟落盘（区别于旧实现的直接丢弃重试机会）
+    return;
+  }
   _lastFlush = now;
   const batch = _buf;
   _buf = [];

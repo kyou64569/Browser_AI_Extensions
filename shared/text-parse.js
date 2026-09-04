@@ -88,8 +88,10 @@ export function countClosedUnits(raw, fromIdx = 0) {
  */
 export function parseRefine(out, raw) {
   let s = (out || '').trim();
-  // 去掉可能的 markdown 代码围栏
-  s = s.replace(/^```[\s\S]*?\n?/i, '').replace(/```\s*$/i, '').trim();
+  // 去掉可能的 markdown 代码围栏（含 ```json / ```text 等语言标签）：
+  // 旧正则 /^```[\s\S]*?\n?/i 懒惰匹配到第一个换行就停，会把 `json` 语言标签
+  // 当成"原文"保留下来。显式匹配围栏行 + 可选语言标签整行。
+  s = s.replace(/^```[a-zA-Z0-9_-]*[ \t]*\r?\n/, '').replace(/```\s*$/i, '').trim();
   const om = s.match(/<o>([\s\S]*?)<\/o>/i);
   const tm = s.match(/<t>([\s\S]*?)<\/t>/i);
   let original = om && om[1].trim() ? om[1].trim() : '';

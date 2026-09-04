@@ -29,7 +29,12 @@ export class LocalKbConnector extends KnowledgeBaseConnector {
   }
 
   /**
-   * 校验地址：仅允许 localhost / 127.0.0.1 / 常见局域网网段，阻止公网地址（防误连外部服务）。
+   * 校验地址：仅允许 localhost / 127.0.0.1 / 私有网段 IP 字面量，阻止公网地址（防误连外部服务）。
+   * 主机名必须先判定为 IP 字面量再做网段匹配：裸 startsWith('192.168.') 会被
+   * http://192.168.evil.com 这类普通域名绕过（域名前缀撞上私有网段）。
+   * 非字面量主机名只放行 localhost 变体；LAN 主机名（如 nas.local）在此不予放行，
+   * 用户可直接填写其 IP。DNS 重绑定（域名解析到内网 IP）无法在扩展侧解析 DNS，
+   * 由「不放行任意域名 + 302 重定向一律拒绝」两道闸兜底。
    * @param {string} url
    * @returns {boolean}
    */
@@ -37,14 +42,28 @@ export class LocalKbConnector extends KnowledgeBaseConnector {
     try {
       const parsed = new URL(url);
       if (!['http:', 'https:'].includes(parsed.protocol)) return false;
-      const h = parsed.hostname;
-      if (h === 'localhost' || h === '127.0.0.1') return true;
-      if (h.startsWith('192.168.')) return true;
-      if (h.startsWith('10.')) return true;
-      // 仅放行 RFC1918 私有网段 172.16.0.0/12（即 172.16.x–172.31.x）。
-      // 原 startsWith('172.') 会误放行 172.0/1/200 等公网地址 → SSRF 过滤绕过。
-      if (/^172\.(1[6-9]|2[0-9]|3[01])\./.test(h)) return true;
-      return false;
+      const h = parsed.hostname.toLowerCase().replace(/\.$/, ''); // 去掉 FQDN 尾点
+      if (h === 'localhost' || h.endsWith('.localhost') || h === '[::1]' || h === '::1') return true;
+      // IPv4 字面量：四个 0-255 十进制段（ prevents 192.168.evil.com 之类域名混入）
+      const m4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
+      if (m4) {
+        const oct = m4.slice(1).map(Number);
+        if (oct.some((n) => n > 255)) return false;
+        const [a, b] = oct;
+        if (a === 127) return true;                              // loopback
+        if (a === 10) return true;                               // 10/8
+        if (a === 192 && b === 168) return true;                 // 192.168/16
+        if (a === 172 && b >= 16 && b <= 31) return true;        // 172.16/12
+        if (a === 169 && b === 254) return true;                 // link-local（保守放行本地场景）
+        return false;
+      }
+      // IPv6 字面量（URL.hostname 形如 [xxxx]）：只放行 ULA fc00::/7 与 loopback
+      if (h.startsWith('[') && h.endsWith(']')) {
+        const v6 = h.slice(1, -1).toLowerCase();
+        if (v6 === '::1') return true;
+        return /^f[cd][0-9a-f]{2}:/.test(v6);
+      }
+      return false; // 其余一律是域名：不放行
     } catch {
       return false;
     }
@@ -53,14 +72,21 @@ export class LocalKbConnector extends KnowledgeBaseConnector {
   async _get(path, params = {}) {
     if (!this.baseUrl) throw new Error('未配置本地知识库服务地址');
     if (!this._isValidUrl(this.baseUrl)) {
-      throw new Error('知识库地址无效或不被允许（仅支持 localhost / 局域网）');
+      throw new Error('知识库地址无效或不被允许（仅支持 localhost / 局域网 IP）');
     }
     const url = new URL(this.baseUrl + path);
     for (const [k, v] of Object.entries(params)) {
       if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, v);
     }
-    const res = await fetchWithTimeout(url.toString(), { method: 'GET', headers: this._headers() }, this.timeoutMs);
-    return res.json();
+    // redirect: 'error' —— 内网服务不应 302 跳公网；跟随重定向会让
+    // 「已通过白名单的 baseUrl」经一次跳转把带 Authorization 的请求发到任意主机
+    const res = await fetchWithTimeout(url.toString(), { method: 'GET', headers: this._headers(), redirect: 'error' }, this.timeoutMs);
+    // 非 JSON 响应（如网关返回 HTML 错误页）给出可读错误，而非裸 TypeError
+    try {
+      return await res.json();
+    } catch (e) {
+      throw new Error('本地知识库返回的不是 JSON（HTTP ' + res.status + '）：' + ((e && e.message) || e));
+    }
   }
 
   /** 连接测试：GET /api/v1/health → { status: 'healthy' } */

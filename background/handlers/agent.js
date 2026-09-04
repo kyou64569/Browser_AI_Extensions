@@ -18,7 +18,7 @@ import { extractMainTextInPage } from '../../shared/extract.js';
 import { translateSegments } from './translate.js';
 import { resolvePptOpts, sanitizeFilename, exportPptForAutomate } from './ppt.js';
 import { withSafetyTimeout } from '../messaging.js';
-import { getActiveTab, getRunningAgent, setRunningAgent } from '../state.js';
+import { getActiveTab } from '../state.js';
 import { TIMEOUT_AGENT_MS, TIMEOUT_WORKFLOW_MS } from '../../shared/constants.js';
 
 /** 广播进度事件到侧边栏（发送失败静默：侧边栏未打开时无意义） */
@@ -30,8 +30,10 @@ function broadcast(type, payload) {
 
 /**
  * AGENT_RUN：规划-执行-反思循环。
+ * 注意：chrome.runtime.sendMessage 消息无法携带 AbortSignal，本入口不支持中止——
+ * 消息路由是「发后即忘」的，若未来需要中止能力，应改用 Port 长连接传递 abort 语义。
  * @param {{goal?:string, modelId?:string, maxSteps?:number, thinkingStrength?:string,
- *          signal?:AbortSignal, context?:{pageInfo?:{title?:string,url?:string,text?:string},[k:string]:any},
+ *          context?:{pageInfo?:{title?:string,url?:string,text?:string},[k:string]:any},
  *          template?:string, [k:string]:any}} msg
  * @param {{respond:(payload:object)=>void}} ctx
  */
@@ -66,9 +68,7 @@ export function handleAgentRun(msg, { respond }) {
         },
         onEvent: (event) => broadcast('AGENT_PROGRESS', event),
       });
-      setRunningAgent(agent);
       try {
-        if (msg.signal?.aborted) agent.abort();
         const ctx = msg.context || {};
         if (!ctx.pageInfo?.text) {
           try {
@@ -112,23 +112,13 @@ export function handleAgentRun(msg, { respond }) {
           ok: true, ...result,
           _debug: { pageInfoLen: ctx.pageInfo?.text?.length || 0, hasPageInfo: !!ctx.pageInfo?.text },
         });
-      } finally {
-        setRunningAgent(null);
+      } catch (e) {
+        respond({ ok: false, error: e?.message || String(e) });
       }
       return undefined; // 已用 respond 回包，避免重复
     },
     { sendResponse: respond, timeoutMs: TIMEOUT_AGENT_MS, label: 'Agent 执行' }
   );
-}
-
-/** AGENT_ABORT：中止运行中的 Agent */
-export function handleAgentAbort({ respond }) {
-  // 直接调用运行中 Agent 实例的 abort()，使其内部的 this._aborted 置位
-  const agent = getRunningAgent();
-  if (agent) agent.abort();
-  try { chrome.runtime.sendMessage({ type: 'AGENT_PROGRESS', payload: { phase: 'abort' } }, () => { void chrome.runtime.lastError; }); } catch (_) {}
-  respond({ ok: true });
-  return true;
 }
 
 /**

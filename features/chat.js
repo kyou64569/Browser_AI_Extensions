@@ -47,6 +47,8 @@ function extractImages(messages) {
  * 视觉转发：若聊天模型自身不支持看图且配置了视觉模型，则先把图片交给视觉模型识别，
  * 再把识别结果以文本形式回灌进原消息，交由聊天模型整合回答。
  * 聊天模型支持看图（supportsVision）或未配置视觉模型时，原样返回。
+ * 视觉识别失败时回退为「仅发送文字」：识别不可用不应导致整条消息失败，
+ * 也不应让每个子模型都各自重复调用一次视觉模型。
  */
 async function augmentWithVision(messages, chatCfg, visionCfg, opts) {
   const imgs = extractImages(messages);
@@ -54,11 +56,18 @@ async function augmentWithVision(messages, chatCfg, visionCfg, opts) {
   if (chatCfg.supportsVision) return messages; // 聊天模型自身可看图
   if (!visionCfg) return messages;             // 无视觉模型，原样发送（可能报错，由上层处理）
 
-  const desc = await runSingle(visionCfg, [{
-    role: 'user',
-    content: '请尽可能详细地描述这张图片中的所有可见内容，包括文字、图表、布局与关键细节，以便另一个模型据此回答用户问题。',
-    attachments: imgs,
-  }], opts);
+  let desc = '';
+  try {
+    desc = await runSingle(visionCfg, [{
+      role: 'user',
+      content: '请尽可能详细地描述这张图片中的所有可见内容，包括文字、图表、布局与关键细节，以便另一个模型据此回答用户问题。',
+      attachments: imgs,
+    }], opts);
+  } catch (e) {
+    if (opts.signal && opts.signal.aborted) throw e; // 用户中止要原样上抛
+    console.warn('[chat] 视觉识别失败，回退为仅文字发送:', e?.message || e);
+    return stripImageAttachments(messages);
+  }
 
   // 用视觉识别结果替换图片附件，避免聊天模型收到它无法解析的图片
   return messages.map(m => {
@@ -67,6 +76,15 @@ async function augmentWithVision(messages, chatCfg, visionCfg, opts) {
       return { role: m.role, content: text };
     }
     return m;
+  });
+}
+
+/** 剥掉消息中的图片附件，保留纯文本（视觉识别失败时的降级路径） */
+function stripImageAttachments(messages) {
+  return messages.map(m => {
+    if (!m.attachments || !m.attachments.length) return m;
+    const rest = m.attachments.filter(a => a.type !== 'image');
+    return rest.length ? { ...m, attachments: rest } : { role: m.role, content: m.content || '' };
   });
 }
 
@@ -105,13 +123,19 @@ function buildSynthesis(messages, results) {
 async function* collabStream(args) {
   const { models, primary, visionModel, thinkingStrength, messages, opts } = args;
   const subs = models.filter(m => m !== primary && m.enabled !== false);
+  // 视觉增强只做一次、全体子模型复用：原来每个子模型各调一次视觉模型，
+  // N 个子模型就是 N 倍的图片 token 与延迟。识别结果对看图能力弱的子模型同样够用。
+  const needVision = [...subs, primary].some(m => !m.supportsVision);
+  const aug = needVision ? await augmentWithVision(messages, {}, visionModel, opts) : messages;
   const subResults = [];
   for (const m of subs) {
-    const aug = await augmentWithVision(messages, m, visionModel, opts);
     let text = '';
     try {
       text = await runSingle(m, aug, opts);
     } catch (e) {
+      // 用户点「停止」：中止不是子模型故障，必须原样上抛，
+      // 否则循环继续把剩余子模型全部跑完、主模型整合调用照常发出，白烧 token
+      if (opts.signal && opts.signal.aborted) throw e;
       text = `[模型 ${m.name} 调用失败：${e.message}]`;
     }
     subResults.push({ name: m.name, text });
@@ -154,7 +178,8 @@ export async function* chatStream(ctx, messages, opts = {}) {
   }
 
   const mode = opts.mode === 'collab' ? 'collab' : 'single';
-  const visionModel = models.find(m => m.supportsVision);
+  // 视觉模型候选必须带有效凭证：选一个没配 key 的视觉模型，图片消息注定失败
+  const visionModel = models.find(m => m.supportsVision && hasCred(m));
 
   if (mode === 'collab') {
     const enabledModels = models.filter(m => m.enabled !== false);
@@ -163,7 +188,7 @@ export async function* chatStream(ctx, messages, opts = {}) {
       yield { error: 'NO_PRIMARY', delta: '' };
       return;
     }
-    // 视觉模型即使未“启用”也纳入候选，保证图片识别可用
+    // 视觉模型即使未“启用”也纳入候选，保证图片识别可用（已带凭证校验）
     let pool = enabledModels;
     if (visionModel && !pool.includes(visionModel)) pool = [...pool, visionModel];
     yield* collabStream({ models: pool, primary, visionModel, thinkingStrength: opts.thinkingStrength, messages, opts });

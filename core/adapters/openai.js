@@ -4,6 +4,7 @@
 
 import { ModelClient } from '../model-base.js';
 import { postJson, fetchWithTimeout, HttpError } from '../http.js';
+import { streamLines, sseData } from '../sse.js';
 import { normalizeApiBase } from '../../shared/utils.js';
 import { redactUrl } from '../../shared/sanitize.js';
 
@@ -52,29 +53,21 @@ export class OpenAIAdapter extends ModelClient {
       signal,
     }, this.config.timeoutMs);
 
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = '';
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      const lines = buf.split('\n');
-      buf = lines.pop() || '';
-      for (const line of lines) {
-        const t = line.trim();
-        if (!t || !t.startsWith('data:')) continue;
-        const data = t.slice(5).trim();
-        if (data === '[DONE]') {
-          yield { delta: '', done: true };
-          return;
-        }
-        try {
-          const json = JSON.parse(data);
-          const delta = json.choices?.[0]?.delta?.content || '';
-          if (delta) yield { delta, done: false, meta: { raw: json } };
-        } catch (e) { console.warn('[openai] Failed to parse stream chunk:', e); }
+    for await (const line of streamLines(res.body)) {
+      const data = sseData(line);
+      if (data == null) continue;
+      if (data === '[DONE]') {
+        yield { delta: '', done: true };
+        return;
       }
+      let json;
+      try { json = JSON.parse(data); } catch (_) { continue; }
+      // 流内错误帧：部分网关在 HTTP 200 的 SSE 里下发 {"error": ...}，必须抛出而非吞掉
+      if (json.error) {
+        throw new HttpError('server', `流式错误: ${json.error.message || JSON.stringify(json.error).slice(0, 200)}`);
+      }
+      const delta = json.choices?.[0]?.delta?.content || '';
+      if (delta) yield { delta, done: false, meta: { raw: json } };
     }
     yield { delta: '', done: true };
   }

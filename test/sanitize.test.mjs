@@ -16,7 +16,8 @@ test('stripHtmlText: 解码后复活的标签必须再次剥离（编码型 XSS�
   // 只做"去标签→解实体"一遍的话，解码后会重新出现 <img ...>
   const out = stripHtmlText('&lt;img src=x onerror=alert(1)&gt;');
   assert.ok(!/<img/i.test(out), '不应残留 <img 标签，实际得到：' + out);
-  assert.ok(!/onerror/i.test(out) || !/<img/i.test(out));
+  // 旧断言 `!/onerror/ || !/<img/` 右支恒真（上一行已保证），形同虚设；改为独立断言
+  assert.ok(!/onerror/i.test(out), 'onerror 处理器不应残留，实际得到：' + out);
 });
 
 test('stripHtmlText: 双重编码也要清干净', () => {

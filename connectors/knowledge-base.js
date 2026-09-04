@@ -25,7 +25,7 @@ export class KnowledgeBaseConnector {
    * @param {Object} [opts] 可选：topK、过滤条件等
    * @returns {Promise<KbChunk[]>}
    */
-  // eslint-disable-next-line no-unused-vars
+   
   async search(query, opts) {
     throw new Error('search() 未实现');
   }
@@ -36,7 +36,7 @@ export class KnowledgeBaseConnector {
    * @param {Object} [meta] 可选元数据
    * @returns {Promise<boolean>} 是否成功
    */
-  // eslint-disable-next-line no-unused-vars
+   
   async add(content, meta) {
     throw new Error('add() 未实现');
   }

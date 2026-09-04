@@ -168,8 +168,10 @@ export function extractCodeBlocks(text) {
       buf.push(line);
     } else {
       const t = line.trim();
-      // 闭合围栏：同一字符、长度不小于开栏，且不得带 info string
-      if (t.length >= fenceLen && /^[`~]{3,}$/.test(t) && t[0] === fenceChar) {
+      // 闭合围栏：必须是「同一字符重复 fenceLen 次以上」的纯围栏行。
+      // 旧正则 /^[`~]{3,}$/ 允许 ` 和 ~ 混用（如 ```~~~），会被 CommonJS 规范外的
+      // 畸形围栏意外闭合；用反向引用锁定单一字符。
+      if (t.length >= fenceLen && new RegExp(`^\\${fenceChar}{${fenceLen},}$`).test(t)) {
         segs.push({ type: 'code', content: buf.join('\n'), lang });
         buf = [];
         inCode = false;

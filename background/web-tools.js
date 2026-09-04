@@ -87,7 +87,12 @@ function requestNavApproval(payload) {
  * 仅当 content script 不可达（如扩展重载后已打开的标签页未重新注入、或受保护页面）
  * 时，回退到 scripting 注入。全程带超时，避免 sendMessage 在接收端缺失时无限挂起。
  */
-const CS_TIMEOUT_MS = 8000;
+/**
+ * content script 消息超时。必须大于 wait_for 工具自身的默认等待超时（dom-tools.js 中
+ * DEFAULT_WAIT_FOR_TIMEOUT_MS=10000），否则 wait_for 还没等到条件，这里的 sendMessage
+ * 先超时回落到 executeScript——同一个工具被执行两遍（click 双击 / type 双输入）。
+ */
+const CS_TIMEOUT_MS = 15000;
 
 async function runInPage(tabId, tool, args) {
   // 带超时的 sendMessage（content script 缺失时浏览器可能长时间挂起或不报明确错误）
@@ -162,9 +167,9 @@ async function takeScreenshot(tab, a = {}) {
 /** 注入页面、在页面上下文中执行的辅助函数（必须自包含，不依赖外部作用域） */
 function pageScreenshotHelper(cmd, payload) {
   function locate(p) {
-    if (p && p.selector) { try { return document.querySelector(p.selector); } catch (e) { return null; } }
+    if (p && p.selector) { try { return document.querySelector(p.selector); } catch (_) { return null; } }
     if (p && p.xpath) {
-      try { return document.evaluate(p.xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue; } catch (e) { return null; }
+      try { return document.evaluate(p.xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue; } catch (_) { return null; }
     }
     if (p && p.text) {
       const tw = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
@@ -227,7 +232,7 @@ async function blobToDataUrl(blob) {
 async function takeFullPageScreenshot(tab) {
   const tabId = tab.id;
   const metrics = (await chrome.scripting.executeScript({ target: { tabId }, func: pageScreenshotHelper, args: ['metrics', null] }))[0].result;
-  const { fullW, fullH, vw, vh } = metrics;
+  const { fullH, vw, vh } = metrics;
   const maxTiles = 120;
   const totalTiles = Math.ceil(fullH / vh);
   if (totalTiles > maxTiles) {

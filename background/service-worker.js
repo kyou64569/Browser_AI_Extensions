@@ -22,7 +22,7 @@ import {
   getPptThemes, importPptTemplate, deletePptTemplate, exportPpt, exportPptForAutomate,
 } from './handlers/ppt.js';
 import {
-  handleAgentRun, handleAgentAbort, handleWorkflowRun,
+  handleAgentRun, handleWorkflowRun,
 } from './handlers/agent.js';
 import { handlePortConnect } from './handlers/streams.js';
 import {
@@ -280,12 +280,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     );
   }
 
-  // ── 自主 Agent / 中止 / 工作流 ──
+  // ── 自主 Agent / 工作流 ──
   if (msg.type === 'AGENT_RUN') {
     return handleAgentRun(msg, { respond: sendResponse });
-  }
-  if (msg.type === 'AGENT_ABORT') {
-    return handleAgentAbort({ respond: sendResponse });
   }
   if (msg.type === 'WORKFLOW_RUN') {
     return handleWorkflowRun(msg, { respond: sendResponse });

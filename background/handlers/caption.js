@@ -35,10 +35,14 @@ const WHISPER_LANG = {
  */
 export async function streamTranscribe(port, msg) {
   const { whisperModelIds, audio, language, mime } = msg;
+  // 端口回包统一经 try/catch：转写期间（可能长达 2 分钟）内容脚本随时可能关闭端口
+  // （页面刷新/用户停止）。此前 postMessage 直接抛异常会被 catch 当成「模型失败」，
+  // 触发对下一模型的重复上传——同一片音频被转发多次，纯烧配额。
+  const post = (m) => { try { port.postMessage(m); } catch (_) { /* 端口已断开，静默 */ } };
   // 内容脚本发来的是 Blob（或少数情况下的 ArrayBuffer）。跨进程传输后类型可能变化，
   // 这里只做 null 检查和 Blob/ArrayBuffer 的通用容量判断，避免误判。
   if (!audio) {
-    port.postMessage({ type: 'error', error: 'Whisper 转写失败：无效的音频数据' }); return;
+    post({ type: 'error', error: 'Whisper 转写失败：无效的音频数据' }); return;
   }
 
   // 兼容防错：跨进程（MessagePort）传输二进制 Uint8Array 时，可能在部分浏览器中被序列化为
@@ -59,7 +63,7 @@ export async function streamTranscribe(port, msg) {
   const all = await getWhisperModels();
   const matched = (Array.isArray(whisperModelIds) && whisperModelIds.length)
     ? all.filter(w => whisperModelIds.includes(w.id) && w.model) : all.filter(w => w.model);
-  if (!matched.length) { port.postMessage({ type: 'error', error: '未配置可用的 Whisper 模型' }); return; }
+  if (!matched.length) { post({ type: 'error', error: '未配置可用的 Whisper 模型' }); return; }
 
   // 轮询负载均衡：本片从 ((rr++) % N) 这个模型起步，把请求分摊到各模型；
   // 列表仍按"起步模型在前、其余在后"的顺序遍历，故某模型 429/失败时自动故障转移到下一个。
@@ -77,7 +81,7 @@ export async function streamTranscribe(port, msg) {
     let sawRate = false;
     for (const wm of list) {
       if (Date.now() - startedAt > WHISPER_TOTAL_TIMEOUT_MS) {
-        port.postMessage({ type: 'error', error: 'Whisper 转写超时（超过 2 分钟）' });
+        post({ type: 'error', error: 'Whisper 转写超时（超过 2 分钟）' });
         return;
       }
       const ctrl = new AbortController();
@@ -100,7 +104,7 @@ export async function streamTranscribe(port, msg) {
         const ct = (res.headers && typeof res.headers.get === 'function' && res.headers.get('content-type')) || '';
         if (!/text\/event-stream/i.test(ct)) {
           const json = await res.json().catch(() => ({}));
-          port.postMessage({ type: 'final', text: stripHallucination((json.text || '').trim()) });
+          post({ type: 'final', text: stripHallucination((json.text || '').trim()) });
           return;
         }
         const reader = res.body.getReader();
@@ -120,11 +124,11 @@ export async function streamTranscribe(port, msg) {
             if (!data || data === '[DONE]') continue;
             let json; try { json = JSON.parse(data); } catch (_) { continue; }
             if (json.type === 'transcript.text') {
-              port.postMessage({ type: 'partial', text: json.text || '' });
+              post({ type: 'partial', text: json.text || '' });
             } else if (json.type === 'transcript.delta') {
               full += json.delta || '';
               if (full.length > WHISPER_MAX_FULL_TEXT) full = full.slice(-WHISPER_MAX_FULL_TEXT);
-              port.postMessage({ type: 'partial', text: full });
+              post({ type: 'partial', text: full });
             } else if (json.type === 'transcript.done') {
               full = json.text || full;
             } else if (json.type === 'error') {
@@ -132,7 +136,7 @@ export async function streamTranscribe(port, msg) {
             }
           }
         }
-        port.postMessage({ type: 'final', text: stripHallucination(full.trim()) }); return;
+        post({ type: 'final', text: stripHallucination(full.trim()) }); return;
       } catch (e) {
         lastErr = e;
         if (isRateLimit(e)) sawRate = true;
@@ -145,7 +149,7 @@ export async function streamTranscribe(port, msg) {
     if (!sawRate) break;
     if (round < WHISPER_MAX_ROUNDS - 1) await sleep(WHISPER_RETRY_BACKOFF_MS * (round + 1));
   }
-  port.postMessage({ type: 'error', error: (lastErr && lastErr.message) || '所有 Whisper 模型均失败' });
+  post({ type: 'error', error: (lastErr && lastErr.message) || '所有 Whisper 模型均失败' });
 }
 
 // ---------- Offscreen Document 生命周期 ----------
@@ -206,7 +210,8 @@ export async function ensureOffscreen() {
       justification: '捕获标签页音频并恢复声音（绕过内容脚本 autoplay 限制）',
     });
   } catch (e) {
-    // 极小概率竞态下文档已存在，忽略——其端口会连上来
+    // 竞态下文档已存在：该文档的「SW 断连自动重连」逻辑（subtitle-offscreen.js 的
+    // connectSW 重试）会把端口补连回来，无需在这里处理
     if (!/already exists/i.test(String((e && e.message) || ''))) {
       console.warn('[offscreen] createDocument 失败', e);
     }
@@ -215,12 +220,24 @@ export async function ensureOffscreen() {
   }
 }
 
+// startCapture 互斥：侧边栏快速双击「开启字幕」/ 双标签页同时开启时，
+// 两个并发实例会互相 closeLingeringOffscreen，把对方刚建好的 offscreen 文档关掉。
+let _startCaptureChain = Promise.resolve();
+
 /**
- * 启动音频捕获：拿 streamId → 建 offscreen → 下发 START。
+ * 启动音频捕获：拿 streamId → 建 offscreen → 下发 START（串行化，见 _startCaptureChain）。
  * 调用前必须先关掉旧捕获，否则 getMediaStreamId 会报
  * "Cannot capture a tab with an active stream"，且标签页持续静音。
+ * @param {number} tabId
+ * @returns {Promise<{ok:boolean, error?:string}>}
  */
-export async function startCapture(tabId) {
+export function startCapture(tabId) {
+  const run = _startCaptureChain.then(() => startCaptureLocked(tabId));
+  _startCaptureChain = run.then(() => {}, () => {}); // 失败不断链
+  return run;
+}
+
+async function startCaptureLocked(tabId) {
   // 若已有捕获（含上一会话留下的孤儿 offscreen），先停掉
   const port = offscreen.getPort();
   if (port) { try { port.postMessage({ type: 'STOP' }); } catch (_) {} }
@@ -253,6 +270,8 @@ export async function stopCapture() {
   try { chrome.offscreen.closeDocument().catch(() => {}); } catch (_) {}
   offscreen.setPort(null);
   offscreen.setActiveTabId(null);
+  // 排到 startCapture 互斥链上执行，避免与并发 start 交叉（关掉对方刚建的文档）
+  _startCaptureChain = _startCaptureChain.then(() => {}, () => {});
 }
 
 /**

@@ -80,15 +80,33 @@ export async function fetchWithTimeout(url, init = {}, timeoutMs = 0) {
  * @param {AbortSignal} [signal]
  */
 export async function postJson(url, body, headers = {}, timeoutMs = 0, signal) {
-  const res = await fetchWithTimeout(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...headers },
-    body: JSON.stringify(body),
-    signal,
-  }, timeoutMs);
+  let timer;
+  const controller = new AbortController();
+  const signal2 = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+  if (timeoutMs > 0) timer = setTimeout(() => controller.abort(), timeoutMs);
+  let res;
   try {
+    res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...headers },
+      body: JSON.stringify(body),
+      signal: signal2,
+    });
+    if (!res.ok) {
+      const kind = classifyStatus(res.status);
+      const text = await res.text().catch(() => '');
+      throw new HttpError(kind, `HTTP ${res.status}: ${text.slice(0, 200)}`, res.status);
+    }
+    // JSON 解析也在超时窗口内：服务端「回了头、挂着不吐 body」时同样会被看门狗掐断
     return await res.json();
   } catch (e) {
-    throw new HttpError('unknown', `Invalid JSON response: ${e.message}`, res.status);
+    if (e instanceof HttpError) throw e;
+    if (e?.name === 'AbortError') {
+      if (signal && signal.aborted) throw new HttpError('aborted', '请求已被用户中止', 0);
+      throw new HttpError('timeout', `请求超时（>${timeoutMs}ms）`, 0);
+    }
+    throw new HttpError('unknown', `Invalid JSON response: ${e?.message || e}`, res?.status);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }

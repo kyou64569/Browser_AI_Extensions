@@ -46,16 +46,21 @@ export function estimateTokens(text) {
 export function splitSentences(text) {
   const s = String(text || '');
   if (!s.trim()) return [];
+  // 保护小数点：'3.5'/'0.5' 若按普通句点切分会碎成两句。用哨兵字符临时替换，
+  // 切完再还原（\u0000 在正常网页文本中不存在，无碰撞风险）。
+  const GUARD = '\u0000';
+  const guarded = s.replace(/(\d)\.(\d)/g, `$1${GUARD}$2`);
   // 匹配「若干非分隔符 + 若干分隔符」，或「行尾剩余的非分隔符串」
   const re = /[^。.!?！？\n]*[。.!?！？\n]+|[^。.!?！？\n]+$/g;
-  const parts = s.match(re);
+  const parts = guarded.match(re);
   if (!parts || parts.length === 0) return [{ text: s, sep: '' }];
+  const unguard = (t) => t.split(GUARD).join('.');
   const out = [];
   for (const p of parts) {
     const m = p.match(/^([\s\S]*?)([。.!?！？\n]*)$/);
     const body = m ? m[1] : p;
     const sep = m ? m[2] || '' : '';
-    out.push({ text: body, sep });
+    out.push({ text: unguard(body), sep });
   }
   if (out.length === 0) out.push({ text: s, sep: '' });
   return out;
@@ -127,7 +132,8 @@ export class RateGate {
     this.rpm = (typeof rpm === 'number' && rpm > 0) ? rpm : Infinity;
     this.tokenLog = []; // {t, n}
     this.reqLog = [];   // {t}  （每项 n=1）
-    this._floor = 2000; // tpm 自适应下限，防止瞬态误判把额度压到 0
+    this._floor = 2000;       // tpm 自适应下限兜底，防止瞬态误判把额度压到 0
+    this._reserveFloor = 0;   // 单批最大预约量（reserve 时记录），自适应下限不得低于它
     this._origTpm = this.tpm; // 记录原始配置上限，用于限流下调后的回弹封顶
     this._limitedAt = 0;      // 上次触发 TPM 限流的时间戳
   }
@@ -156,6 +162,8 @@ export class RateGate {
    * @param {number} tokens 预估的本次请求总 token 消耗（输入+输出）
    */
   async reserve(tokens) {
+    this._reserveFloor = Math.max(this._reserveFloor, tokens || 0);
+    this._floor = Math.max(2000, this._reserveFloor); // 下限至少容纳一个完整批次
     let totalWaited = 0;
     for (;;) {
       const now = Date.now();
@@ -189,7 +197,9 @@ export class RateGate {
     }
   }
 
-  /** 实际触发 TPM 限流后调用：把上限压到观测窗口用量的 0.8（保留下限），避免再次立即超限。 */
+  /** 实际触发 TPM 限流后调用：把上限压到观测窗口用量的 0.8（保留下限），避免再次立即超限。
+   *  下限不低于单批典型预约量（见 chunkUnits 默认 maxBatchTokens≈6000）：压到低于单批需求
+   *  会让 reserve() 永远凑不齐额度、吞吐塌缩到每窗口 1 批。 */
   onTokenRateLimit() {
     const now = Date.now();
     this._clean(now);

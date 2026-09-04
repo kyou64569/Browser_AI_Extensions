@@ -38,6 +38,22 @@ function safeCodePoint(n) {
 }
 
 /**
+ * 解码「不带分号的 legacy 命名实体」。
+ * HTML5 规范在文本态会解码这类实体：`&ltimg src=x onerror=...&gt` 浏览器解析出来就是
+ * `<img ...>`。decodeHtmlEntities 要求分号，解码不了这种形态；若 stripHtmlText 不同步
+ * 该行为，无分号序列会原样穿过标签剥离，成为「已消毒数据里藏着可复活标签结构」的隐患
+ * （当前调用点走 textContent 尚不可利用，但任何下游改用 innerHTML 立刻成 XSS）。
+ * @param {string} s
+ * @returns {string}
+ */
+function decodeLegacyEntitiesNoSemicolon(s) {
+  return String(s).replace(/&(lt|gt|amp|quot|nbsp)(?!;)/gi, (m, name) => {
+    const v = NAMED_ENTITIES[name.toLowerCase()];
+    return v === undefined ? m : v;
+  });
+}
+
+/**
  * 把 HTML 片段压成安全的纯文本。
  *
  * 关键点：必须在"解码实体"之后"再剥一次标签"。只做一遍
@@ -58,7 +74,7 @@ export function stripHtmlText(s) {
       // 丢弃标签。刻意要求 `<` 后紧跟字母或 `!`（不允许空格），
       // 否则 "a < b" 这类比较文本会被误吃掉。末尾 `>` 可选，兼容被截断的标签。
       .replace(/<\/?[a-z!][^>]*>?/gi, ' ');
-    out = decodeHtmlEntities(out);
+    out = decodeLegacyEntitiesNoSemicolon(decodeHtmlEntities(out));
     if (out === before) break;
   }
   // 兜底：中和仍"看起来像标签开头"的序列（解码后复活的 `<img`、未闭合的 `<script` 等）。
@@ -82,6 +98,47 @@ export function sanitizeHttpUrl(raw) {
   } catch (_) {
     return '';
   }
+}
+
+/**
+ * HTML 文本转义（& < > " '）。用于 innerHTML 模板插值。
+ * 注意必须连引号一起转义：只转义 & < > 的实现一旦被放进双引号属性
+ * （如 value="${escapeHtml(x)}"）就能被 `"` 闭合属性注入 onerror 等事件。
+ * @param {*} s
+ * @returns {string}
+ */
+export function escapeHtml(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+/**
+ * 校验媒体资源地址（图片/音频/视频 src），返回可直接拼进 `src="..."` 的安全值，否则 ''。
+ * 与 safeImageSrc 的差别：媒体 URL 常来自第三方网关的响应体（可能带查询参数、编码字符），
+ * 因此不能像截图路径那样一刀切拒绝空白——用 URL 解析 + 全量转义代替字符黑名单：
+ * 1) 协议白名单：http(s)、blob:、data:image|audio|video/<栅格或媒体格式>（不放行 svg：可携带脚本）
+ * 2) 输出前把 & < > " ' 全部转成实体，属性上下文里也不可能逃逸
+ * @param {string} raw
+ * @returns {string}
+ */
+export function safeMediaSrc(raw) {
+  const s = String(raw == null ? '' : raw).trim();
+  if (!s) return '';
+  let ok = false;
+  if (/^data:(image\/(png|jpe?g|gif|webp|bmp|avif)|audio\/(mpeg|mp3|ogg|wav|webm|m4a|aac|flac)|video\/(mp4|webm|ogg|quicktime));/i.test(s)) ok = true;
+  else if (/^blob:/i.test(s)) ok = true;
+  else {
+    try {
+      const u = new URL(s);
+      ok = u.protocol === 'http:' || u.protocol === 'https:';
+    } catch (_) { ok = false; }
+  }
+  if (!ok) return '';
+  return escapeHtml(s);
 }
 
 /**

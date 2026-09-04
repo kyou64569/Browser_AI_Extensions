@@ -97,8 +97,19 @@ export async function getPptThemes() {
 /** PPT_IMPORT_TEMPLATE：解析用户上传的 .pptx 并存入 storage（作为默认模板） */
 export async function importPptTemplate({ data, name }) {
   if (!data) return { ok: false, error: '未收到模板数据' };
-  const bytes = base64ToBytes(data);
-  const parsed = await parseTemplate(bytes);
+  let bytes;
+  try {
+    bytes = base64ToBytes(data);
+  } catch (e) {
+    return { ok: false, error: '模板数据不是有效的 base64：' + ((e && e.message) || e) };
+  }
+  let parsed;
+  try {
+    parsed = await parseTemplate(bytes);
+  } catch (e) {
+    // 损坏/非 pptx 文件此前会被笼统报成「模板解析失败」而丢失真实原因
+    return { ok: false, error: '模板解析失败：' + ((e && e.message) || e) };
+  }
   // 存整份模板原始字节（base64）+ 轻量元数据；导出时实时重解析，
   // 这样 parseTemplate 的任何改进都能自动生效，无需用户反复重传。
   const stored = {
@@ -109,9 +120,11 @@ export async function importPptTemplate({ data, name }) {
     palette: parsed.palette,
     sldSz: parsed.sldSz,
   };
-  await chrome.storage.local.set({ [PPT_CUSTOM_KEY]: stored });
-  if (chrome.runtime.lastError) {
-    return { ok: false, error: '模板过大无法保存（' + (chrome.runtime.lastError.message || '存储配额超限') + '），请换用体积更小的模板' };
+  // storage 的 Promise API 配额超限时以异常形式抛出（回调式的 lastError 检查在此路径下是死代码）
+  try {
+    await chrome.storage.local.set({ [PPT_CUSTOM_KEY]: stored });
+  } catch (e) {
+    return { ok: false, error: '模板过大无法保存（' + ((e && e.message) || '存储配额超限') + '），请换用体积更小的模板' };
   }
   return {
     ok: true, name: stored.name, palette: parsed.palette, layoutPhs: parsed.layoutPhs,
@@ -122,9 +135,10 @@ export async function importPptTemplate({ data, name }) {
 
 /** DELETE_PPT_TEMPLATE：删除自定义模板 */
 export async function deletePptTemplate() {
-  await chrome.storage.local.remove(PPT_CUSTOM_KEY);
-  if (chrome.runtime.lastError) {
-    return { ok: false, error: '删除失败：' + (chrome.runtime.lastError.message || '未知错误') };
+  try {
+    await chrome.storage.local.remove(PPT_CUSTOM_KEY);
+  } catch (e) {
+    return { ok: false, error: '删除失败：' + ((e && e.message) || '未知错误') };
   }
   return { ok: true };
 }
@@ -169,7 +183,19 @@ export async function exportPptForAutomate(args = {}) {
     if (!outline.slides.length) return { ok: false, error: 'PPT 没有幻灯片内容' };
     const blob = await exporter.export(outline, await resolvePptOpts({ template: args.template }));
     const dataUrl = await blobToDataUrl(blob);
-    chrome.downloads.download({ url: dataUrl, filename: sanitizeFilename(outline.title) + '.pptx' }, () => {});
+    // downloads.download 是回调式 API：lastError（配额/文件名非法/用户取消）不读会变成
+    // "Unchecked runtime.lastError"，且这里必须如实向 Agent 回报失败，否则模型会谎称完成
+    const ok = await new Promise((resolve) => {
+      try {
+        chrome.downloads.download({ url: dataUrl, filename: sanitizeFilename(outline.title) + '.pptx' }, (downloadId) => {
+          const err = chrome.runtime.lastError;
+          resolve(!err && downloadId != null);
+        });
+      } catch (_) {
+        resolve(false);
+      }
+    });
+    if (!ok) return { ok: false, error: 'PPT 文件下载失败（浏览器拒绝下载或用户取消）' };
     return { ok: true, result: { message: `PPT「${outline.title}」已下载`, slideCount: outline.slides.length, filename: sanitizeFilename(outline.title) + '.pptx' } };
   } catch (e) {
     return { ok: false, error: 'PPT 导出失败：' + (e?.message || e) };

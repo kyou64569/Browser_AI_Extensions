@@ -48,6 +48,9 @@ export function parseRetryAfterSec(e) {
   return m ? Number(m[1]) : null;
 }
 
+/** 单次退避上限：畸形/超大的 retry-after（如 86400）不应卡死整批翻译 */
+const RETRY_BACKOFF_CAP_MS = 2 * 60 * 1000;
+
 /**
  * 计算本次退避时长（ms）。
  * @param {Error} e
@@ -55,8 +58,10 @@ export function parseRetryAfterSec(e) {
  */
 export function backoffMs(e, round) {
   const explicit = parseRetryAfterSec(e);
-  if (isTokenRateLimit(e)) return (explicit != null ? explicit : RETRY_TPM_BACKOFF_MS / 1000) * 1000;
-  return explicit != null ? explicit * 1000 : RETRY_BASE_BACKOFF_MS * (round + 1);
+  let ms;
+  if (isTokenRateLimit(e)) ms = (explicit != null ? explicit : RETRY_TPM_BACKOFF_MS / 1000) * 1000;
+  else ms = explicit != null ? explicit * 1000 : RETRY_BASE_BACKOFF_MS * (round + 1);
+  return Math.min(ms, RETRY_BACKOFF_CAP_MS);
 }
 
 /**

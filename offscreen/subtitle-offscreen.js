@@ -45,17 +45,53 @@ let silenceMs = 0;        // 段内当前连续静音时长
 let lastStep = null;      // 上一 STEP 的 PCM（preroll：语音起始前一步，避免吃掉句首辅音）
 
 let swPort = null;        // 与 SW 的端口
+let swReconnectTimer = null; // SW 断连后的重连定时器
+let swReconnectAttempts = 0; // 重连退避计数（连续失败时逐步拉长间隔）
+
+const SW_RECONNECT_MAX_MS = 10000; // 重连退避上限
 
 function connectSW() {
+  // 先取消未完成的重连计划（本调用即重连本身或首次连接）
+  if (swReconnectTimer) { clearTimeout(swReconnectTimer); swReconnectTimer = null; }
   swPort = chrome.runtime.connect({ name: 'offscreen-caption' });
   swPort.onMessage.addListener((msg) => {
     if (!msg) return;
     if (msg.type === 'START') startCapture(msg.streamId);
     else if (msg.type === 'STOP') stopCapture();
   });
-  swPort.onDisconnect.addListener(() => { swPort = null; stopCapture(); });
+  swPort.onDisconnect.addListener(() => {
+    swPort = null;
+    stopCapture();
+    scheduleSWReconnect();
+  });
+  swReconnectAttempts = 0;
   // 通知 SW：离屏文档已就绪，可接收 START
   try { chrome.runtime.sendMessage({ type: 'OFFSCREEN_CAPTION_READY' }); } catch (_) {}
+}
+
+/**
+ * SW 端口断开后的自动重连。
+ *
+ * 为什么必须有：MV3 service worker 空闲约 30 秒被浏览器终止（侧边栏关闭、
+ * 纯静音段 VAD 长时间不发消息时都会发生）。SW 一死端口即断开——若只在断开时
+ * stopCapture() 而不重连，捕获链路就此死亡，而 startCapture 早已返回 ok:true，
+ * UI 毫无感知；SW 重启后 caption.js 也无法让旧 offscreen 文档「自己接回来」。
+ * chrome.runtime.connect 会唤醒休眠的 SW，因此重连是可靠的自愈路径。
+ * 退避重试上限后放弃（如扩展正在被卸载，context 已失效时 connect 会抛异常终止循环）。
+ */
+function scheduleSWReconnect() {
+  if (swReconnectTimer) return;
+  swReconnectAttempts++;
+  const delay = Math.min(500 * Math.pow(2, Math.min(swReconnectAttempts - 1, 5)), SW_RECONNECT_MAX_MS);
+  swReconnectTimer = setTimeout(() => {
+    swReconnectTimer = null;
+    try {
+      connectSW();
+    } catch (e) {
+      // 扩展上下文已失效（重载/卸载中）：无法再连接，放弃重试
+      console.warn('[offscreen] SW 重连失败（扩展上下文可能已失效）:', e && e.message);
+    }
+  }, delay);
 }
 
 async function startCapture(streamId) {

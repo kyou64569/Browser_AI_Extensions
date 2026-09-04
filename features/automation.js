@@ -269,8 +269,9 @@ export function buildToolSystemPrompt() {
 
 const RE_BLOCK = /```toolcall\s*\n([\s\S]*?)```|<<TOOLCALL>>\s*([\s\S]*?)\s*<<\/TOOLCALL>>|<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/gi;
 
-/** 从 openIdx（s[openIdx] === '{'）开始做括号匹配，返回匹配的右花括号下标；失败返回 -1 */
-function matchBrace(s, openIdx) {
+/** 从 openIdx（s[openIdx] === '{'）开始做括号匹配，返回匹配的右花括号下标；失败返回 -1。
+ *  导出供 agent.js 的反思 JSON 提取复用（贪婪正则截不准嵌套对象）。 */
+export function matchBrace(s, openIdx) {
   let depth = 0, inStr = false, esc = false;
   for (let i = openIdx; i < s.length; i++) {
     const c = s[i];
@@ -313,13 +314,29 @@ function extractCalls(text) {
   };
   if (!text) return calls;
 
-  // 1) 代码块 / 标签 / XML 形式
+  // 1) 代码块 / 标签 / XML 形式。块内可能含多个 JSON 对象（模型偶发把多个调用写进同一块），
+  //    逐个做括号匹配全部解析；删除区间取整个匹配块（含围栏/标签），否则 stripToolCall
+  //    只删 JSON 会留下空的 ```toolcall 围栏。
   let m;
   RE_BLOCK.lastIndex = 0;
   while ((m = RE_BLOCK.exec(text)) !== null) {
-    const json = (m[1] || m[2] || m[3] || '').trim();
-    const c = tryParseCall(json);
-    if (c) push(c, m.index, RE_BLOCK.lastIndex);
+    const raw = (m[1] || m[2] || m[3] || '').trim();
+    if (!raw) continue;
+    let parsed = false;
+    let i = 0;
+    while (i < raw.length) {
+      if (raw[i] !== '{') { i++; continue; }
+      const end = matchBrace(raw, i);
+      if (end === -1) break;
+      const c = tryParseCall(raw.slice(i, end + 1));
+      if (c) { push(c, m.index, RE_BLOCK.lastIndex); parsed = true; }
+      i = end + 1;
+    }
+    if (!parsed) {
+      // 兼容非 JSON 形式的整块内容（保持旧行为：整体作为 JSON 试一次，失败即放弃）
+      const c = tryParseCall(raw);
+      if (c) push(c, m.index, RE_BLOCK.lastIndex);
+    }
   }
 
   // 2) 关键字形式：toolcall / tool_call / function_call（后可跟可选的 : = 或 [ 再接 {）
@@ -343,8 +360,9 @@ function extractCalls(text) {
 
   // 2.5) 中文「调用/使用/执行 工具」格式（防御性兜底）：模型偶尔用中文工具调用
   // （如“调用工具：screenshot”或“使用工具 click”），若不被识别会在终止分支被误判为最终回答、
-  // 导致像 SenseNova 那样提前结束。仅当名称命中已知工具清单才视为有效调用，以降低普通中文
-  // 说明文字误触发的概率。
+  // 导致像 SenseNova 那样提前结束。仅当名称命中已知工具清单且**其后紧跟参数 JSON** 才视为
+  // 有效调用——「调用工具 screenshot 截个图看看」这类自然语言说明不带参数块，不应被当成调用
+  // （误触发会执行真实 DOM 操作）。
   const CN = /(?:调用|使用|执行)\s*工具\s*[:：]?\s*([A-Za-z_][\w-]*)/gi;
   let cn;
   CN.lastIndex = 0;
@@ -352,23 +370,16 @@ function extractCalls(text) {
     const name = cn[1];
     let scan = cn.index + cn[0].length;
     while (scan < text.length && /\s/.test(text[scan])) scan++;
+    if (text[scan] !== '{') continue; // 无参数块：视为普通说明文字，跳过
+    const e = matchBrace(text, scan);
+    if (e === -1) continue;
     let args = {};
-    // 默认结束点：名称之后（不吞掉后续空格/文字，保证 stripToolCall 不会误删正文）。
-    // 注意：中文格式的名称在 JSON 外部，故参数 JSON 不含 name 字段，不能复用 tryParseCall
-    // （它要求 JSON 内必须有 name），而应当把整段 JSON 直接当作 args 解析。
-    let end = cn.index + cn[0].length;
-    if (text[scan] === '{') {
-      const e = matchBrace(text, scan);
-      if (e !== -1) {
-        try {
-          const o = JSON.parse(text.slice(scan, e + 1));
-          if (o && typeof o === 'object' && !Array.isArray(o)) args = o;
-        } catch (_) { /* 非法 JSON 忽略，按无参数处理 */ }
-        end = e + 1;
-      }
-    }
+    try {
+      const o = JSON.parse(text.slice(scan, e + 1));
+      if (o && typeof o === 'object' && !Array.isArray(o)) args = o;
+    } catch (_) { /* 非法 JSON 忽略，按无参数处理 */ }
     // 使用大小写不敏感匹配，避免模型输出 "Screenshot" 而非 "screenshot" 时被忽略
-    if (TOOLS.some(t => t.name.toLowerCase() === name.toLowerCase())) push({ name, args }, cn.index, end);
+    if (TOOLS.some(t => t.name.toLowerCase() === name.toLowerCase())) push({ name, args }, cn.index, e + 1);
   }
 
   // 3) 兜底：整段中任何含 name 的 JSON 对象（仅在前两步无果时启用，避免误伤普通文本）

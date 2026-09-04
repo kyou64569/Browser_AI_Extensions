@@ -2,16 +2,22 @@
 # dev-server.py  （零依赖，仅用 Python 标准库）
 # 功能同 dev-server.mjs：静态托管 + 可选 /proxy/<vendor>/<path> 反向代理。
 # 说明：Python 版代理为“整块缓冲”转发（非增量流式），预览足够；如需打字机流式效果请用 Node 版。
+#
+# 安全约定（与 dev-server.mjs 一致）：
+# - 只绑定 127.0.0.1，密钥文件/.git/node_modules 不经静态服务暴露。
+# - 代理只接受本机来源，拒绝跨站页面 CSRF 驱动。
 
 import http.server
 import socketserver
 import urllib.request
 import urllib.error
+import urllib.parse
 import json
 import os
 import re
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
+HOST = os.environ.get('HOST', '127.0.0.1')
 PORT = int(os.environ.get('PORT', '5173'))
 
 VENDOR_BASE = {
@@ -36,14 +42,39 @@ MIME = {
     '.json': 'application/json; charset=utf-8',
 }
 
+# 静态服务永不下发的路径
+STATIC_DENYLIST = ['secrets.json', '.git', 'node_modules']
+
+
+def _denied(urlpath):
+    p = urlpath.lower()
+    return any(d in p for d in ('/' + x for x in STATIC_DENYLIST))
+
+
+def _local_origin(headers):
+    host = (headers.get('Host') or '').split(':')[0]
+    if host not in ('localhost', '127.0.0.1', '[::1]', '::1'):
+        return False
+    origin = headers.get('Origin')
+    if not origin:
+        return True
+    try:
+        o = urllib.parse.urlparse(origin)
+        return o.hostname in ('localhost', '127.0.0.1', '::1')
+    except Exception:
+        return False
+
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def _serve_static(self):
-        urlpath = urllib.parse.unquote(self.path.split('?')[0])
+        urlpath = urllib.parse.unquote(self.path.split('?')[0], errors='replace')
         if urlpath == '/':
             urlpath = '/preview/index.html'
+        if _denied(urlpath):
+            self.send_error(403); return
         fp = os.path.normpath(os.path.join(ROOT, urlpath.lstrip('/')))
-        if not fp.startswith(ROOT):
+        # normpath 后必须是 ROOT 或其子路径；startsWith 裸比较会被同前缀兄弟目录绕过
+        if fp != ROOT and not fp.startswith(ROOT + os.sep):
             self.send_error(403); return
         if not os.path.isfile(fp):
             self.send_error(404); return
@@ -59,6 +90,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         base = VENDOR_BASE.get(vendor)
         if not base:
             self.send_error(400, 'unknown vendor'); return
+        if not _local_origin(self.headers):
+            self.send_error(403, 'proxy only serves local origins'); return
         target = base + '/' + rest
         if vendor == 'gemini' and secrets.get('gemini'):
             target = re.sub(r'([?&]key=)[^&]*', r'\1' + secrets['gemini'], target)
@@ -116,7 +149,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 if __name__ == '__main__':
     # 用多线程服务器：流式代理请求较慢（最长 120s）时，仍可同时响应页面静态 JS/CSS，
     # 避免对话期间预览页“卡住加载”。（与 .mjs 版的异步并发行为对齐）
-    with socketserver.ThreadingTCPServer(('', PORT), Handler) as s:
-        print(f'\n  本地预览已启动:  http://localhost:{PORT}')
+    with socketserver.ThreadingTCPServer((HOST, PORT), Handler) as s:
+        print(f'\n  本地预览已启动:  http://localhost:{PORT}（仅监听 {HOST}）')
         print(f'  代理模式:       {"已配置密钥" if secrets else "未配置 preview/secrets.json（仅直连模式）"}\n')
         s.serve_forever()

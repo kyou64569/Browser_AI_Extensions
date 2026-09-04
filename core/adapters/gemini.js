@@ -4,14 +4,23 @@
 
 import { ModelClient } from '../model-base.js';
 import { postJson, fetchWithTimeout, HttpError } from '../http.js';
+import { streamLines, sseData } from '../sse.js';
 import { normalizeApiBase } from '../../shared/utils.js';
 import { redactUrl } from '../../shared/sanitize.js';
 
+/** Gemini 思考预算（tokens）档位映射；不传时由模型动态决定 */
+const GEMINI_THINKING_BUDGET = { low: 1024, medium: 4096, high: 12288 };
+
 export class GeminiAdapter extends ModelClient {
-  /** 流式与非流式 endpoint 不同（流式加 ?alt=sse） */
+  /**
+   * 流式与非流式 endpoint 不同。
+   * 流式必须带 ?alt=sse：官方 REST 不带该参数时返回的是 JSON 数组
+   * （数组模式还带尾逗号，逐行 JSON.parse 根本无法解析），只有 alt=sse 才是 SSE 事件流。
+   */
   _endpoint(stream) {
     const base = normalizeApiBase(this.config.apiBase);
-    return `${base}/models/${this.config.model}:${stream ? 'streamGenerateContent' : 'generateContent'}`;
+    const method = stream ? 'streamGenerateContent?alt=sse' : 'generateContent';
+    return `${base}/models/${this.config.model}:${method}`;
   }
 
   /**
@@ -48,7 +57,7 @@ export class GeminiAdapter extends ModelClient {
   }
 
   async *_stream(req, signal) {
-    const { maxTokens, temperature, topP, top_p } = req.options || {};
+    const { maxTokens, temperature, topP, top_p, thinkingStrength } = req.options || {};
     const body = this._toVendor(req);
     const generationConfig = {
       ...(maxTokens != null ? { maxOutputTokens: maxTokens } : {}),
@@ -57,38 +66,43 @@ export class GeminiAdapter extends ModelClient {
       ...(top_p != null ? { topP: top_p } : {}),
     };
     if (Object.keys(generationConfig).length) body.generationConfig = generationConfig;
+    // thinkingStrength 映射为 Gemini thinkingConfig（此前被静默丢弃，UI 档位形同虚设）
+    if (thinkingStrength && thinkingStrength !== 'off') {
+      body.generationConfig = body.generationConfig || {};
+      body.generationConfig.thinkingConfig = { thinkingBudget: GEMINI_THINKING_BUDGET[thinkingStrength] || 0 };
+    }
     const res = await fetchWithTimeout(this._endpoint(true), {
       method: 'POST',
       headers: this._headers(),
       body: JSON.stringify(body),
       signal,
     }, this.config.timeoutMs);
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = '';
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      const lines = buf.split('\n');
-      buf = lines.pop() || '';
-      for (const line of lines) {
-        const t = line.trim();
-        if (!t) continue;
-        try {
-          const json = JSON.parse(t);
-          const candidate = json.candidates?.[0];
-          if (!candidate?.content?.parts) continue;
-          const text = candidate.content.parts.map(p => p.text || '').join('') || '';
-          if (text) yield { delta: text, done: false, meta: { raw: json } };
-        } catch (e) { console.warn('[gemini] Failed to parse stream chunk:', e); }
+    for await (const line of streamLines(res.body)) {
+      const data = sseData(line);
+      if (data == null) continue;
+      let json;
+      try { json = JSON.parse(data); } catch (_) { continue; }
+      // 流内错误帧：官方在 HTTP 200 的 SSE 里也可能下发 error 事件（如配额/内部错误），
+      // 不抛出会被上层误判为「空输出的成功调用」
+      if (json.error) {
+        throw new HttpError('server', `Gemini 流式错误: ${json.error.message || JSON.stringify(json.error).slice(0, 200)}`);
       }
+      if (json.promptFeedback?.blockReason) {
+        throw new HttpError('unknown', `Gemini 安全拦截: ${json.promptFeedback.blockReason}`);
+      }
+      const candidate = json.candidates?.[0];
+      if (candidate?.finishReason === 'SAFETY') {
+        throw new HttpError('unknown', 'Gemini 安全拦截: SAFETY');
+      }
+      if (!candidate?.content?.parts) continue;
+      const text = candidate.content.parts.map(p => p.text || '').join('') || '';
+      if (text) yield { delta: text, done: false, meta: { raw: json } };
     }
     yield { delta: '', done: true };
   }
 
   async *_nonStream(req, signal) {
-    const { maxTokens, temperature, topP, top_p } = req.options || {};
+    const { maxTokens, temperature, topP, top_p, thinkingStrength } = req.options || {};
     const body = this._toVendor(req);
     const generationConfig = {
       ...(maxTokens != null ? { maxOutputTokens: maxTokens } : {}),
@@ -97,8 +111,21 @@ export class GeminiAdapter extends ModelClient {
       ...(top_p != null ? { topP: top_p } : {}),
     };
     if (Object.keys(generationConfig).length) body.generationConfig = generationConfig;
+    if (thinkingStrength && thinkingStrength !== 'off') {
+      body.generationConfig = body.generationConfig || {};
+      body.generationConfig.thinkingConfig = { thinkingBudget: GEMINI_THINKING_BUDGET[thinkingStrength] || 0 };
+    }
     const json = await postJson(this._endpoint(false), body, this._headers(), this.config.timeoutMs, signal);
+    if (json.error) {
+      throw new HttpError('server', `Gemini 错误: ${json.error.message || JSON.stringify(json.error).slice(0, 200)}`);
+    }
+    if (json.promptFeedback?.blockReason) {
+      throw new HttpError('unknown', `Gemini 安全拦截: ${json.promptFeedback.blockReason}`);
+    }
     const candidate = json.candidates?.[0];
+    if (candidate?.finishReason === 'SAFETY') {
+      throw new HttpError('unknown', 'Gemini 安全拦截: SAFETY');
+    }
     if (!candidate?.content?.parts) {
       yield { delta: '', done: true, meta: { raw: json } };
       return;

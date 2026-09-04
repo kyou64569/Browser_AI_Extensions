@@ -77,6 +77,14 @@ test('splitSentences: 中英文句末都能切分', () => {
   assert.ok(zh.length >= 3, '中文应切成多句，实际：' + JSON.stringify(zh));
 });
 
+test('splitSentences: 小数点不切分（审查修复回归：3.5 不再碎成两句）', () => {
+  const parts = splitSentences('Pi is 3.5 times. Next one');
+  assert.equal(parts.length, 2, '小数点不应成为切分点，实际：' + JSON.stringify(parts));
+  const joined = parts.map(p => p.text + p.sep).join('');
+  assert.ok(joined.includes('3.5 times'), '小数必须完整保留，实际：' + joined);
+  assert.equal(splitSentences('value 0.5')[0].text, 'value 0.5');
+});
+
 test('splitSentences: 空输入返回空数组', () => {
   assert.deepEqual(splitSentences(''), []);
 });

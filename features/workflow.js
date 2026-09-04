@@ -60,6 +60,9 @@
  * @property {string} [error] 错误信息
  */
 
+/** 跳过节点的 ctx.errors 标记值（与真实失败区分开，见 _shouldSkip） */
+const SKIP_MARKER = '上游节点失败，跳过';
+
 export class WorkflowEngine {
   constructor() {
     /** @type {Map<string, (input: any, config: object, ctx: WorkflowContext) => Promise<any>>} */
@@ -119,9 +122,12 @@ export class WorkflowEngine {
     for (const nodeId of sorted) {
       const node = nodeMap.get(nodeId);
 
-      // 检查上游是否有错误（如果有且未设置 continueOnError，跳过）
+      // 检查上游是否有错误（如果有且未设置 continueOnError，跳过）。
+      // 跳过必须同时写入 ctx.errors：这样「上游失败→本节点被跳过→下下游节点」
+      // 才能级联跳过，而不是让下下游拿原始 ctx.input 照常执行，造成数据流错乱。
       if (this._shouldSkip(nodeId, nodeMap, edges, ctx)) {
-        report(nodeId, 'skipped', { error: '上游节点失败，跳过' });
+        ctx.errors.set(nodeId, SKIP_MARKER);
+        report(nodeId, 'skipped', { error: SKIP_MARKER });
         continue;
       }
 
@@ -132,7 +138,7 @@ export class WorkflowEngine {
         const error = `未知节点类型: ${node.type}`;
         ctx.errors.set(nodeId, error);
         report(nodeId, 'error', { error });
-        if (!node.continueOnError) break;
+        if (!node.continueOnError) continue;
         continue;
       }
 
@@ -145,7 +151,7 @@ export class WorkflowEngine {
         const error = e?.message || String(e);
         ctx.errors.set(nodeId, error);
         report(nodeId, 'error', { error });
-        if (!node.continueOnError) break;
+        if (!node.continueOnError) continue;
       }
     }
 
@@ -166,6 +172,11 @@ export class WorkflowEngine {
     for (const node of nodes) {
       if (!node.id) throw new Error('节点缺少 id');
       if (!node.type) throw new Error(`节点 "${node.id}" 缺少 type`);
+    }
+
+    // 重复 id 会让 nodeMap 静默覆盖、节点被跳过执行，必须在入口拦下
+    if (nodeIds.size !== nodes.length) {
+      throw new Error('存在重复的节点 id');
     }
 
     for (const edge of edges) {
@@ -214,15 +225,28 @@ export class WorkflowEngine {
 
   /**
    * 判断是否应跳过当前节点
+   * - 上游真实失败且未开 continueOnError → 跳过
+   * - 上游本身是被级联跳过的（从未执行）→ 无条件跳过（continueOnError 对「没跑过」无意义）
+   * - 上游是条件节点且本边端口与条件结果不符 → 跳过（true/false 分支路由）
    * @private
    */
   _shouldSkip(nodeId, nodeMap, edges, ctx) {
     const upstreamEdges = edges.filter(e => e.to === nodeId);
     for (const edge of upstreamEdges) {
       const upstream = nodeMap.get(edge.from);
-      if (ctx.errors.has(edge.from) && !upstream?.continueOnError) {
-        return true;
+
+      // 条件节点端口路由：不命中的分支及其下游一律跳过
+      if (upstream?.type === 'condition' && ctx.results.has(edge.from)) {
+        const res = ctx.results.get(edge.from);
+        const cond = !!(res && typeof res === 'object' && res._conditionResult);
+        const wantTrue = (edge.port || 'true') !== 'false';
+        if (cond !== wantTrue) return true;
+        continue;
       }
+
+      if (!ctx.errors.has(edge.from)) continue;
+      if (ctx.errors.get(edge.from) === SKIP_MARKER) return true;
+      if (!upstream?.continueOnError) return true;
     }
     return false;
   }
@@ -262,10 +286,10 @@ export class WorkflowEngine {
  */
 export async function extractNode(input, config, ctx) {
   const { extractMain } = ctx.globals.get('api') || {};
-  if (typeof extractMain === 'function') {
-    return await extractMain(input, config);
+  if (typeof extractMain !== 'function') {
+    throw new Error('提取 API 不可用（未注入 extractMain）');
   }
-  return input;
+  return await extractMain(input, config);
 }
 
 /**
@@ -273,10 +297,10 @@ export async function extractNode(input, config, ctx) {
  */
 export async function summarizeNode(input, config, ctx) {
   const { summarize } = ctx.globals.get('api') || {};
-  if (typeof summarize === 'function') {
-    return await summarize(input, config, ctx.globals.get('models'));
+  if (typeof summarize !== 'function') {
+    throw new Error('总结 API 不可用（未注入 summarize）');
   }
-  return typeof input === 'string' ? input : JSON.stringify(input);
+  return await summarize(input, config, ctx.globals.get('models'));
 }
 
 /**
@@ -284,11 +308,11 @@ export async function summarizeNode(input, config, ctx) {
  */
 export async function translateNode(input, config, ctx) {
   const { translate } = ctx.globals.get('api') || {};
-  if (typeof translate === 'function') {
-    const texts = Array.isArray(input) ? input : [input];
-    return await translate(texts, config.targetLang || '中文（简体）', config.modelId, ctx.globals.get('models'));
+  if (typeof translate !== 'function') {
+    throw new Error('翻译 API 不可用（未注入 translate）');
   }
-  return input;
+  const texts = Array.isArray(input) ? input : [input];
+  return await translate(texts, config.targetLang || '中文（简体）', config.modelId, ctx.globals.get('models'));
 }
 
 /**
@@ -296,11 +320,12 @@ export async function translateNode(input, config, ctx) {
  */
 export async function kbSearchNode(input, config, ctx) {
   const { kbSearch } = ctx.globals.get('api') || {};
-  if (typeof kbSearch === 'function') {
-    const query = typeof input === 'string' ? input : input?.content || '';
-    return await kbSearch(query, config);
+  if (typeof kbSearch !== 'function') {
+    // 返回伪成功会让下游把「没检索」当「检索到空结果」，必须抛错让引擎记录
+    throw new Error('知识库 API 不可用（未注入 kbSearch）');
   }
-  return { chunks: [], error: '知识库 API 不可用' };
+  const query = typeof input === 'string' ? input : input?.content || '';
+  return await kbSearch(query, config);
 }
 
 /**
@@ -352,10 +377,10 @@ export async function waitNode(input, config, ctx) {
  */
 export async function automateNode(input, config, ctx) {
   const { execTool } = ctx.globals.get('api') || {};
-  if (typeof execTool === 'function' && config.tool) {
-    return await execTool(config.tool, config.args || {});
+  if (typeof execTool !== 'function' || !config.tool) {
+    throw new Error('自动化 API 不可用或未配置 tool');
   }
-  return input;
+  return await execTool(config.tool, config.args || {});
 }
 
 /**
@@ -363,10 +388,10 @@ export async function automateNode(input, config, ctx) {
  */
 export async function exportPptNode(input, config, ctx) {
   const { exportPpt } = ctx.globals.get('api') || {};
-  if (typeof exportPpt === 'function') {
-    return await exportPpt(input, config);
+  if (typeof exportPpt !== 'function') {
+    throw new Error('PPT 导出 API 不可用（未注入 exportPpt）');
   }
-  return { format: 'pptx', error: 'PPT 导出 API 不可用' };
+  return await exportPpt(input, config);
 }
 
 /**

@@ -12,6 +12,15 @@ import { recordCall } from '../shared/usage.js';
 /** 失败冷却时间：10 分钟内不再重试该模型 */
 export const COOLDOWN_MS = 10 * 60 * 1000;
 
+/**
+ * 失败记录表（模块级：跨 FallbackManager 实例共享）。
+ * 调用方（chat/summarize/selection 等）每次调用都 new 一个 FallbackManager，
+ * 若把失败记录挂在实例上，冷却机制永远不生效。挂到模块级后在 SW 存活期内
+ * 跨调用生效；SW 休眠重启后重置——MV3 下这是可接受的粒度。
+ * @type {Map<string,{reason:string,time:number}>}
+ */
+const FAIL_LOG = new Map();
+
 export class FallbackManager {
   /**
    * @param {object} opts
@@ -19,8 +28,6 @@ export class FallbackManager {
    */
   constructor(opts = {}) {
     this.onFallback = opts.onFallback || (() => {});
-    /** @type {Map<string,{reason:string,time:number}>} 模型 id -> 最近失败记录 */
-    this._failLog = new Map();
   }
 
   /**
@@ -29,7 +36,7 @@ export class FallbackManager {
    * @param {string} reason
    */
   _recordFailure(id, reason) {
-    this._failLog.set(id, { reason, time: Date.now() });
+    FAIL_LOG.set(id, { reason, time: Date.now() });
   }
 
   /**
@@ -38,10 +45,10 @@ export class FallbackManager {
    * @returns {boolean}
    */
   _inCooldown(id) {
-    const f = this._failLog.get(id);
+    const f = FAIL_LOG.get(id);
     if (!f) return false;
     if (Date.now() - f.time > COOLDOWN_MS) {
-      this._failLog.delete(id);
+      FAIL_LOG.delete(id);
       return false;
     }
     return true;
@@ -67,7 +74,7 @@ export class FallbackManager {
         let text = '';
         let used = cfg;
         for await (const chunk of client.chat(req)) {
-          text += chunk.delta;
+          text += chunk.delta || '';
         }
         if (!text.trim()) {
           // 空响应（弱模型偶发）不应当作成功，记录失败并走降级路径
@@ -118,6 +125,12 @@ export class FallbackManager {
           text += chunk.delta || '';
           yield { ...chunk, model: cfg.name, index: i };
         }
+        // 流式同样要查空响应：流「正常结束」但零产出（弱模型偶发/错误帧被吞）不应当作成功。
+        // 尚未产出内容时可安全降级；已产出则保持原状视为成功（半成品不能重放）。
+        if (!text.trim() && !produced) {
+          this._recordFailure(cfg.id, 'empty response');
+          throw new Error('模型返回空响应');
+        }
         if (i > 0) this.onFallback(i, cfg, '自动降级');
         recordCall({ model: cfg.name, vendor: cfg.vendor, kind: req && req.kind, ok: true,
           messages: req && req.messages, completion: text, durationMs: Date.now() - t0 });
@@ -147,6 +160,6 @@ export class FallbackManager {
 
   /** 清除某个模型的失败记录（手动重试时有用） */
   clearFailure(id) {
-    this._failLog.delete(id);
+    FAIL_LOG.delete(id);
   }
 }

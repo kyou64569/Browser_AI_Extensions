@@ -272,7 +272,9 @@ export async function pageTool(tool, args) {
     throw new Error('目标元素不是复选框（input[type=checkbox] 或 role=checkbox）');
   }
 
-  const h = handlers[tool];
+  // hasOwnProperty 守卫：tool 来自模型输出（外部输入），'constructor'/'toString' 等
+  // 原型链键会命中 Object.prototype 的函数并被当工具调用
+  const h = Object.prototype.hasOwnProperty.call(handlers, tool) ? handlers[tool] : null;
   if (!h) return { ok: false, error: '未知工具：' + tool };
   try {
     const data = await h(args);

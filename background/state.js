@@ -51,13 +51,6 @@ export async function getActiveTab() {
   return null;
 }
 
-// ── 运行中的 Agent 实例（供 AGENT_ABORT 消息拿到句柄）─────────────────────
-// 用 getter/setter 而非直接导出 let：ES module 的 live binding 允许"读"到更新，
-// 但 importer 不能对导入的 binding 赋值，因此必须提供 setter。
-let _runningAgent = null;
-export function setRunningAgent(agent) { _runningAgent = agent; }
-export function getRunningAgent() { return _runningAgent; }
-
 // ── Whisper 跨模型轮询计数器 ──────────────────────────────────────────────
 // 每片音频从不同的模型起步，把请求均匀分摊到多个 Whisper 模型，
 // 避免全部压在单一模型上触发 429 限流（片内仍保留故障转移兜底）。

@@ -37,6 +37,7 @@ export function parseDdgResults(html, maxResults) {
   // 避免旧写法 result__A 大写导致永远匹配不到、联网搜索返回空。
   const titleRe = /<a[^>]+class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
   let m;
+  titleRe.lastIndex = 0; // 模块外无共享，但防御性归零（同 Bing /g 正则 lastIndex 残留问题）
   while ((m = titleRe.exec(html)) && results.length < maxResults) {
     const title = stripHtmlText(m[2]);
     if (!title) continue;
@@ -48,6 +49,7 @@ export function parseDdgResults(html, maxResults) {
   }
   const snipRe = /<a[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>/gi;
   let sm, i = 0;
+  snipRe.lastIndex = 0;
   while ((sm = snipRe.exec(html)) && i < results.length) {
     results[i].snippet = stripHtmlText(sm[1]);
     i++;
@@ -68,6 +70,9 @@ const BING_PATTERNS = [
 export function parseBingResults(html, maxResults) {
   const results = [];
   for (const pat of BING_PATTERNS) {
+    // 模块级 /g 正则的 lastIndex 跨调用残留：上次提前退出（如凑满 maxResults）时
+    // lastIndex 停在中途，本次搜索开头的若干结果块会被跳过。每次解析前显式归零。
+    pat.block.lastIndex = 0;
     let bm;
     while ((bm = pat.block.exec(html)) && results.length < maxResults) {
       const blockHtml = bm[0];

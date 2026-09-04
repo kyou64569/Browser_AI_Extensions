@@ -331,17 +331,44 @@
     }, 250);
   }
 
-  document.addEventListener('selectionchange', onSelectionChange);
-  document.addEventListener('mousedown', (e) => {
-    if (isSelectionInEditable()) return;
-    const bar = getSelectionBar();
-    const result = getSelectionResult();
-    if (bar && !bar.contains(e.target) && (!result || !result.contains(e.target))) {
-      if (!window.getSelection().toString().trim()) {
-        hideSelectionUI();
+  // 扩展更新/重载会重新注入本脚本：UI 监听器（划词条/滚动/快捷键）与消息监听器一样
+  // 必须「先移除上一轮注入的、再注册本轮的」，否则同一事件被多个旧闭包重复处理。
+  const prevUi = window.__aiAssistantExtractUi;
+  if (prevUi) {
+    document.removeEventListener('selectionchange', prevUi.selectionChange);
+    document.removeEventListener('mousedown', prevUi.mousedown);
+    document.removeEventListener('scroll', prevUi.scroll, true);
+    document.removeEventListener('keydown', prevUi.keydown);
+  }
+  const uiListeners = {
+    selectionChange: onSelectionChange,
+    mousedown: (e) => {
+      if (isSelectionInEditable()) return;
+      const bar = getSelectionBar();
+      const result = getSelectionResult();
+      if (bar && !bar.contains(e.target) && (!result || !result.contains(e.target))) {
+        if (!window.getSelection().toString().trim()) {
+          hideSelectionUI();
+        }
       }
-    }
-  });
-  document.addEventListener('scroll', () => { hideSelectionUI(); }, true);
-  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') hideSelectionUI(); });
+    },
+    // capture 阶段监听所有滚动（含内部滚动容器）：滚动的可能是页面里任意元素，
+    // 若事件目标就在我们的划词结果面板内（面板自身内容滚动），不应把面板藏掉。
+    scroll: (e) => {
+      const t = e.target;
+      if (t && t.nodeType === 1) {
+        const result = getSelectionResult();
+        if (result && (t === result || result.contains(t))) return;
+        const bar = getSelectionBar();
+        if (bar && (t === bar || bar.contains(t))) return;
+      }
+      hideSelectionUI();
+    },
+    keydown: (e) => { if (e.key === 'Escape') hideSelectionUI(); },
+  };
+  window.__aiAssistantExtractUi = uiListeners;
+  document.addEventListener('selectionchange', uiListeners.selectionChange);
+  document.addEventListener('mousedown', uiListeners.mousedown);
+  document.addEventListener('scroll', uiListeners.scroll, true);
+  document.addEventListener('keydown', uiListeners.keydown);
 })();

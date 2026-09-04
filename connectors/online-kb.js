@@ -156,10 +156,18 @@ function stripHtml(html) {
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
     .replace(/&quot;/g, '"')
-    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(+n || 32))
-    .replace(/&#x([0-9a-fA-F]+);/g, (_, n) => String.fromCharCode(parseInt(n, 16) || 32))
+    .replace(/&#(\d+);/g, (_, n) => safeEntityCodePoint(+n))
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, n) => safeEntityCodePoint(parseInt(n, 16)))
     .replace(/[ \t\r\n ]+/g, ' ')
     .trim();
+}
+
+/** 数字实体安全解码：fromCharCode 按 UTF-16 码元处理，>0xFFFF 的码点（如 🎉 U+1F389）
+ *  会被拆成孤立代理项产生乱码；>0x10FFFF 或非法值统一回落为空格。 */
+function safeEntityCodePoint(n) {
+  if (!Number.isFinite(n) || n <= 0 || n > 0x10ffff) return ' ';
+  if (n >= 0xd800 && n <= 0xdfff) return ' ';
+  try { return String.fromCodePoint(n); } catch (_) { return ' '; }
 }
 
 /** 内容质量校验：剔除「二进制乱码」与过短内容，避免污染 RAG 并撑爆模型上下文导致超时。

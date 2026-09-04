@@ -90,8 +90,9 @@ export function classifyError(e) {
   if (/缺少有效凭证|缺少有效凭证（api key）|请先在设置添加模型|未找到可用.*模型/.test(msg)) {
     return ERROR_KIND.CREDENTIAL;
   }
-  // 3) 文本匹配兜底
-  if (/401|403|unauthorized|forbidden|invalid api key|incorrect api key|api key|鉴权|密钥无效/.test(s)) {
+  // 3) 文本匹配兜底。状态码用 \b 边界匹配：无边界的 /401|403/ 会把
+  //    "chat1401 模型不存在" 这类模型名/错误编号误判成鉴权失败
+  if (/\b401\b|\b403\b|unauthorized|forbidden|invalid api key|incorrect api key|api key|鉴权|密钥无效/.test(s)) {
     return ERROR_KIND.AUTH;
   }
   if (/\b429\b|rate.?limit|too many requests|quota|tpm|tokens per minute/.test(s)) {

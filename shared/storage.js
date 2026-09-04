@@ -4,9 +4,7 @@
 const KEYS = {
   MODELS: 'models',        // ModelConfig[]
   WHISPER: 'whisperModels',// Whisper 语音识别模型配置 []
-  MULTIMODAL: 'multimodalModels', // 多模态模型配置 [{...modalities:{image,audio,video}}]
   KB: 'kb',                // 知识库多 provider 状态：{ active, providers:{ <id>:{type,cfg} } }
-  SETTINGS: 'settings',    // 杂项
 };
 
 /** 读取全部模型配置（ModelConfig[]，结构见 core/model-config.js） */
@@ -87,25 +85,5 @@ export async function getWhisperModels() {
   const r = await chrome.storage.local.get(KEYS.WHISPER);
   return /** @type {any[]} */ (r[KEYS.WHISPER]) || [];
 }
-
-/**
- * 读取多模态模型配置（聊天中的图像/音频/视频生成任务路由）。
- * @returns {Promise<Array>}
- */
-export async function getMultimodalModels() {
-  const r = await chrome.storage.local.get(KEYS.MULTIMODAL);
-  return /** @type {any[]} */ (r[KEYS.MULTIMODAL]) || [];
-}
-
-/**
- * 保存多模态模型配置。
- * @param {Array} arr
- */
-export async function saveMultimodalModels(arr) {
-  await chrome.storage.local.set({ [KEYS.MULTIMODAL]: arr || [] });
-}
-
-export async function getSettings() {
-  const r = await chrome.storage.local.get(KEYS.SETTINGS);
-  return r[KEYS.SETTINGS] || {};
-}
+// 注：多模态模型配置（multimodalModels）由 preview/preview.js 直接读写 storage key，
+// 此处不再提供封装导出（曾有无调用方的死导出，已移除）。

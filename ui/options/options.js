@@ -216,17 +216,23 @@ document.getElementById('save').onclick = async () => {
     card.querySelectorAll('[data-f]').forEach(inp => {
       const f = inp.dataset.f;
       const val = inp.type === 'checkbox' ? inp.checked : inp.value;
-      // 数值型字段转为 Number；空字符串视为未配置（undefined），让适配器走厂商默认
+      // 数值型字段转为 Number；空字符串视为未配置（undefined），让适配器走厂商默认。
+      // Number('abc') 是 NaN，NaN 进 storage 会破坏限速/超时逻辑，非法输入直接弃用
       if (f === 'timeoutMs' || f === 'tpm' || f === 'rpm' || f === 'temperature' || f === 'top_p') {
-        models[i][f] = (val === '' || val == null) ? undefined : Number(val);
+        const n = Number(val);
+        models[i][f] = (val === '' || val == null || !Number.isFinite(n)) ? undefined : n;
       } else {
         models[i][f] = val;
       }
     });
   });
   await saveModels(models);
-  // 知识库：保存当前 provider 草稿（随表单输入实时更新，不覆盖其他 provider）
-  await saveKbState(kbStateDraft);
+  // 知识库：保存当前 provider 草稿（随表单输入实时更新，不覆盖其他 provider）。
+  // 草稿未加载完成（初始 getKbState 竞态失败）时不能保存：saveKbState(null) 会把
+  // 用户已配置的 KB 凭证整体清空
+  if (kbStateDraft) {
+    await saveKbState(kbStateDraft);
+  }
   document.getElementById('msg').textContent = '已保存';
   setTimeout(() => (document.getElementById('msg').textContent = ''), 2000);
 };

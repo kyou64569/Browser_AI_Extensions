@@ -20,7 +20,7 @@ export class ModelClient {
    * @param {import('./message.js').ChatRequest} req
    * @returns {AsyncIterable<import('./message.js').ChatResponseChunk>}
    */
-  // eslint-disable-next-line no-unused-vars
+   
   async *chat(req) {
     throw new Error('chat() 未实现');
   }

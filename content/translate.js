@@ -20,8 +20,6 @@
   const translationCache = new Map();
   let active = false;
   let mode = 'manual';
-  let activeHost = null;
-  let curHost = location.hostname;
   let navTimer = null;
   let pendingTranslate = null; // 用于取消进行中的翻译请求
   const translatedSet = new Set(); // 已翻译节点集合（内容刷新去重，避免重复翻译已处理内容）
@@ -164,7 +162,7 @@
 
       if (count === 0) {
         originalSnapshot = { pageSeq, groups: groups.map((g, i) => ({ nodes: g.nodes, originals: groupOriginals[i], setTrans: g.setTrans })) };
-        active = true; activeHost = location.hostname;
+        active = true;
         notifyTranslateDone();
         return { ok: true, total: groups.length, cached: groups.length };
       }
@@ -184,7 +182,7 @@
       });
 
       originalSnapshot = { pageSeq, groups: groups.map((g, i) => ({ nodes: g.nodes, originals: groupOriginals[i], setTrans: g.setTrans })) };
-      active = true; activeHost = location.hostname;
+      active = true;
       notifyTranslateDone();
       return { ok: true, total: groups.length, translated: count };
     } finally {
@@ -282,16 +280,22 @@
   }
   function scriptOf(text) {
     if (!text) return null;
-    let cjk = 0, latin = 0, cyr = 0, thai = 0, arabic = 0;
+    let cjk = 0, kana = 0, hangul = 0, latin = 0, cyr = 0, thai = 0, arabic = 0;
     for (const ch of text) {
       const cp = ch.codePointAt(0);
       if (cp >= 0x4e00 && cp <= 0x9fff) cjk++;
-      else if ((cp >= 0x3040 && cp <= 0x30ff) || (cp >= 0xac00 && cp <= 0xd7af)) cjk++; // 假名 / 谚文
+      else if (cp >= 0x3040 && cp <= 0x30ff) kana++;    // 平/片假名：日语独有
+      else if (cp >= 0xac00 && cp <= 0xd7af) hangul++;  // 谚文：韩语独有
       else if ((cp >= 0x0041 && cp <= 0x024f)) latin++;
       else if (cp >= 0x0400 && cp <= 0x04ff) cyr++;
       else if (cp >= 0x0e00 && cp <= 0x0e7f) thai++;
       else if (cp >= 0x0600 && cp <= 0x06ff) arabic++;
     }
+    // 假名/谚文必须与其宿主的汉字分开计数：日语页=汉字+假名、韩语页=汉字+谚文。
+    // 旧实现把它们并入 cjk 后，日/韩站被误判为 cjk→zh，触发「页面已是目标语言则跳过」，
+    // 自动翻译对日韩站整体失效。
+    if (kana > 0 && kana * 2 >= cjk) return 'ja';
+    if (hangul > 0 && hangul * 2 >= cjk) return 'ko';
     if (cjk >= latin && cjk >= cyr && cjk >= thai && cjk >= arabic && cjk > 0) return 'cjk';
     if (latin > 0 && latin >= cjk && latin >= cyr && latin >= thai && latin >= arabic) return 'latin';
     if (cyr > 0) return 'cyr';
@@ -316,6 +320,8 @@
     sample = sample.slice(0, 800);
     const s = scriptOf(sample);
     if (s === 'cjk') return 'zh';        // 中文站最常见；翻译以中→外为主，足够判断“是否已是目标语言”
+    if (s === 'ja') return 'ja';         // 假名独占 → 日语站
+    if (s === 'ko') return 'ko';         // 谚文独占 → 韩语站
     if (s === 'latin') return 'en';
     if (s === 'cyr') return 'ru';
     if (s === 'thai') return 'th';
@@ -357,10 +363,10 @@
         const pageLang = getPageLang();
         const tCode = targetCodeOf(targetLang);
         if (pageLang && tCode && pageLang === tCode) {
-          active = false; originalSnapshot = null; activeHost = location.hostname;
+          active = false; originalSnapshot = null;
           return;
         }
-        await doTranslate(modelId, targetLang); // 成功则把 active/activeHost 设为当前页
+        await doTranslate(modelId, targetLang); // 成功则把 active 置为当前页状态
       } catch (_) {}
     }, delay || 800);
   }
@@ -380,16 +386,12 @@
     } else {
       autoTranslate(800); // 自动模式：任何导航（含跨站 / SPA）都重新检测并翻译
     }
-    curHost = location.hostname;
   }
-  window.addEventListener('load', () => { curHost = location.hostname; });
-  const _ps = history.pushState, _rs = history.replaceState;
-  // 覆写 pushState/replaceState 以拦截 SPA 站内导航（如 React Router / Vue Router 的
-  // pushState 调用）。由于本脚本在 document_idle 注入（页面脚本已执行完毕），
-  // _ps / _rs 捕获的是 SPA 框架的 patched 版本（若有），apply 调用时走回 SPA 逻辑，
-  // 保证 onUrlChange 在 URL 更新后触发，不破坏 SPA 路由行为。
-  history.pushState = function () { const r = _ps.apply(this, arguments); onUrlChange(); return r; };
-  history.replaceState = function () { const r = _rs.apply(this, arguments); onUrlChange(); return r; };
+  window.addEventListener('load', () => { /* noop：保留事件位以备扩展 */ });
+  // SPA 站内导航：本脚本运行在隔离世界，覆写 history.pushState/replaceState 只能拦到
+  // 隔离世界自己的调用，拦不到页面主世界（React Router / Vue Router）的导航。
+  // SPA 场景实际依赖两层兜底：1) popstate/hashchange（浏览器事件，跨世界可见）；
+  // 2) 内容观察器（startContentObserver）检测到新内容变更后自动重翻。
   window.addEventListener('popstate', onUrlChange);
   window.addEventListener('hashchange', onUrlChange);
   const titleEl = document.querySelector('title');
@@ -444,7 +446,7 @@
       if (p.mode === 'auto') {
         // 注意：不再依赖存储里的 active/activeHost（那是上一页的残留），
         // 直接对新页面做语言检测 + 自动翻译。
-        active = false; activeHost = null;
+        active = false;
         autoTranslate(1200); // 等正文基本就绪后再翻译（避免翻译空页面）
         startContentObserver(); // 启动内容观察：后续局部刷新 / 站内 tab 切换也会自动翻译
       }
@@ -473,7 +475,7 @@
       mode = newMode;
       if (mode === 'auto') {
         // 切回自动：重新检测并翻译当前页，并启动内容观察（站内 tab / 局部刷新自动翻译）
-        active = false; activeHost = null; originalSnapshot = null;
+        active = false; originalSnapshot = null;
         if (!contentObserver) startContentObserver();
         autoTranslate(800);
       } else {

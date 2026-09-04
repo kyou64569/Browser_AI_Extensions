@@ -4,18 +4,37 @@
 
 import { ModelClient } from '../model-base.js';
 import { postJson, fetchWithTimeout, HttpError } from '../http.js';
+import { streamLines, sseData } from '../sse.js';
 import { normalizeApiBase } from '../../shared/utils.js';
 import { redactUrl } from '../../shared/sanitize.js';
 
 /** Anthropic 思考预算（tokens）档位映射 */
 const ANTHROPIC_THINKING_BUDGET = { low: 2000, medium: 8000, high: 16000 };
 
+/**
+ * 思考预算上限。Anthropic 要求 max_tokens > budget_tokens，而 max_tokens 不得超过
+ * 模型输出上限：接受 thinking 参数的模型（3.7+/4 系）上限均 ≥8192，因此预算压到
+ * 8192-1024=7168 可保证任何档位下 max_tokens=8192 都合法，不会再触发 400。
+ * 3.5 系本身不支持 thinking 参数，400 会如实透出（属用户配置问题）。
+ */
+const ANTHROPIC_MAX_THINKING_BUDGET = 7168;
+
 /** 把 thinkingStrength 转成 Anthropic thinking 参数；'off'/无则返回 null */
 function mapAnthropicThinking(strength) {
   if (!strength || strength === 'off') return null;
   const budget = ANTHROPIC_THINKING_BUDGET[strength];
   if (!budget) return null;
-  return { type: 'enabled', budget_tokens: budget };
+  return { type: 'enabled', budget_tokens: Math.min(budget, ANTHROPIC_MAX_THINKING_BUDGET) };
+}
+
+/**
+ * max_tokens = max(用户设定, budget+1024)。启用 thinking 时整体压到 8192 内
+ * （理由同上）；未启用时用户显式设置的 maxTokens 原样透传，不做截断。
+ */
+function effMaxTokens(maxTokens, thinking) {
+  const budget = thinking?.budget_tokens || 0;
+  const want = Math.max(maxTokens ?? 1024, budget + 1024);
+  return budget ? Math.min(want, budget + 1024) : want;
 }
 
 export class AnthropicAdapter extends ModelClient {
@@ -54,13 +73,10 @@ export class AnthropicAdapter extends ModelClient {
     const { system, messages } = this._toVendor(req);
     const { maxTokens, thinkingStrength, ...otherOptions } = req.options || {};
     const thinking = mapAnthropicThinking(thinkingStrength);
-    // Anthropic 要求 max_tokens 大于 thinking 预算
-    const budget = thinking?.budget_tokens || 0;
-    const maxTokensEff = Math.max(maxTokens ?? 1024, budget + 1024);
     const body = {
       model: this.config.model,
       messages,
-      max_tokens: maxTokensEff,
+      max_tokens: effMaxTokens(maxTokens, thinking),
       stream: true,
       ...(system ? { system } : {}),
       ...(thinking ? { thinking } : {}),
@@ -77,28 +93,20 @@ export class AnthropicAdapter extends ModelClient {
       signal,
     }, this.config.timeoutMs);
 
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = '';
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      const lines = buf.split('\n');
-      buf = lines.pop() || '';
-      for (const line of lines) {
-        const t = line.trim();
-        if (!t || !t.startsWith('data:')) continue;
-        const data = t.slice(5).trim();
-        try {
-          const json = JSON.parse(data);
-          if (json.type === 'content_block_delta' && json.delta?.text) {
-            yield { delta: json.delta.text, done: false, meta: { raw: json } };
-          } else if (json.type === 'message_stop') {
-            yield { delta: '', done: true };
-            return;
-          }
-        } catch (e) { console.warn('[anthropic] Failed to parse stream chunk:', e); }
+    for await (const line of streamLines(res.body)) {
+      const data = sseData(line);
+      if (data == null) continue;
+      let json;
+      try { json = JSON.parse(data); } catch (_) { continue; }
+      // 流内 error 事件（overloaded_error 等）：不抛出会被上层误判为「空输出的成功调用」
+      if (json.type === 'error') {
+        throw new HttpError('server', `Anthropic 流式错误: ${json.error?.message || json.error?.type || 'unknown'}`);
+      }
+      if (json.type === 'content_block_delta' && json.delta?.text) {
+        yield { delta: json.delta.text, done: false, meta: { raw: json } };
+      } else if (json.type === 'message_stop') {
+        yield { delta: '', done: true };
+        return;
       }
     }
     yield { delta: '', done: true };
@@ -108,12 +116,10 @@ export class AnthropicAdapter extends ModelClient {
     const { system, messages } = this._toVendor(req);
     const { maxTokens, thinkingStrength, ...otherOptions } = req.options || {};
     const thinking = mapAnthropicThinking(thinkingStrength);
-    const budget = thinking?.budget_tokens || 0;
-    const maxTokensEff = Math.max(maxTokens ?? 1024, budget + 1024);
     const body = {
       model: this.config.model,
       messages,
-      max_tokens: maxTokensEff,
+      max_tokens: effMaxTokens(maxTokens, thinking),
       stream: false,
       ...(system ? { system } : {}),
       ...(thinking ? { thinking } : {}),

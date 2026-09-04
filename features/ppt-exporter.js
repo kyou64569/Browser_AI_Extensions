@@ -950,85 +950,6 @@ function buildCleanContentLayout() {
 </p:sldLayout>`;
 }
 
-/** 判断版式是否不适合作为正文版式（分区/节标题，或正文框过小） */
-function isUnsuitableContentLayout(layout) {
-  if (!layout) return true;
-  const type = (layout.type || '').toLowerCase();
-  if (/sechead|section|divider|blank/.test(type)) return true;
-  // 正文占位符框高小于 ~1.5 英寸（~1371600 EMU）视为过小
-  const phs = layout.phs || {};
-  const body = phs.body;
-  if (body && body.box && body.box.cy && body.box.cy < 1371600) return true;
-  return false;
-}
-
-/** 从封面版式 XML 取出背景图片形状（含 <a:blip> 的 <p:pic>），用于在内容版式里复用同一背景 */
-function extractBgPics(coverXml) {
-  if (!coverXml) return '';
-  const spTree = /<p:spTree>([\s\S]*?)<\/p:spTree>/.exec(coverXml);
-  if (!spTree) return '';
-  const out = [];
-  const re = /<p:pic>[\s\S]*?<\/p:pic>/g;
-  let m;
-  while ((m = re.exec(spTree[1]))) {
-    if (/<a:blip\b/.test(m[0])) out.push(m[0]);
-  }
-  // 避免与内容版式内 title(id=2)/body(id=3) 占位符的 cNvPr id 冲突
-  return out.map(p => p.replace(/<p:cNvPr id="\d+"/, '<p:cNvPr id="100"')).join('\n');
-}
-
-/**
- * 构建「套用模板外观」的干净内容版式：沿用封面背景图 + 干净标题/正文占位符几何。
- * 这样内容页视觉上属于同一模板家族，而不是纯白（且不触发修复弹窗，只要 [Content_Types] 声明了图片扩展名）。
- */
-function buildSkinnedContentLayout(bgPics, palette) {
-  const titleColor = (palette && palette.lt1) ? palette.lt1 : 'FFFFFF';
-  return `${XML_DECL}
-<p:sldLayout xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" type="titleAndContent" preserve="1">
-  <p:cSld>
-    <p:spTree>
-      <p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
-      <p:grpSpPr>
-        <a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm>
-      </p:grpSpPr>
-      ${bgPics}
-      <p:sp>
-        <p:nvSpPr><p:cNvPr id="2" name="标题占位符 1"/><p:cNvSpPr><a:spLocks noGrp="1"/></p:cNvSpPr><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr>
-        <p:spPr>
-          <a:xfrm><a:off x="457200" y="365125"/><a:ext cx="8229600" cy="1454052"/></a:xfrm>
-          <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
-          <a:noFill/>
-        </p:spPr>
-        <p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:rPr lang="zh-CN" b="1"><a:solidFill><a:schemeClr val="tx1"/></a:solidFill></a:rPr><a:t>占位标题</a:t></a:r><a:endParaRPr lang="zh-CN"/></a:p></p:txBody>
-      </p:sp>
-      <p:sp>
-        <p:nvSpPr><p:cNvPr id="3" name="内容占位符 2"/><p:cNvSpPr><a:spLocks noGrp="1"/></p:cNvSpPr><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr>
-        <p:spPr>
-          <a:xfrm><a:off x="457200" y="2032000"/><a:ext cx="8229600" cy="3835375"/></a:xfrm>
-          <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
-          <a:noFill/>
-        </p:spPr>
-        <p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:endParaRPr lang="zh-CN"/></a:p></p:txBody>
-      </p:sp>
-    </p:spTree>
-  </p:cSld>
-  <p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr>
-</p:sldLayout>`;
-}
-
-/** 内容版式 .rels：母版(rId1) + 背景图（沿用封面 pic 的 r:embed id，从封面 rels 取 target） */
-function buildSkinnedContentLayoutRels(coverRelsXml, embeds) {
-  const items = [`<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster" Target="../slideMasters/slideMaster1.xml"/>`];
-  if (coverRelsXml && embeds && embeds.length) {
-    const rels = parseRels(coverRelsXml);
-    for (const e of embeds) {
-      const r = rels.find(x => x.id === e);
-      if (r) items.push(`<Relationship Id="${r.id}" Type="${r.type}" Target="${r.target}"/>`);
-    }
-  }
-  return `${XML_DECL}\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">\n  ${items.join('\n  ')}\n</Relationships>`;
-}
-
 /**
  * 为某一页选择使用的版式。
  * 优先尊重 slide.layout 显式指定（'cover'/'content'/版式索引/版式名），
@@ -1063,7 +984,6 @@ function autoPickLayout(slide, index, idx, layouts) {
   const { cover, closing, section, toc, content, defaultContent } = idx;
   if (index === 0) return cover;
   const heading = (slide.heading || '').toLowerCase();
-  const bullets = slide.bullets || [];
   // 结尾 / 致谢页
   if (/谢谢|感谢|thank|联系我们|contact|q\s*&?\s*a|封底|结尾/.test(heading)) {
     if (closing[0]) return closing[0];
