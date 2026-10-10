@@ -302,6 +302,70 @@ body {
 .typing span:nth-child(3) { animation-delay: .4s; }
 @keyframes blink { 0%,80%,100% { opacity: .3; } 40% { opacity: 1; } }
 
+/* ---------- 思考过程折叠区（AI 气泡内，正文上方） ---------- */
+.think-box {
+  margin: 0 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--code-bg);
+  overflow: hidden;
+}
+.think-toggle {
+  display: flex; align-items: center; gap: 6px;
+  width: 100%; border: none; background: transparent;
+  padding: 5px 10px; cursor: pointer;
+  font-size: 11.5px; font-weight: 600; color: var(--text-2);
+  text-align: left;
+}
+.think-toggle:hover { background: var(--icon-hover); }
+.think-arrow { margin-left: auto; transition: transform .15s ease; font-size: 10px; }
+.think-box.folded .think-arrow { transform: rotate(-90deg); }
+.think-body {
+  padding: 4px 12px 8px;
+  font-size: 12px; line-height: 1.6;
+  color: var(--text-2);
+  white-space: pre-wrap; word-break: break-word;
+  max-height: 280px; overflow-y: auto;
+}
+.think-box.folded .think-body { display: none; }
+
+/* ---------- 协作模式：子模型运行状态芯片 + 详情气泡 ---------- */
+/* 气泡挂在 .bubble 上（setRich 只重建 .bubble-text，放正文里会被抹掉），
+   所以这里要显式关掉继承自 .bubble 的 pre-wrap，否则芯片里的空格也参与排版。 */
+.sub-row {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+  margin: 8px 0 0; white-space: normal;
+}
+.sub-sum { font-size: 11px; color: var(--muted); margin-right: 2px; }
+.sub-chip {
+  border: 1px solid var(--line); border-radius: 999px;
+  background: var(--code-bg); color: var(--text);
+  padding: 2px 9px; font-size: 11.5px; cursor: pointer;
+  max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sub-chip:hover { background: var(--icon-hover); }
+.sub-chip[data-phase="start"] { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
+.sub-chip[data-phase="done"] { border-color: color-mix(in srgb, var(--ok) 40%, var(--line)); }
+.sub-chip[data-phase="error"] { color: var(--err); border-color: color-mix(in srgb, var(--err) 45%, var(--line)); }
+/* 跑完但零正文：不是失败（钱确实花了），用与状态条 warn 同一档的琥珀色 */
+.sub-chip[data-phase="empty"] { color: #b7791f; border-color: color-mix(in srgb, #b7791f 45%, var(--line)); }
+/* 详情气泡：挂在 body 上（避开 .view / .chat-scroll 的裁切），限高内滚 */
+.sub-pop {
+  position: fixed; z-index: 9998;
+  width: min(420px, calc(100vw - 16px));
+  max-height: min(50vh, 360px); overflow: auto;
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 12px;
+  box-shadow: var(--shadow); padding: 8px 10px;
+  font-size: 12px; line-height: 1.55; text-align: left; white-space: normal;
+}
+.sub-pop-head { font-size: 11.5px; font-weight: 600; color: var(--muted); margin-bottom: 6px; }
+.sub-sec { margin-top: 6px; }
+.sub-sec-title { font-size: 11px; color: var(--muted); margin-bottom: 3px; }
+.sub-sec-body {
+  white-space: pre-wrap; word-break: break-word;
+  background: var(--code-bg); border-radius: 8px; padding: 6px 8px;
+}
+
 /* 状态条 */
 .status-bar {
   min-height: 18px; font-size: 12px; color: var(--accent);
@@ -642,7 +706,14 @@ body {
 /* 流式生成中：发送按钮切换为"停止"形态（红色方块，点击中止） */
 .send-btn.stopping { background: #e5484d; }
 .send-btn.stopping svg { display: none; }
-.send-btn.stopping::after { content: '■'; font-size: 13px; line-height: 1; }
+/* 用真盒子而不是 ■ 字形：方块大小只有这样才能按设计给（字形受字体度量与基线影响，
+   看着偏小且不居中）。.send-btn 已是 grid + place-items:center，盒子天然居中。 */
+.send-btn.stopping::after {
+  content: '';
+  width: 14px; height: 14px;
+  border-radius: 3px;
+  background: currentColor;
+}
 
 /* ---------- 功能 / 设置 页面 ---------- */
 .page {
@@ -776,6 +847,13 @@ button.mini { padding: 4px 10px; font-size: 12px; }
 }
 .mc-checks { display: flex; flex-wrap: wrap; gap: 8px 14px; font-size: 11px; margin-top: 8px; color: var(--muted); }
 .mc-checks label { display: flex; align-items: center; gap: 5px; min-width: 0; overflow-wrap: anywhere; }
+/* 模型卡字段下方的小字提示（如 maxTokens 的思考建议） */
+.field-hint { display: block; font-size: 10px; line-height: 1.4; color: var(--muted); }
+/* 思考参数 / 思考强度选择行（开启「思考」时显示，见 refreshCheckboxUI） */
+.mc-think { display: flex; flex-wrap: wrap; gap: 8px 14px; font-size: 11px; margin-top: 6px; color: var(--muted); }
+.mc-think label { display: flex; align-items: center; gap: 5px; min-width: 0; flex: 1 1 180px; }
+.mc-think select { max-width: 100%; }
+.mc-think label[data-tip] { cursor: help; }
 /* 复选框悬停提示（JS 驱动的浮动提示框，自动夹在视口内避免溢出屏幕外） */
 .mc-checks label[data-tip] { cursor: help; }
 .tip-pop {
@@ -795,7 +873,8 @@ button.mini { padding: 4px 10px; font-size: 12px; }
 .mm-media { max-width: 100%; border-radius: 10px; margin-top: 4px; }
 /* 折叠状态：仅显示别名框 + 图标按钮，详情区收起 */
 .model-card.collapsed .mc-grid,
-.model-card.collapsed .mc-checks { display: none; }
+.model-card.collapsed .mc-checks,
+.model-card.collapsed .mc-think { display: none; }
 /* 头部图标按钮（保存/编辑/删除） */
 .icon-btn {
   display: inline-flex; align-items: center; justify-content: center;

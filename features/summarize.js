@@ -174,6 +174,7 @@ async function* simulateSummaryStream(page, instruction = '') {
  * @param {string} [opts.modelId] 指定模型 id（优先于路由选择）
  * @param {string} [opts.thinkingStrength] 思考强度
  * @param {(i:number,cfg:object,reason:string)=>void} [opts.onFallback]
+ * @param {(evt:object)=>void} [opts.onSubModel] 协作模式下子模型的状态回调（原样透传给 chatStream）
  * @param {AbortSignal} [opts.signal]
  * @yields {{delta:string, model?:string, index?:number}}
  */
@@ -203,11 +204,12 @@ export async function* summarizeStream(ctx, page, opts = {}) {
 
   const apiMessages = buildMessages(page.title, page.text, kbChunks, opts.instruction, opts.kbName);
 
-  // 多模型协作：交给 chatStream 的统一协作逻辑（子模型各自非流式回答，主模型整合流式输出）
+  // 多模型协作：交给 chatStream 的统一协作逻辑（子模型并发回答，主模型整合流式输出）
   if (opts.mode === 'collab') {
     yield* chatStream({ models: ctx.models }, apiMessages, {
       mode: 'collab',
       thinkingStrength: opts.thinkingStrength,
+      ...(opts.onSubModel ? { onSubModel: opts.onSubModel } : {}),
       ...(opts.signal ? { signal: opts.signal } : {}),
     });
     if (sourcesFooter) yield { delta: sourcesFooter };

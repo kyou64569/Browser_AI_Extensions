@@ -37,6 +37,12 @@
  * 归一化响应片段（流式与非流式共用）
  * @typedef {Object} ChatResponseChunk
  * @property {string}   delta      增量文本（非流式时整段一次给出）
+ * @property {string}   [thinking] 思考过程增量文本（reasoning_content / thinking_delta 等）。
+ *                                 与 delta 相互独立、可交错到达；不需要思考展示的调用方
+ *                                 （翻译 / 总结 / 协作子模型等）忽略本字段即可
+ * @property {string}   [finishReason] 厂商结束原因（openai: length / anthropic: max_tokens /
+ *                                 gemini: MAX_TOKENS / ollama: length），用于识别「输出被
+ *                                 token 上限截断」；正常结束不携带
  * @property {boolean}  done       是否结束
  * @property {Object}   [meta]     厂商原始 meta（usage / model / id 等），透传不解析
  */

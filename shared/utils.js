@@ -43,30 +43,41 @@ export function optionsFromModel(m = {}) {
   if (typeof m.temperature === 'number') o.temperature = m.temperature;
   if (typeof m.top_p === 'number') o.top_p = m.top_p;
   if (typeof m.maxTokens === 'number') o.maxTokens = m.maxTokens;
-  // 思考强度：仅当开启思考且非 'off' 时透传。
-  // OpenAI 兼容厂商（openai/ollama/gemini）走 reasoning_effort，必须模型显式支持
-  // （reasoningEffortSupported），否则普通模型（gpt-4o 等）会因该参数返回 HTTP 400；
-  // Anthropic 走 thinking budget，只需 supportsThinking 即可。
-  const wantThink = m.supportsThinking && m.thinkingStrength && m.thinkingStrength !== 'off';
-  if (wantThink) {
-    const reasoningVendor = m.vendor === 'openai' || m.vendor === 'ollama' || m.vendor === 'gemini';
-    if (!reasoningVendor || m.reasoningEffortSupported) {
-      o.thinkingStrength = m.thinkingStrength;
-    }
-  }
+  // 思考强度：仅 low/medium/high 透传给适配器。
+  // 'default'（使用厂商默认）与未启用思考等效，不发任何思考参数；
+  // 'off'（显式关闭）不经过模型配置透传，只在聊天页下拉显式选择时经 opts 直达适配器
+  //（GLM/Qwen/Ollama 风格下适配器会发禁用参数）。
+  // 是否发送、发哪种思考参数由各适配器按 thinkingStyle 决定（shared/thinking.js）：
+  // 'auto' 识别不出的模型解析为 'none'——不发任何参数，因此这里不再需要
+  // 旧 reasoningEffortSupported 门槛来防普通模型 HTTP 400。
+  const s = m.thinkingStrength;
+  const wantThink = m.supportsThinking && s && s !== 'off' && s !== 'default';
+  if (wantThink) o.thinkingStrength = s;
   return o;
 }
 
 /**
+ * 判断厂商的结束原因是否为「输出被 token 上限截断」。
+ * 各厂商取值：openai length / anthropic max_tokens / gemini MAX_TOKENS / ollama length。
+ * @param {string} [reason] 适配器透出的 finishReason（原始厂商值）
+ * @returns {boolean}
+ */
+export function isTruncatedFinish(reason) {
+  return !!reason && /length|max_tokens/i.test(String(reason));
+}
+
+/**
  * 思考强度下拉选项，按厂商动态生成。
- * OpenAI 兼容（reasoning_effort）与 Anthropic 兼容（thinking budget）展示不同档位；
- * 其余厂商给出通用档位（适配器按需忽略，不报错）。
+ * 'default'（不传任何思考参数、由厂商/模型按默认行为决定）与 'off'（显式关闭：
+ * GLM/Qwen/Ollama 等混合推理模型需要发禁用参数才关得掉）是两种不同语义。
+ * OpenAI 兼容（reasoning_effort）与 Anthropic 兼容（thinking budget）展示不同档位。
  * @param {string} vendor
  * @returns {{value:string, label:string}[]}
  */
 export function thinkingLevels(vendor) {
   if (vendor === 'anthropic') {
     return [
+      { value: 'default', label: '思考：默认（不传参数）' },
       { value: 'off', label: '思考：关闭' },
       { value: 'low', label: '思考：低 (2K)' },
       { value: 'medium', label: '思考：中 (8K)' },
@@ -75,6 +86,7 @@ export function thinkingLevels(vendor) {
   }
   // openai / gemini / ollama 等：通用档位（OpenAI 走 reasoning_effort）
   return [
+    { value: 'default', label: '思考：默认（不传参数）' },
     { value: 'off', label: '思考：关闭' },
     { value: 'low', label: '思考：低' },
     { value: 'medium', label: '思考：中' },

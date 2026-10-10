@@ -298,25 +298,13 @@ function tryParseCall(jsonStr) {
 }
 
 /**
- * 从 AI 回复文本中解析全部工具调用（含起止下标），无则空数组。
- * 识别格式：```toolcall 代码块 / <<TOOLCALL>> / <tool_call> / 裸 toolcall{...} / toolcall[...] /
- * tool_call{...} / function_call{...} / 中文「调用/使用/执行 工具：name」(name 须为已知工具) /
- * 以及兜底的任何含 name 的 JSON 对象。
+ * 1) 解析代码块/标签/XML形式的工具调用（```toolcall / <<TOOLCALL>> / <tool_call>）。
+ * 块内可能含多个 JSON 对象（模型偶发把多个调用写进同一块），逐个做括号匹配全部解析；
+ * 删除区间取整个匹配块（含围栏/标签），否则 stripToolCall 只删 JSON 会留下空的 ```toolcall 围栏。
+ * @param {string} text
+ * @param {(c:{name:string,args:object}, start:number, end:number)=>void} push
  */
-function extractCalls(text) {
-  const calls = [];
-  const seen = new Set();
-  const push = (c, start, end) => {
-    const norm = JSON.stringify({ name: c.name, args: c.args });
-    if (seen.has(norm)) return;
-    seen.add(norm);
-    calls.push({ name: c.name, args: c.args, _start: start, _end: end });
-  };
-  if (!text) return calls;
-
-  // 1) 代码块 / 标签 / XML 形式。块内可能含多个 JSON 对象（模型偶发把多个调用写进同一块），
-  //    逐个做括号匹配全部解析；删除区间取整个匹配块（含围栏/标签），否则 stripToolCall
-  //    只删 JSON 会留下空的 ```toolcall 围栏。
+function parseBlockFormat(text, push) {
   let m;
   RE_BLOCK.lastIndex = 0;
   while ((m = RE_BLOCK.exec(text)) !== null) {
@@ -338,8 +326,14 @@ function extractCalls(text) {
       if (c) push(c, m.index, RE_BLOCK.lastIndex);
     }
   }
+}
 
-  // 2) 关键字形式：toolcall / tool_call / function_call（后可跟可选的 : = 或 [ 再接 {）
+/**
+ * 2) 解析关键字形式的工具调用（toolcall / tool_call / function_call，后可跟可选的 : = 或 [ 再接 {）
+ * @param {string} text
+ * @param {(c:{name:string,args:object}, start:number, end:number)=>void} push
+ */
+function parseKeywordFormat(text, push) {
   const KW = /(tool_?call|function_?call)\b\s*(\[)?/gi;
   let km;
   KW.lastIndex = 0;
@@ -357,12 +351,18 @@ function extractCalls(text) {
       push(c, km.index, close);
     }
   }
+}
 
-  // 2.5) 中文「调用/使用/执行 工具」格式（防御性兜底）：模型偶尔用中文工具调用
-  // （如“调用工具：screenshot”或“使用工具 click”），若不被识别会在终止分支被误判为最终回答、
-  // 导致像 SenseNova 那样提前结束。仅当名称命中已知工具清单且**其后紧跟参数 JSON** 才视为
-  // 有效调用——「调用工具 screenshot 截个图看看」这类自然语言说明不带参数块，不应被当成调用
-  // （误触发会执行真实 DOM 操作）。
+/**
+ * 3) 解析中文「调用/使用/执行 工具：name」格式（防御性兜底）。
+ * 模型偶尔用中文表达工具调用（如“调用工具：screenshot”“使用工具 click”），若不被识别会在终止
+ * 分支被误判为最终回答、导致像 SenseNova 那样提前结束。仅当名称命中已知工具清单且**其后紧跟参数
+ * JSON** 才视为有效调用——「调用工具 screenshot 截个图看看」这类自然语言说明不带参数块，不应被
+ * 当成调用（误触发会执行真实 DOM 操作）。
+ * @param {string} text
+ * @param {(c:{name:string,args:object}, start:number, end:number)=>void} push
+ */
+function parseChineseFormat(text, push) {
   const CN = /(?:调用|使用|执行)\s*工具\s*[:：]?\s*([A-Za-z_][\w-]*)/gi;
   let cn;
   CN.lastIndex = 0;
@@ -381,20 +381,51 @@ function extractCalls(text) {
     // 使用大小写不敏感匹配，避免模型输出 "Screenshot" 而非 "screenshot" 时被忽略
     if (TOOLS.some(t => t.name.toLowerCase() === name.toLowerCase())) push({ name, args }, cn.index, e + 1);
   }
+}
 
-  // 3) 兜底：整段中任何含 name 的 JSON 对象（仅在前两步无果时启用，避免误伤普通文本）
-  if (calls.length === 0) {
-    let i = 0;
-    while (i < text.length) {
-      if (text[i] === '{') {
-        const end = matchBrace(text, i);
-        if (end === -1) { i++; continue; }
-        const c = tryParseCall(text.slice(i, end + 1));
-        if (c) push(c, i, end + 1);
-        i = end + 1;
-      } else i++;
-    }
+/**
+ * 4) 解析兜底 JSON 对象形式（整段中任何含 name 的 JSON 对象）。
+ * 只在前三种格式全都没认出来时由 extractCalls 调用，避免误伤正文里的普通 JSON。
+ * @param {string} text
+ * @param {(c:{name:string,args:object}, start:number, end:number)=>void} push
+ */
+function parseFallbackFormat(text, push) {
+  let i = 0;
+  while (i < text.length) {
+    if (text[i] === '{') {
+      const end = matchBrace(text, i);
+      if (end === -1) { i++; continue; }
+      const c = tryParseCall(text.slice(i, end + 1));
+      if (c) push(c, i, end + 1);
+      i = end + 1;
+    } else i++;
   }
+}
+
+/**
+ * 从 AI 回复文本中解析全部工具调用（含起止下标），无则空数组。
+ * 识别格式：```toolcall 代码块 / <<TOOLCALL>> / <tool_call> / 裸 toolcall{...} / toolcall[...] /
+ * tool_call{...} / function_call{...} / 中文「调用/使用/执行 工具：name」(name 须为已知工具) /
+ * 以及兜底的任何含 name 的 JSON 对象。
+ */
+function extractCalls(text) {
+  const calls = [];
+  const seen = new Set();
+  const push = (c, start, end) => {
+    const norm = JSON.stringify({ name: c.name, args: c.args });
+    if (seen.has(norm)) return;
+    seen.add(norm);
+    calls.push({ name: c.name, args: c.args, _start: start, _end: end });
+  };
+  if (!text) return calls;
+
+  parseBlockFormat(text, push);     // 1) ```toolcall 代码块 / <<TOOLCALL>> / <tool_call>
+  parseKeywordFormat(text, push);   // 2) 关键字 toolcall / tool_call / function_call
+  parseChineseFormat(text, push);   // 3) 中文「调用/使用/执行 工具：name」
+  // 4) 兜底：任何含 name 的 JSON 对象。只在前三种全都没认出来时启用，
+  //    否则正文里一段普通 JSON（如工具返回值）会被误当成一次调用去执行。
+  if (!calls.length) parseFallbackFormat(text, push);
+
   return calls;
 }
 

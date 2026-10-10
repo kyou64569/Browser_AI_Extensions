@@ -20,9 +20,13 @@
  * @property {boolean} [enabled]   是否启用（默认 true；仅"多模型协作"模式下参与协作对话）
  * @property {boolean} [isPrimary] 是否设为主模型（仅"多模型协作"模式生效，单选）
  * @property {boolean} [supportsThinking] 是否开启"思考"能力（UI 展示思考选择器；Anthropic 直接据此发 thinking budget）
- * @property {string}  [thinkingStrength] 思考强度：'off'|'low'|'medium'|'high'（默认 'off'）
- * @property {boolean} [reasoningEffortSupported] OpenAI 兼容厂商专用：模型是否接受 reasoning_effort 参数（o1/o3 等推理模型）。
- *   仅当此标志为真时，openai/ollama 适配器才会发送 reasoning_effort；普通模型（gpt-4o 等）置 false 以避免 HTTP 400。
+ * @property {string}  [thinkingStrength] 思考强度：'default'|'off'|'low'|'medium'|'high'。
+ *   'default'=不传任何思考参数（用厂商默认行为，与混合推理模型的默认思考兼容）；'off'=显式关闭。
+ *   新建配置默认 'off'（openai 兼容通道下不发参数，行为与 'default' 相同）。
+ * @property {string}  [thinkingStyle] OpenAI 兼容厂商专用：思考参数风格。
+ *   'auto'（默认，按模型名自动识别，见 shared/thinking.js）| 'none'（不发参数）|
+ *   'openai'（reasoning_effort）| 'openrouter'（reasoning）| 'glm'（thinking）| 'qwen'（enable_thinking）。
+ *   取代旧的 reasoningEffortSupported 布尔开关（存储迁移见 migrateModels）。
  * @property {number}  [temperature] 采样温度（可选，透传厂商 API）
  * @property {number}  [top_p] 核采样阈值（可选，透传厂商 API）
  * @property {number}  [maxTokens] 单次回复最大 token 数（可选，透传厂商 API）
@@ -50,10 +54,29 @@ export function createModelConfig(overrides = {}) {
     isPrimary: overrides.isPrimary ?? false,
     supportsThinking: overrides.supportsThinking ?? false,
     thinkingStrength: overrides.thinkingStrength || 'off',
-    reasoningEffortSupported: overrides.reasoningEffortSupported ?? false,
+    thinkingStyle: overrides.thinkingStyle || 'auto',
     tpm: overrides.tpm,
     rpm: overrides.rpm,
   };
+}
+
+/**
+ * 模型配置存储迁移（就地修改并返回）。
+ * v2：reasoningEffortSupported 布尔开关 → thinkingStyle 风格枚举。
+ * 旧配置勾了「推理」的迁移为 'openai'（reasoning_effort），其余 'auto'（按模型名自动识别）。
+ * 兼容：迁移不删除旧字段，避免用户降级版本后旧代码读到 undefined。
+ * 入参放宽为 any[]：迁移要读取的正是「不再符合当前 ModelConfig 类型」的历史数据。
+ * @param {Array<any>} [models]
+ * @returns {Array<any>}
+ */
+export function migrateModels(models) {
+  for (const m of models || []) {
+    if (!m || typeof m !== 'object') continue;
+    if (!m.thinkingStyle) {
+      m.thinkingStyle = m.reasoningEffortSupported ? 'openai' : 'auto';
+    }
+  }
+  return models;
 }
 
 /**

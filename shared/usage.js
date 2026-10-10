@@ -49,7 +49,8 @@ export function estimateCallTokens(messages, completion) {
  * 记录一次模型调用。失败/中止的调用也记录（ok:false），便于观察降级频率。
  * @param {{model:string, vendor?:string, kind?:string, ok?:boolean,
  *          messages?:Array<{role:string,content:string}>, completion?:string,
- *          durationMs?:number}} entry
+ *          thinking?:string, durationMs?:number}} entry
+ *          thinking: 思考过程文本，计入输出 token（推理模型的思考消耗真实输出配额）
  */
 export function recordCall(entry) {
   if (!entry || !entry.model) return;
@@ -61,7 +62,7 @@ export function recordCall(entry) {
     kind: entry.kind || 'chat',          // chat | summarize | translate | agent ...
     ok: entry.ok !== false,
     inTok: est.inTok,
-    outTok: est.outTok,
+    outTok: est.outTok + estimateTokens(entry.thinking || ''),
     ms: Math.max(0, Math.round(entry.durationMs || 0)),
   });
   if (_buf.length >= 20) { void flushUsage(); return; }

@@ -7,6 +7,8 @@ import { getModels, saveModels, getKbState, saveKbState } from '../../shared/sto
 import { createModelConfig } from '../../core/model-config.js';
 import { KB_PROVIDERS } from '../../connectors/kb-registry.js';
 import { aggregateUsage } from '../../shared/usage.js';
+import { THINKING_STYLES, maxTokensHint } from '../../shared/thinking.js';
+import { thinkingLevels } from '../../shared/utils.js';
 
 const kFmt = (n) => n >= 10000 ? (n / 1000).toFixed(1) + 'k' : String(n);
 
@@ -81,13 +83,9 @@ async function renderKbProviders() {
   });
 }
 
-function thinkLabel(v) {
-  return { off: '关闭', low: '低', medium: '中', high: '高' }[v] || v;
-}
-
-/** 是否展示“支持 reasoning_effort”开关：仅 OpenAI 兼容厂商（openai/ollama/gemini）且已开启思考时 */
-function showResFlag(cfg) {
-  return cfg.supportsThinking && cfg.vendor !== 'anthropic';
+/** 思考参数（风格）下拉：仅 OpenAI 兼容厂商（openai）且已开启思考时展示 */
+function showThinkStyle(cfg) {
+  return cfg.supportsThinking && cfg.vendor === 'openai';
 }
 
 function escapeHtml(s) {
@@ -97,6 +95,7 @@ function escapeHtml(s) {
 }
 
 function cardHtml(cfg, idx) {
+  const mtHint = maxTokensHint(cfg);
   return `
   <div class="model-card" data-idx="${idx}">
     <label>名称 <input data-f="name" value="${escapeHtml(cfg.name)}"></label>
@@ -114,10 +113,17 @@ function cardHtml(cfg, idx) {
     <label>RPM上限 <input data-f="rpm" type="number" min="0" step="1" placeholder="留空=自适应" value="${cfg.rpm != null ? cfg.rpm : ''}"></label>
     <label>Temperature <input data-f="temperature" type="number" min="0" max="2" step="0.1" placeholder="留空=厂商默认" value="${cfg.temperature != null ? cfg.temperature : ''}"></label>
     <label>Top P <input data-f="top_p" type="number" min="0" max="1" step="0.05" placeholder="留空=厂商默认" value="${cfg.top_p != null ? cfg.top_p : ''}"></label>
+    <label data-tip="单次回复的最大输出 token 上限：思考与正文共用这一份额度，过小会让正文被 max_tokens 截断；留空=厂商默认">最大输出 tokens <input data-f="maxTokens" type="number" min="1" step="1" placeholder="留空=厂商默认" value="${cfg.maxTokens != null ? cfg.maxTokens : ''}">${mtHint ? `<span class="field-hint">${mtHint}</span>` : ''}</label>
     <label class="think-strength" style="display:${cfg.supportsThinking ? '' : 'none'}">思考强度
       <select data-f="thinkingStrength">
-        ${['off', 'low', 'medium', 'high'].map(v =>
-          `<option value="${v}" ${cfg.thinkingStrength === v ? 'selected' : ''}>${thinkLabel(v)}</option>`).join('')}
+        ${thinkingLevels(cfg.vendor).map(v =>
+          `<option value="${v.value}" ${cfg.thinkingStrength === v.value ? 'selected' : ''}>${v.label}</option>`).join('')}
+      </select>
+    </label>
+    <label class="think-style" data-tip="各网关「让模型思考」的参数不同：默认按模型名自动识别；识别不准时手动指定。仅 OpenAI 兼容厂商需要，Anthropic / Gemini / Ollama 用各自原生参数" style="display:${showThinkStyle(cfg) ? '' : 'none'}">思考参数
+      <select data-f="thinkingStyle">
+        ${THINKING_STYLES.map(s =>
+          `<option value="${s.value}" ${(cfg.thinkingStyle || 'auto') === s.value ? 'selected' : ''}>${s.label}</option>`).join('')}
       </select>
     </label>
     <label data-tip="勾选后此模型参与多模型协作；单模型处理时此复选框无作用"><input type="checkbox" data-f="enabled" ${cfg.enabled !== false ? 'checked' : ''}> 启用</label>
@@ -125,7 +131,6 @@ function cardHtml(cfg, idx) {
     <label data-tip="逐字流式输出；关闭则等待完整结果后一次性返回"><input type="checkbox" data-f="supportsStream" ${cfg.supportsStream !== false ? 'checked' : ''}> 流式</label>
     <label data-tip="多模型协作时由它整合各子模型结果；只能勾选一个主模型"><input type="checkbox" data-f="isPrimary" ${cfg.isPrimary ? 'checked' : ''}> 主模型</label>
     <label data-tip="开启推理/思考能力，推理模型会先思考再作答（Anthropic 走 thinking budget）"><input type="checkbox" data-f="supportsThinking" ${cfg.supportsThinking ? 'checked' : ''}> 思考</label>
-    <label class="res-flag" data-tip="OpenAI 兼容推理模型（o1/o3 等）专用：开启后发送 reasoning_effort 参数；普通模型（如 gpt-4o）请勿勾选，否则会报 HTTP 400" style="display:${showResFlag(cfg) ? '' : 'none'}"><input type="checkbox" data-f="reasoningEffortSupported" ${cfg.reasoningEffortSupported ? 'checked' : ''}> 推理</label>
     <button class="del">删除</button>
   </div>`;
 }
@@ -149,17 +154,23 @@ function refreshChecks() {
     streamCb.disabled = isVision;
     thinkCb.disabled = isVision;
 
-    // 思考强度选择器：仅开启“思考”且非视觉模型时显示
+    // 思考相关选择器：仅开启“思考”且非视觉模型时显示。
+    // 思考参数（风格）下拉仅 OpenAI 兼容（openai）厂商有意义；
+    // 强度下拉按厂商刷新选项（anthropic 展示预算档位），避免切换厂商后残留旧选项
+    const showThink = m.supportsThinking && !isVision;
     const thinkStrengthLabel = card.querySelector('.think-strength');
-    if (thinkStrengthLabel) thinkStrengthLabel.style.display = (m.supportsThinking && !isVision) ? '' : 'none';
-    // reasoning_effort 开关：仅 OpenAI 兼容厂商 + 开启思考时显示并可用
-    const resFlagLabel = card.querySelector('.res-flag');
-    const showRes = m.supportsThinking && m.vendor !== 'anthropic' && !isVision;
-    if (resFlagLabel) {
-      resFlagLabel.style.display = showRes ? '' : 'none';
-      const resCb = resFlagLabel.querySelector('input[data-f="reasoningEffortSupported"]');
-      if (resCb) resCb.disabled = isVision;
+    if (thinkStrengthLabel) {
+      thinkStrengthLabel.style.display = showThink ? '' : 'none';
+      const sel = thinkStrengthLabel.querySelector('select[data-f="thinkingStrength"]');
+      if (sel) {
+        const cur = m.thinkingStrength || 'off';
+        sel.innerHTML = thinkingLevels(m.vendor)
+          .map(l => `<option value="${l.value}" ${l.value === cur ? 'selected' : ''}>${l.label}</option>`).join('');
+        sel.value = cur;
+      }
     }
+    const thinkStyleLabel = card.querySelector('.think-style');
+    if (thinkStyleLabel) thinkStyleLabel.style.display = (showThink && m.vendor === 'openai') ? '' : 'none';
 
     const primaryDisabled = isVision || m.enabled === false || (primaryIdx >= 0 && i !== primaryIdx);
     primaryCb.disabled = primaryDisabled;
@@ -218,9 +229,9 @@ document.getElementById('save').onclick = async () => {
       const val = inp.type === 'checkbox' ? inp.checked : inp.value;
       // 数值型字段转为 Number；空字符串视为未配置（undefined），让适配器走厂商默认。
       // Number('abc') 是 NaN，NaN 进 storage 会破坏限速/超时逻辑，非法输入直接弃用
-      if (f === 'timeoutMs' || f === 'tpm' || f === 'rpm' || f === 'temperature' || f === 'top_p') {
+      if (f === 'timeoutMs' || f === 'tpm' || f === 'rpm' || f === 'temperature' || f === 'top_p' || f === 'maxTokens') {
         const n = Number(val);
-        models[i][f] = (val === '' || val == null || !Number.isFinite(n)) ? undefined : n;
+        models[i][f] = (val === '' || val == null || !Number.isFinite(n) || (f === 'maxTokens' && n <= 0)) ? undefined : n;
       } else {
         models[i][f] = val;
       }

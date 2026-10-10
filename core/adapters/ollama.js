@@ -31,13 +31,18 @@ export class OllamaAdapter extends ModelClient {
   }
 
   async *_stream(req, signal) {
-    // thinkingStrength 从 otherOptions 中剥离（解构后弃用）：Ollama 不识别该参数，透传会 400
-    const { maxTokens, thinkingStrength: _thinkingStrength, ...otherOptions } = req.options || {};
+    const { maxTokens, thinkingStrength, ...otherOptions } = req.options || {};
+    // think 参数：'default' 不传（厂商默认）；「关闭」显式传 false
+    //（DeepSeek-R1/Qwen3 等思考模型默认就思考，不发参数关不掉）；低/中/高传 true
+    const thinkParam = (thinkingStrength == null || thinkingStrength === 'default')
+      ? null
+      : thinkingStrength !== 'off';
     const body = {
       model: this.config.model,
       messages: this._toVendor(req),
       stream: true,
       ...(maxTokens != null ? { max_tokens: maxTokens } : {}),
+      ...(thinkParam != null ? { think: thinkParam } : {}),
       ...otherOptions,
     };
     const res = await fetchWithTimeout(this.endpoint, {
@@ -46,6 +51,7 @@ export class OllamaAdapter extends ModelClient {
       body: JSON.stringify(body),
       signal,
     }, this.config.timeoutMs);
+    let finishReason = '';
     for await (const line of streamLines(res.body)) {
       const data = sseData(line); // Ollama 是 NDJSON，sseData 对无前缀行原样放行
       if (data == null) continue;
@@ -55,21 +61,36 @@ export class OllamaAdapter extends ModelClient {
       if (json.error) {
         throw new HttpError('server', `Ollama 流式错误: ${typeof json.error === 'string' ? json.error : JSON.stringify(json.error).slice(0, 200)}`);
       }
+      if (json.done_reason) finishReason = json.done_reason;
+      const think = json.message?.thinking;
+      if (think) yield { delta: '', thinking: think, done: false };
       const delta = json.message?.content || '';
       if (delta) yield { delta, done: false, meta: { raw: json } };
-      if (json.done) { yield { delta: '', done: true }; return; }
+      if (json.done) { yield { delta: '', done: true, ...(finishReason ? { finishReason } : {}) }; return; }
     }
-    yield { delta: '', done: true };
+    yield { delta: '', done: true, ...(finishReason ? { finishReason } : {}) };
   }
 
   async *_nonStream(req, signal) {
-    const { maxTokens, thinkingStrength: _thinkingStrength, ...otherOptions } = req.options || {};
-    const body = { model: this.config.model, messages: this._toVendor(req), stream: false, ...(maxTokens != null ? { max_tokens: maxTokens } : {}), ...otherOptions };
+    const { maxTokens, thinkingStrength, ...otherOptions } = req.options || {};
+    // think 参数：'default' 不传（厂商默认）；「关闭」显式传 false
+    //（DeepSeek-R1/Qwen3 等思考模型默认就思考，不发参数关不掉）；其余档位 true
+    const thinkParam = (thinkingStrength == null || thinkingStrength === 'default')
+      ? null
+      : thinkingStrength !== 'off';
+    const body = {
+      model: this.config.model, messages: this._toVendor(req), stream: false,
+      ...(maxTokens != null ? { max_tokens: maxTokens } : {}),
+      ...(thinkParam != null ? { think: thinkParam } : {}),
+      ...otherOptions,
+    };
     const json = await postJson(this.endpoint, body, {}, this.config.timeoutMs, signal);
     if (json.error) {
       throw new HttpError('server', `Ollama 错误: ${typeof json.error === 'string' ? json.error : JSON.stringify(json.error).slice(0, 200)}`);
     }
-    yield { delta: json.message?.content || '', done: true, meta: { raw: json } };
+    const think = json.message?.thinking;
+    if (think) yield { delta: '', thinking: think, done: false };
+    yield { delta: json.message?.content || '', done: true, ...(json.done_reason ? { finishReason: json.done_reason } : {}), meta: { raw: json } };
   }
 
   async *chat(req) {

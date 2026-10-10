@@ -6,11 +6,57 @@ import { ModelClient } from '../model-base.js';
 import { postJson, fetchWithTimeout, HttpError } from '../http.js';
 import { streamLines, sseData } from '../sse.js';
 import { normalizeApiBase } from '../../shared/utils.js';
+import { resolveThinkingStyle, buildThinkingParams } from '../../shared/thinking.js';
 import { redactUrl } from '../../shared/sanitize.js';
+import { THINKING_MIN_TIMEOUT_MS } from '../../shared/constants.js';
+
+/** 从 delta / message 对象提取思考文本：DeepSeek/Qwen/GLM 系走 reasoning_content，OpenRouter 走 reasoning */
+function pickThinking(o) {
+  if (!o) return '';
+  if (typeof o.reasoning_content === 'string') return o.reasoning_content;
+  if (typeof o.reasoning === 'string') return o.reasoning;
+  return '';
+}
+
+
+
+/**
+ * 本次调用是否会产出思考。
+ * 判据不能只看「发出了思考参数」：SenseNova / DeepSeek-R1 这类 thinkingStyle 不可调的模型
+ * 默认就思考、也没有开关参数可发，按旧判据会被算成「不思考」而只拿模型卡那点超时，
+ * 于是用户把输出额度调大、思考变长之后，报错从「max_tokens 截断」变成更难排查的「请求超时」。
+ * 超时只是安全上限，勾选了「支持思考」就一律按会思考处理。
+ * @param {{supportsThinking?:boolean}} config 模型配置
+ * @param {Record<string, any>} [thinkParams] _thinkingParams 的结果（空对象 = 本次未发思考参数）
+ * @returns {boolean}
+ */
+export function willProduceThinking(config, thinkParams) {
+  return Object.keys(thinkParams || {}).length > 0 || !!(config && config.supportsThinking);
+}
+
+/**
+ * 计算本次调用的有效超时：会产出思考时不低于 THINKING_MIN_TIMEOUT_MS；
+ * timeoutMs 为 0（用户显式「永不超时」）时保持 0。
+ * @param {number} [timeoutMs] 模型卡配置的超时
+ * @param {boolean} [willThink] 本次是否会产出思考（见 willProduceThinking）
+ * @returns {number}
+ */
+export function effectiveTimeoutMs(timeoutMs, willThink) {
+  const t = timeoutMs || 0;
+  if (!t) return 0;
+  return willThink ? Math.max(t, THINKING_MIN_TIMEOUT_MS) : t;
+}
 
 export class OpenAIAdapter extends ModelClient {
   get endpoint() {
     return normalizeApiBase(this.config.apiBase) + '/chat/completions';
+  }
+
+  /** 思考参数：按模型配置的 thinkingStyle（'auto' 时按模型名识别）× 强度生成；'default'/未启用不发 */
+  _thinkingParams(thinkingStrength) {
+    if (thinkingStrength == null || thinkingStrength === 'default') return {};
+    const style = resolveThinkingStyle(this.config.thinkingStyle, this.config.model, this.config.apiBase);
+    return buildThinkingParams(style, thinkingStrength);
   }
 
   /** 统一消息 -> OpenAI messages */
@@ -33,14 +79,13 @@ export class OpenAIAdapter extends ModelClient {
 
   async *_stream(req, signal) {
     const { maxTokens, thinkingStrength, ...otherOptions } = req.options || {};
+    const thinkParams = this._thinkingParams(thinkingStrength);
     const body = {
       model: this.config.model,
       messages: this._toVendor(req),
       stream: true,
       ...(maxTokens != null ? { max_tokens: maxTokens } : {}),
-      // reasoning_effort 仅对真正支持的推理模型发送；否则普通模型会返回 HTTP 400
-      ...(this.config.reasoningEffortSupported && thinkingStrength && thinkingStrength !== 'off'
-          ? { reasoning_effort: thinkingStrength } : {}),
+      ...thinkParams,
       ...otherOptions,
     };
     const res = await fetchWithTimeout(this.endpoint, {
@@ -51,13 +96,14 @@ export class OpenAIAdapter extends ModelClient {
       },
       body: JSON.stringify(body),
       signal,
-    }, this.config.timeoutMs);
+    }, effectiveTimeoutMs(this.config.timeoutMs, willProduceThinking(this.config, thinkParams)));
 
+    let finishReason = '';
     for await (const line of streamLines(res.body)) {
       const data = sseData(line);
       if (data == null) continue;
       if (data === '[DONE]') {
-        yield { delta: '', done: true };
+        yield { delta: '', done: true, ...(finishReason ? { finishReason } : {}) };
         return;
       }
       let json;
@@ -66,31 +112,40 @@ export class OpenAIAdapter extends ModelClient {
       if (json.error) {
         throw new HttpError('server', `流式错误: ${json.error.message || JSON.stringify(json.error).slice(0, 200)}`);
       }
-      const delta = json.choices?.[0]?.delta?.content || '';
+      const fr = json.choices?.[0]?.finish_reason;
+      if (fr) finishReason = fr;
+      const d = json.choices?.[0]?.delta || {};
+      // 思考增量与正文增量相互独立、可交错到达；思考帧不携带 meta（无 usage 价值）
+      const think = pickThinking(d);
+      if (think) yield { delta: '', thinking: think, done: false };
+      const delta = d.content || '';
       if (delta) yield { delta, done: false, meta: { raw: json } };
     }
-    yield { delta: '', done: true };
+    yield { delta: '', done: true, ...(finishReason ? { finishReason } : {}) };
   }
 
   async *_nonStream(req, signal) {
     const { maxTokens, thinkingStrength, ...otherOptions } = req.options || {};
+    const thinkParams = this._thinkingParams(thinkingStrength);
     const body = {
       model: this.config.model,
       messages: this._toVendor(req),
       stream: false,
       ...(maxTokens != null ? { max_tokens: maxTokens } : {}),
-      ...(this.config.reasoningEffortSupported && thinkingStrength && thinkingStrength !== 'off'
-          ? { reasoning_effort: thinkingStrength } : {}),
+      ...thinkParams,
       ...otherOptions,
     };
     const json = await postJson(
       this.endpoint, body,
       { Authorization: `Bearer ${this.config.apiKey}` },
-      this.config.timeoutMs,
+      effectiveTimeoutMs(this.config.timeoutMs, willProduceThinking(this.config, thinkParams)),
       signal
     );
-    const text = json.choices?.[0]?.message?.content || '';
-    yield { delta: text, done: true, meta: { raw: json } };
+    const msg = json.choices?.[0]?.message || {};
+    const think = pickThinking(msg);
+    const fr = json.choices?.[0]?.finish_reason;
+    if (think) yield { delta: '', thinking: think, done: false };
+    yield { delta: msg.content || '', done: true, ...(fr ? { finishReason: fr } : {}), meta: { raw: json } };
   }
 
   async *chat(req) {

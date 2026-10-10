@@ -24,4 +24,16 @@ export class ModelClient {
   async *chat(req) {
     throw new Error('chat() 未实现');
   }
+
+  /**
+   * 本次请求实际发出的输出上限（token），null = 不发送该字段（走厂商默认）。
+   * 思考预算保护与「正文被截断」的判读必须用它，而不是模型卡的 cfg.maxTokens：
+   * 降级时请求体沿用主模型的 options，而部分厂商对 max_tokens 另有规则（见 AnthropicAdapter）。
+   * @param {import('./message.js').ChatRequest} req
+   * @returns {number|null}
+   */
+  outputCap(req) {
+    const t = req && req.options ? req.options.maxTokens : undefined;
+    return typeof t === 'number' && Number.isFinite(t) && t > 0 ? t : null;
+  }
 }

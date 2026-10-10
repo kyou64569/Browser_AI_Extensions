@@ -6,6 +6,7 @@ input, select { padding: 6px; width: 320px; max-width: 100%; }
 .model-card label { display: inline-block; width: 30%; margin: 4px 0; vertical-align: top; overflow-wrap: anywhere; }
 /* 复选框悬停提示（JS 驱动的浮动提示框，自动夹在视口内避免溢出屏幕外） */
 .model-card label[data-tip] { cursor: help; }
+.model-card .field-hint { display: block; font-size: 10px; color: #888; }
 .tip-pop {
   position: fixed; z-index: 9999; max-width: 240px; padding: 7px 10px;
   background: #1f2430; color: #fff; font-size: 12px; line-height: 1.5; border-radius: 8px;

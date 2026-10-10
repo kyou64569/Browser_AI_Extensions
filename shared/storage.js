@@ -1,16 +1,18 @@
 // shared/storage.js
 // chrome.storage.local 封装。所有模型配置/API Key 存这里，不写死在代码里。
 
+import { migrateModels } from '../core/model-config.js';
+
 const KEYS = {
   MODELS: 'models',        // ModelConfig[]
   WHISPER: 'whisperModels',// Whisper 语音识别模型配置 []
   KB: 'kb',                // 知识库多 provider 状态：{ active, providers:{ <id>:{type,cfg} } }
 };
 
-/** 读取全部模型配置（ModelConfig[]，结构见 core/model-config.js） */
+/** 读取全部模型配置（ModelConfig[]，结构见 core/model-config.js），读取时顺带做旧格式迁移 */
 export async function getModels() {
   const r = await chrome.storage.local.get(KEYS.MODELS);
-  return /** @type {import('../core/model-config.js').ModelConfig[]} */ (r[KEYS.MODELS]) || [];
+  return migrateModels(/** @type {import('../core/model-config.js').ModelConfig[]} */ (r[KEYS.MODELS]) || []);
 }
 
 /** 保存全部模型配置 */

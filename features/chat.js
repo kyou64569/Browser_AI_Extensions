@@ -2,15 +2,17 @@
 // 通用聊天：复用同一套 adapter + FallbackManager 链路。
 // 支持三种调用形态：
 //   1) 单模型（默认）：使用 ctx.models 中的所选模型，失败且无凭证时降级为本地演示。
-//   2) 多模型协作（opts.mode === 'collab'）：所有"已启用"模型参与，由"主模型"收集各子模型
-//      结果并整合为最终流式回复；仅主模型判断是否流式。
+//   2) 多模型协作（opts.mode === 'collab'）：所有"已启用"模型参与，子模型并发回答（限
+//      COLLAB_MAX_CONCURRENCY 路），由"主模型"按勾选顺序收集整合为最终流式回复。
+//      子模型也走流式，但只用于向 opts.onSubModel 回报进度，不直接向 UI 出字。
 //   3) 视觉转发：当聊天模型不支持看图、而用户消息含图片时，自动把图片转交"视觉模型"识别，
 //      再把识别结果回灌给聊天模型整合回答。
 // 本模块只依赖 core/model-client、core/fallback、shared/utils，不依赖具体 UI。
 
-import { FallbackManager } from '../core/fallback.js';
+import { FallbackManager, isThinkingBudgetBlown } from '../core/fallback.js';
 import { createClient } from '../core/model-client.js';
-import { hasCred, optionsFromModel } from '../shared/utils.js';
+import { hasCred, optionsFromModel, isTruncatedFinish } from '../shared/utils.js';
+import { recordCall } from '../shared/usage.js';
 
 function buildDemoReply(prompt) {
   const p = (prompt || '').trim();
@@ -58,11 +60,12 @@ async function augmentWithVision(messages, chatCfg, visionCfg, opts) {
 
   let desc = '';
   try {
-    desc = await runSingle(visionCfg, [{
+    // 视觉识别的思考文本不回灌（只要结论），但要能上报状态；用量按 vision 单记一类
+    desc = (await runSingle(visionCfg, [{
       role: 'user',
       content: '请尽可能详细地描述这张图片中的所有可见内容，包括文字、图表、布局与关键细节，以便另一个模型据此回答用户问题。',
       attachments: imgs,
-    }], opts);
+    }], { ...opts, kind: 'vision' })).text;
   } catch (e) {
     if (opts.signal && opts.signal.aborted) throw e; // 用户中止要原样上抛
     console.warn('[chat] 视觉识别失败，回退为仅文字发送:', e?.message || e);
@@ -88,27 +91,84 @@ function stripImageAttachments(messages) {
   });
 }
 
-/** 非流式调用单个模型（用于子模型回答、视觉识别）。自动按配置决定是否思考。 */
+/**
+ * 调用单个模型（子模型回答、视觉识别）。自动按配置决定是否思考。
+ * 传了 opts.onProgress 就走流式：逐帧回报思考/正文增量，让 UI 能显示子模型的实时进度；
+ * 具体是否真流式由适配器按该卡的 supportsStream 自动降级，这里不必判断。
+ *
+ * 这条路径刻意不走 FallbackManager（子模型答得不好不该被换成别的模型、也不该进冷却），
+ * 但单模型路径上的三道保险在这里同样必要，逐项搬过来：
+ * - 思考预算保护：正文迟迟不出、而思考已逼近本次发出的 max_tokens 时提前断开流。
+ *   协作一次并发 N 路，等厂商自己撞满额度就是十几分钟白烧（实测 sensenova 559s、intern 757s）；
+ * - finishReason + 空正文：「跑完但一个字没吐」必须让调用方看得出来，不能算成功；
+ * - 用量记录：含思考文本，否则协作的 N 路子模型消耗在用量页完全隐形。
+ * @param {import('../core/model-config.js').ModelConfig} cfg
+ * @param {import('../core/message.js').Message[]} messages
+ * @param {{signal?:AbortSignal, thinkingStrength?:string, kind?:string, onProgress?:(p:{thinkingDelta:string, textDelta:string})=>void}} [opts]
+ * @returns {Promise<{text:string, thinking:string, finishReason:string, stoppedByGuard:boolean}>}
+ */
 async function runSingle(cfg, messages, opts = {}) {
   const client = createClient(cfg);
   const options = { ...optionsFromModel(cfg) };
   if (opts.thinkingStrength != null) options.thinkingStrength = opts.thinkingStrength;
+  const req = { messages, stream: typeof opts.onProgress === 'function', options, signal: opts.signal };
+  const cap = client.outputCap(req);   // 本次真正发出的输出上限，保护阈值只认它
   let text = '';
-  for await (const c of client.chat({ messages, stream: false, options, signal: opts.signal })) {
-    text += c.delta || '';
+  let thinking = '';
+  let finishReason = '';
+  let stoppedByGuard = false;
+  const t0 = Date.now();
+  const record = (ok) => recordCall({
+    model: cfg.name, vendor: cfg.vendor, kind: opts.kind, ok,
+    messages, completion: text, thinking, durationMs: Date.now() - t0,
+  });
+  try {
+    for await (const c of /** @type {AsyncGenerator<{delta?:string, thinking?:string, finishReason?:string}>} */ (client.chat(req))) {
+      const d = c.delta || '';
+      const t = c.thinking || '';
+      if (d) text += d;
+      if (t) thinking += t;
+      if (c.finishReason) finishReason = c.finishReason;
+      // 思考全文只用于回报进度，调用方要的是拼好的 {text, thinking}
+      if ((d || t) && opts.onProgress) opts.onProgress({ thinkingDelta: t, textDelta: d });
+      // break 而非 throw：生成器退出会经 sse.js 的 finally 断开底层流，
+      // 而这一路失败不该让整个协作中断——其余子模型照常答，主模型照样能整合。
+      if (!text && isThinkingBudgetBlown(cap, thinking)) { stoppedByGuard = true; break; }
+    }
+    record(!!text.trim());
+  } catch (e) {
+    // 用户中止不记用量（与 FallbackManager 口径一致）；失败要记，白烧的额度正是要看的那类
+    if (!(opts.signal && opts.signal.aborted)) record(false);
+    throw e;
   }
-  return text;
+  return { text, thinking, finishReason, stoppedByGuard };
 }
 
 /**
- * 组装主模型的"整合"提示：保留原始对话，去掉图片附件（子模型已对图片做视觉分析并汇总），
+ * 子模型「跑完了却没有正文」的成因描述。三种成因必须分开报，因为用户的动作不同：
+ * 我方提前停止 = 额度不够但已止损；厂商截断 = 额度不够且已花完；都不是 = 模型自己没吐字。
+ * @param {{text:string, thinking:string, finishReason:string, stoppedByGuard:boolean}} r
+ * @returns {string} 有正文时返回空串
+ */
+function subEmptyNote(r) {
+  if (r.text.trim()) return '';
+  const basis = r.thinking.length ? `已思考 ${r.thinking.length} 字` : '无任何输出';
+  if (r.stoppedByGuard) return `思考占满输出额度，已提前停止（${basis}）`;
+  if (isTruncatedFinish(r.finishReason)) return `正文被 max_tokens 截断（${basis}）`;
+  return r.thinking.length ? `只有思考、没有正文（${basis}）` : '模型返回空响应';
+}
+
+/**
+ * 组装主模型的"整合"提示：保留原始对话，去掉图片附件（子模型已对视觉内容分析并汇总），
  * 追加各子模型独立回答，要求主模型综合分析、去重、修正后给出最佳答案。
  */
 function buildSynthesis(messages, results) {
   // 仅保留 role/content，剥离 attachments，避免主模型重复转发图片
   const base = messages.map(m => ({ role: m.role, content: m.content || '' }));
+  // 空正文要写成「未产出」而不是留一格空白：否则主模型分不清「这票弃权」和「它没什么可说」，
+  // 用户也看不出整合答案里其实少了两路。
   const summary = results
-    .map((r, i) => `【子模型 ${i + 1}：${r.name}】\n${r.text}`)
+    .map((r, i) => `【子模型 ${i + 1}：${r.name}】\n${r.text || r.note || '（未产出正文）'}`)
     .join('\n\n');
   base.push({
     role: 'user',
@@ -117,8 +177,12 @@ function buildSynthesis(messages, results) {
   return base;
 }
 
-/** 多模型协作：子模型各自非流式回答，主模型收集整合后流式输出。
- * @param {{models:import('../core/model-config.js').ModelConfig[], primary:import('../core/model-config.js').ModelConfig, visionModel?:import('../core/model-config.js').ModelConfig, thinkingStrength?:string, messages:import('../core/message.js').Message[], opts:{signal?:AbortSignal, thinkingStrength?:string, [k:string]:any}}} args
+/** 协作子模型的并发上限。不设限的话勾满模型就是一次协作 N 个并发长请求，
+ *  网关的 tpm/rpm 很容易直接 429；3 路已能把总耗时从「求和」压到接近「最慢一个」。 */
+export const COLLAB_MAX_CONCURRENCY = 3;
+
+/** 多模型协作：子模型并发回答（限 3 路），主模型收集整合后流式输出。
+ * @param {{models:import('../core/model-config.js').ModelConfig[], primary:import('../core/model-config.js').ModelConfig, visionModel?:import('../core/model-config.js').ModelConfig, thinkingStrength?:string, messages:import('../core/message.js').Message[], opts:{signal?:AbortSignal, thinkingStrength?:string, onSubModel?:(evt:{index:number,total:number,id:string,name:string,phase:string,ms?:number,thinking?:string,text?:string,error?:string,thinkingDelta?:string,textDelta?:string})=>void, [k:string]:any}}} args
  */
 async function* collabStream(args) {
   const { models, primary, visionModel, thinkingStrength, messages, opts } = args;
@@ -127,33 +191,74 @@ async function* collabStream(args) {
   // N 个子模型就是 N 倍的图片 token 与延迟。识别结果对看图能力弱的子模型同样够用。
   const needVision = [...subs, primary].some(m => !m.supportsVision);
   const aug = needVision ? await augmentWithVision(messages, {}, visionModel, opts) : messages;
-  const subResults = [];
-  for (const m of subs) {
-    let text = '';
-    try {
-      text = await runSingle(m, aug, opts);
-    } catch (e) {
-      // 用户点「停止」：中止不是子模型故障，必须原样上抛，
-      // 否则循环继续把剩余子模型全部跑完、主模型整合调用照常发出，白烧 token
-      if (opts.signal && opts.signal.aborted) throw e;
-      text = `[模型 ${m.name} 调用失败：${e.message}]`;
+  // 子模型的思考与正文此前是被静默丢掉的（runSingle 只取 delta），界面上只能看到
+  // 主模型一段很长的整合思考。这里按 onFallback 的既有约定回调出去，供 UI 摆运行状态。
+  const emit = opts.onSubModel ? (evt) => { try { opts.onSubModel(evt); } catch (_) { /* UI 回调不参与成败 */ } } : null;
+  const total = subs.length;
+  // 按 index 落位，不按完成顺序：整合提示里的「子模型 1/2/3」必须与用户勾选顺序稳定一致，
+  // 并发完成后直接用 push 会把顺序变成「谁先回谁在前」。
+  const results = new Array(total);
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < total) {
+      const index = cursor++;
+      const m = subs[index];
+      const t0 = Date.now();
+      if (emit) emit({ index, total, id: m.id, name: m.name, phase: 'start' });
+      const prog = emit ? ({ thinkingDelta, textDelta }) =>
+        emit({ index, total, id: m.id, name: m.name, phase: 'progress', thinkingDelta, textDelta }) : null;
+      try {
+        const r = await runSingle(m, aug, prog ? { ...opts, onProgress: prog, kind: 'collab' } : { ...opts, kind: 'collab' });
+        const note = subEmptyNote(r);
+        results[index] = { name: m.name, text: r.text, note };
+        // 「完成」只说明没抛异常，零正文不算完成：报 empty，UI 才不会再显示成「完成 · 559.8s」
+        if (emit) emit({
+          index, total, id: m.id, name: m.name,
+          phase: r.text.trim() ? 'done' : 'empty',
+          ms: Date.now() - t0, thinking: r.thinking, text: r.text,
+          ...(note ? { reason: note } : {}),
+        });
+      } catch (e) {
+        // 用户点「停止」：中止不是子模型故障，必须原样上抛，
+        // 否则其余子模型继续跑完、主模型还拿着半截结果整合，白烧 token
+        if (opts.signal && opts.signal.aborted) throw e;
+        results[index] = { name: m.name, text: `[模型 ${m.name} 调用失败：${e.message}]` };
+        if (emit) emit({ index, total, id: m.id, name: m.name, phase: 'error', ms: Date.now() - t0, error: e.message || String(e) });
+      }
     }
-    subResults.push({ name: m.name, text });
-  }
+  };
+  const lanes = Math.max(1, Math.min(COLLAB_MAX_CONCURRENCY, total));
+  await Promise.all(Array.from({ length: lanes }, worker));
 
-  const synthesisMessages = buildSynthesis(messages, subResults);
+  const synthesisMessages = buildSynthesis(messages, results);
   const client = createClient(primary);
-  // 仅主模型决定是否流式；子模型一律非流式
+  // 仅主模型决定是否流式；子模型流式只用于回报进度，不直接向 UI 出字
   const options = { ...optionsFromModel(primary) };
   if (thinkingStrength != null) options.thinkingStrength = thinkingStrength;
 
-  for await (const c of client.chat({
-    messages: synthesisMessages,
-    stream: primary.supportsStream,
-    options,
-    signal: opts.signal,
-  })) {
-    yield { ...c, model: primary.name, index: 0 };
+  // 整合调用要读进 N 份子答案，是协作里最贵的一路，同样要进用量（此前完全隐形）
+  const t0 = Date.now();
+  let pText = '';
+  let pThink = '';
+  try {
+    for await (const c of client.chat({
+      messages: synthesisMessages,
+      stream: primary.supportsStream,
+      options,
+      signal: opts.signal,
+    })) {
+      pText += c.delta || '';
+      pThink += c.thinking || '';
+      yield { ...c, model: primary.name, index: 0 };
+    }
+    recordCall({ model: primary.name, vendor: primary.vendor, kind: 'collab', ok: !!pText.trim(),
+      messages: synthesisMessages, completion: pText, thinking: pThink, durationMs: Date.now() - t0 });
+  } catch (e) {
+    if (!(opts.signal && opts.signal.aborted)) {
+      recordCall({ model: primary.name, vendor: primary.vendor, kind: 'collab', ok: false,
+        messages: synthesisMessages, completion: pText, thinking: pThink, durationMs: Date.now() - t0 });
+    }
+    throw e;
   }
 }
 
@@ -166,8 +271,10 @@ async function* collabStream(args) {
  * @param {string} [opts.selectedId] 单模型模式下所选模型 id（不传则用 models[0]）
  * @param {string} [opts.thinkingStrength] 聊天所选模型的思考强度（覆盖模型配置）
  * @param {(i:number,cfg:object,reason:string)=>void} [opts.onFallback] UI 提示回调
+ * @param {(evt:{index:number,total:number,id:string,name:string,phase:string,ms?:number,thinking?:string,text?:string,error?:string,reason?:string})=>void} [opts.onSubModel] 协作模式下子模型的状态回调（phase: start|progress|done|empty|error；empty=跑完但零正文，reason 说成因；仅 collab 触发）
  * @param {AbortSignal} [opts.signal]
- * @yields {{delta:string, model?:string, index?:number, error?:string}}
+ * @yields {{delta:string, thinking?:string, model?:string, index?:number, error?:string}}
+ *         thinking 为思考过程增量（仅开了思考的模型会产生），不消费思考的调用方忽略即可
  */
 export async function* chatStream(ctx, messages, opts = {}) {
   const models = (ctx.models || []).filter(Boolean);

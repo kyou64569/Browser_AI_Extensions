@@ -8,13 +8,19 @@
 // 3) 所有工具统一返回 { ok:true, result } 或 { ok:false, error }，便于上层（侧边栏）统一处理。
 
 import { pageTool, DOM_TOOLS } from '../shared/dom-tools.js';
+import {
+  NAV_CONFIRM_TIMEOUT_MS,
+  CONTENT_SCRIPT_TIMEOUT_MS,
+  FULL_PAGE_MAX_TILES,
+  CANVAS_MAX_DIM,
+  SCROLL_WAIT_MS,
+} from '../shared/constants.js';
 
 // ── 跨域导航守卫（S-03）────────────────────────────────────────────────────
 // open_url 原本只有"协议白名单"，但没有域名约束：只要网页正文里有一段诱导文本
 // （prompt injection），Agent 就可能被诱导把当前标签导航到钓鱼站。
 // 这里补上程序化约束：跨域名跳转必须先经用户确认，同域名（含子域）正常放行。
 const NAV_APPROVE_KEY = 'navApprovedHosts';   // 存 chrome.storage.session，浏览器会话内有效
-const NAV_CONFIRM_TIMEOUT_MS = 45000;         // 等用户点确认的时间上限
 const _navApproved = new Set();               // 内存副本，避免每次跳转都读存储
 let _navApprovedLoaded = false;
 
@@ -92,7 +98,6 @@ function requestNavApproval(payload) {
  * DEFAULT_WAIT_FOR_TIMEOUT_MS=10000），否则 wait_for 还没等到条件，这里的 sendMessage
  * 先超时回落到 executeScript——同一个工具被执行两遍（click 双击 / type 双输入）。
  */
-const CS_TIMEOUT_MS = 15000;
 
 async function runInPage(tabId, tool, args) {
   // 带超时的 sendMessage（content script 缺失时浏览器可能长时间挂起或不报明确错误）
@@ -120,7 +125,7 @@ async function runInPage(tabId, tool, args) {
 
   // 1) 首选：让已注入的 content script 直接执行（EXECUTE_TOOL 消息）
   try {
-    const resp = await sendWithTimeout(CS_TIMEOUT_MS);
+    const resp = await sendWithTimeout(CONTENT_SCRIPT_TIMEOUT_MS);
     if (resp && typeof resp === 'object' && 'ok' in resp) return resp;
     if (resp && typeof resp === 'object') return resp; // 兼容旧式 {result} 结构
     return { ok: false, error: '内容脚本无返回' };
@@ -214,18 +219,12 @@ async function dataUrlToBitmap(du) {
 }
 
 async function blobToDataUrl(blob) {
-  const buf = await blob.arrayBuffer();
-  const bytes = new Uint8Array(buf);
-  let binary = '';
-  const chunk = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunk) {
-    // 使用循环而非 apply 避免 call stack 溢出（大图片时 bytes.subarray 可能超过栈限制）
-    const sub = bytes.subarray(i, i + chunk);
-    for (let j = 0; j < sub.length; j++) {
-      binary += String.fromCharCode(sub[j]);
-    }
-  }
-  return 'data:image/png;base64,' + btoa(binary);
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(new Error('FileReader failed to convert blob to data URL'));
+    reader.readAsDataURL(blob);
+  });
 }
 
 /** 整页截图：逐屏滚动捕获并拼合 */
@@ -233,27 +232,25 @@ async function takeFullPageScreenshot(tab) {
   const tabId = tab.id;
   const metrics = (await chrome.scripting.executeScript({ target: { tabId }, func: pageScreenshotHelper, args: ['metrics', null] }))[0].result;
   const { fullH, vw, vh } = metrics;
-  const maxTiles = 120;
   const totalTiles = Math.ceil(fullH / vh);
-  if (totalTiles > maxTiles) {
-    return { ok: false, error: `页面过长（约 ${totalTiles} 屏），超出整页截图上限（${maxTiles} 屏）。请改用 element 或 visible 模式，或先缩小页面。` };
+  if (totalTiles > FULL_PAGE_MAX_TILES) {
+    return { ok: false, error: `页面过长（约 ${totalTiles} 屏），超出整页截图上限（${FULL_PAGE_MAX_TILES} 屏）。请改用 element 或 visible 模式，或先缩小页面。` };
   }
   // 画布按 CSS 像素尺寸（vw × fullH），与设备 DPR 无关；
   // 否则高分屏下 captureVisibleTab 返回 DPR 放大位图，整页画布会远超 16384px 上限。
-  const MAX_DIM = 16384;
-  if (vw > MAX_DIM || fullH > MAX_DIM) {
-    return { ok: false, error: `整页尺寸约 ${vw}x${fullH} 超出浏览器单张画布上限（${MAX_DIM}px，约 ${Math.floor(MAX_DIM / vh)} 屏），无法生成整页截图。请改用 element（截取关键元素）或 visible 模式。` };
+  if (vw > CANVAS_MAX_DIM || fullH > CANVAS_MAX_DIM) {
+    return { ok: false, error: `整页尺寸约 ${vw}x${fullH} 超出浏览器单张画布上限（${CANVAS_MAX_DIM}px，约 ${Math.floor(CANVAS_MAX_DIM / vh)} 屏），无法生成整页截图。请改用 element（截取关键元素）或 visible 模式。` };
   }
   const tiles = [];
   await chrome.scripting.executeScript({ target: { tabId }, func: pageScreenshotHelper, args: ['scrollTo', { y: 0 }] });
-  await sleep(220);
+  await sleep(SCROLL_WAIT_MS);
   let y = 0;
   while (y < fullH) {
     tiles.push({ du: await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' }), y });
     y += vh;
     if (y < fullH) {
       await chrome.scripting.executeScript({ target: { tabId }, func: pageScreenshotHelper, args: ['scrollTo', { y }] });
-      await sleep(220);
+      await sleep(SCROLL_WAIT_MS);
     }
   }
   await chrome.scripting.executeScript({ target: { tabId }, func: pageScreenshotHelper, args: ['scrollTop', null] });
@@ -281,7 +278,7 @@ async function takeElementScreenshot(tab, a) {
   const tabId = tab.id;
   const rect = (await chrome.scripting.executeScript({ target: { tabId }, func: pageScreenshotHelper, args: ['elementRect', a] }))[0].result;
   if (!rect || !rect.found) return { ok: false, error: '未找到要截图的元素（selector/xpath/text 均不匹配）' };
-  await sleep(220);
+  await sleep(SCROLL_WAIT_MS);
   const du = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
   const bmp = await dataUrlToBitmap(du);
   const scaleX = bmp.width / rect.vw;

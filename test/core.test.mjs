@@ -3,7 +3,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { normalizeApiBase, hasCred, optionsFromModel, thinkingLevels } from '../shared/utils.js';
+import { normalizeApiBase, hasCred, optionsFromModel, thinkingLevels, isTruncatedFinish } from '../shared/utils.js';
 import { estimateTokens, splitSentences, chunkUnits, RateGate } from '../core/translate-rate.js';
 import {
   isRateLimit, isTokenRateLimit, parseRetryAfterSec, backoffMs, withRateLimitRetry,
@@ -46,21 +46,34 @@ test('optionsFromModel: 只透传合法数值', () => {
   assert.deepEqual(optionsFromModel(/** @type {any} */ ({ temperature: 'hot' })), {});
 });
 
-test('optionsFromModel: reasoning_effort 仅对显式支持的厂商发送', () => {
-  // OpenAI 兼容厂商未声明支持 → 不发（否则普通模型 HTTP 400）
-  assert.equal(optionsFromModel({ vendor: 'openai', supportsThinking: true, thinkingStrength: 'low' }).thinkingStrength, undefined);
-  // 声明支持 → 发
-  assert.equal(optionsFromModel({ vendor: 'openai', supportsThinking: true, thinkingStrength: 'low', reasoningEffortSupported: true }).thinkingStrength, 'low');
-  // Anthropic 走 thinking budget，不需要 reasoningEffortSupported
+test('optionsFromModel: 思考强度只看思考总开关，厂商参数差异由适配器按 thinkingStyle 处理', () => {
+  // 开启思考且强度非 off → 透传（是否发参数、发哪种由 thinkingStyle 在适配器侧决定）
+  assert.equal(optionsFromModel({ vendor: 'openai', supportsThinking: true, thinkingStrength: 'low' }).thinkingStrength, 'low');
   assert.equal(optionsFromModel({ vendor: 'anthropic', supportsThinking: true, thinkingStrength: 'high' }).thinkingStrength, 'high');
-  // 'off' 一律不发
-  assert.equal(optionsFromModel({ vendor: 'anthropic', supportsThinking: true, thinkingStrength: 'off' }).thinkingStrength, undefined);
+  assert.equal(optionsFromModel({ vendor: 'ollama', supportsThinking: true, thinkingStrength: 'medium' }).thinkingStrength, 'medium');
+  // 未开启思考 / 强度 off / 强度 default（使用厂商默认）→ 不透传
+  assert.equal(optionsFromModel({ vendor: 'openai', supportsThinking: false, thinkingStrength: 'low' }).thinkingStrength, undefined);
+  assert.equal(optionsFromModel({ vendor: 'openai', supportsThinking: true, thinkingStrength: 'off' }).thinkingStrength, undefined);
+  assert.equal(optionsFromModel({ vendor: 'openai', supportsThinking: true, thinkingStrength: 'default' }).thinkingStrength, undefined);
 });
 
-test('thinkingLevels: anthropic 展示预算档位，其余展示通用档位', () => {
+test('isTruncatedFinish: 识别各厂商的「输出被上限截断」结束原因', () => {
+  assert.equal(isTruncatedFinish('length'), true);
+  assert.equal(isTruncatedFinish('max_tokens'), true);
+  assert.equal(isTruncatedFinish('MAX_TOKENS'), true);
+  assert.equal(isTruncatedFinish('stop'), false);
+  assert.equal(isTruncatedFinish('end_turn'), false);
+  assert.equal(isTruncatedFinish(''), false);
+  assert.equal(isTruncatedFinish(undefined), false);
+});
+
+test('thinkingLevels: 含「默认（不传参数）」档；anthropic 展示预算档位，其余展示通用档位', () => {
+  for (const v of ['openai', 'anthropic', 'gemini', 'ollama']) {
+    assert.equal(thinkingLevels(v)[0].value, 'default', v + ' 首档应为 default');
+    assert.ok(thinkingLevels(v).some(l => l.value === 'off'), v + ' 应含 off 档');
+  }
   assert.ok(thinkingLevels('anthropic').some(l => l.label.includes('2K')));
   assert.ok(!thinkingLevels('openai').some(l => l.label.includes('2K')));
-  assert.equal(thinkingLevels('openai')[0].value, 'off');
 });
 
 // ── 分块与分句 ────────────────────────────────────────────────────────────

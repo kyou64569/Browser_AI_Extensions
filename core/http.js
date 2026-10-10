@@ -65,6 +65,7 @@ export async function fetchWithTimeout(url, init = {}, timeoutMs = 0) {
       }
       throw new HttpError('timeout', `请求超时（>${timeoutMs}ms）`, 0);
     }
+    console.debug('[fetchWithTimeout] 网络错误:', e.message);
     throw new HttpError('network', e?.message || 'network error', 0);
   } finally {
     if (timer) clearTimeout(timer);
@@ -105,6 +106,7 @@ export async function postJson(url, body, headers = {}, timeoutMs = 0, signal) {
       if (signal && signal.aborted) throw new HttpError('aborted', '请求已被用户中止', 0);
       throw new HttpError('timeout', `请求超时（>${timeoutMs}ms）`, 0);
     }
+    console.debug('[postJson] JSON 解析错误:', e.message);
     throw new HttpError('unknown', `Invalid JSON response: ${e?.message || e}`, res?.status);
   } finally {
     if (timer) clearTimeout(timer);

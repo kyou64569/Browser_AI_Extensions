@@ -48,13 +48,13 @@ chrome.runtime.onInstalled.addListener(() => {
       title: 'AI 助手：开启实时字幕',
       contexts: ['page'],
       documentUrlPatterns: ['http://*/*', 'https://*/*'],
-    }, () => { if (chrome.runtime.lastError) console.warn('[contextMenu]', chrome.runtime.lastError); });
+    }, () => { if (chrome.runtime.lastError) console.warn('[contextMenu] 创建菜单失败:', chrome.runtime.lastError); });
   });
 });
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (info.menuItemId !== 'ai-open-live-caption' || !tab || !tab.id) return;
   // 右键点击普通网页本身即授予该标签页 activeTab；再打开侧边栏即可正常捕获。
-  try { await chrome.sidePanel.open({ tabId: tab.id }); } catch (_) {}
+  try { await chrome.sidePanel.open({ tabId: tab.id }); } catch (e) { console.warn('[contextMenu] 打开侧边栏失败:', e); }
 });
 
 // ── 长连接端口（onConnect）──
@@ -118,7 +118,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         let page = null;
         try {
           page = await chrome.tabs.sendMessage(tab.id, { type: 'EXTRACT_PAGE' });
-        } catch (_) {
+        } catch (e) {
+          console.warn('[GET_PAGE] 内容脚本不可用，尝试兜底:', e.message);
           page = null; // 内容脚本未注入或不可用，进入下方兜底
         }
 
@@ -129,7 +130,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               func: extractMainPageInPage,
             });
             page = (res && res.result) ? res.result : null;
-          } catch (_) {
+          } catch (e) {
+            console.warn('[GET_PAGE] 脚本注入兜底失败:', e.message);
             page = null;
           }
         }
@@ -153,7 +155,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // 原因：content 脚本在 await TRANSLATE_PAGE 响应期间自身被阻塞，经它中转的进度消息易丢失。
         const onProgress = (p) => {
           try { chrome.runtime.sendMessage({ type: 'WEB_TRANSLATE_PROGRESS', payload: p }, () => { void chrome.runtime.lastError; }); }
-          catch (_) { /* 侧边栏未打开时忽略 */ }
+          catch (e) { /* 侧边栏未打开时忽略 */ console.debug('[TRANSLATE_PAGE] 进度回传失败:', e.message); }
         };
         return await handleTranslateBatch(modelId, targetLang, texts, { onProgress });
       },
@@ -176,7 +178,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   // ── 实时字幕：停止捕获并释放 ──
   if (msg.type === 'LIVE_CAPTION_STOP_CAPTURE') {
-    stopCapture(); // 不 await：closeDocument 为 fire-and-forget，端口断开处理在内部
+    try {
+      stopCapture(); // 不 await：closeDocument 为 fire-and-forget，端口断开处理在内部
+    } catch (e) {
+      console.warn('[LIVE_CAPTION_STOP_CAPTURE] 停止捕获失败:', e.message);
+    }
     sendResponse({ ok: true });
     return true;
   }
@@ -294,12 +300,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 // ── 初始化 ──
 
 // 点击工具栏图标：直接在浏览器原生侧边栏中打开聊天应用（最可靠，无需内容脚本）
-chrome.sidePanel?.setPanelBehavior?.({ openPanelOnActionClick: true }).catch(() => {});
+chrome.sidePanel?.setPanelBehavior?.({ openPanelOnActionClick: true }).catch((e) => {
+  console.warn('[SW] 设置侧边栏行为失败（部分浏览器不支持）:', e.message);
+});
 
 // 兜底：部分浏览器若未启用"点击图标开侧面板"，则手动打开当前标签页的侧边栏
 chrome.action?.onClicked?.addListener(async (tab) => {
   if (!tab || !tab.id) return;
-  try { await chrome.sidePanel.open({ tabId: tab.id }); } catch (_) {}
+  try { await chrome.sidePanel.open({ tabId: tab.id }); } catch (e) { console.warn('[SW] 打开侧边栏失败:', e.message); }
 });
 
 // 扩展启动 / 更新 / 安装时，主动给所有已打开的"普通网页"标签页注入 content script。
@@ -318,15 +326,15 @@ async function injectContentScriptsToOpenTabs() {
           target: { tabId: tab.id },
           files: ['content/extract.js', 'content/sidebar-inject.js', 'content/subtitle.js'],
         });
-      } catch (_) { /* 该页面不可注入，忽略 */ }
+      } catch (e) { /* 该页面不可注入，忽略 */ console.debug('[injectContentScripts] 注入失败:', e.message); }
     }
-  } catch (_) { /* 查询失败忽略 */ }
+  } catch (e) { /* 查询失败忽略 */ console.debug('[injectContentScripts] 查询标签页失败:', e.message); }
 }
 
 // 安装 / 更新时注入：合并翻译脚本注入和自动化脚本注入
 chrome.runtime.onInstalled?.addListener(async () => {
   // 清理上一版本可能残留的 offscreen 捕获文档（否则会令标签页持续静音）
-  try { await closeLingeringOffscreen(); } catch (_) {}
+  try { await closeLingeringOffscreen(); } catch (e) { console.warn('[onInstalled] 清理 offscreen 失败:', e.message); }
   try {
     const tabs = await chrome.tabs.query({});
     for (const tab of tabs || []) {
@@ -337,12 +345,12 @@ chrome.runtime.onInstalled?.addListener(async () => {
           target: { tabId: tab.id },
           files: ['content/translate.js', 'content/extract.js', 'content/sidebar-inject.js', 'content/subtitle.js'],
         });
-      } catch (_) { /* 部分页面可能拒绝注入，忽略 */ }
+      } catch (e) { /* 部分页面可能拒绝注入，忽略 */ console.debug('[onInstalled] 注入失败:', e.message); }
     }
-  } catch (_) {}
+  } catch (e) { console.warn('[onInstalled] 查询标签页失败:', e.message); }
 });
 chrome.runtime.onStartup?.addListener(async () => {
-  try { await closeLingeringOffscreen(); } catch (_) {}
+  try { await closeLingeringOffscreen(); } catch (e) { console.warn('[onStartup] 清理 offscreen 失败:', e.message); }
   loadKbListCache();
   injectContentScriptsToOpenTabs();
 });

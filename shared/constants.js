@@ -60,8 +60,8 @@ export const WHISPER_RETRY_BACKOFF_MS = 700;
 // ── 网页自动化 ─────────────────────────────────────────────────────────────
 /** 跨域导航确认等待超时（ms） */
 export const NAV_CONFIRM_TIMEOUT_MS = 45000;
-/** Content script 响应超时（ms） */
-export const CONTENT_SCRIPT_TIMEOUT_MS = 8000;
+/** Content script 响应超时（ms），需大于 wait_for 工具默认超时（10000ms） */
+export const CONTENT_SCRIPT_TIMEOUT_MS = 15000;
 /** 整页截图最大屏数 */
 export const FULL_PAGE_MAX_TILES = 120;
 /** 画布单维度上限（px） */
@@ -95,3 +95,5 @@ export const TIMEOUT_WORKFLOW_MS = 240000;  // 4min
 export const AGENT_PAGE_TEXT_LIMIT = 8000;
 /** 联网搜索默认返回条数 */
 export const WEB_SEARCH_DEFAULT_MAX = 6;
+/** 思考模式最小超时（ms）：部分模型思考发生在响应头之前，需要更长超时避免误判 */
+export const THINKING_MIN_TIMEOUT_MS = 300000;

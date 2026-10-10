@@ -14,32 +14,41 @@ const ANTHROPIC_THINKING_BUDGET = { low: 2000, medium: 8000, high: 16000 };
 /**
  * 思考预算上限。Anthropic 要求 max_tokens > budget_tokens，而 max_tokens 不得超过
  * 模型输出上限：接受 thinking 参数的模型（3.7+/4 系）上限均 ≥8192，因此预算压到
- * 8192-1024=7168 可保证任何档位下 max_tokens=8192 都合法，不会再触发 400。
+ * 8192-1024=7168 可保证「模型卡留空」时发出去的 max_tokens=8192 仍然合法，不会触发 400。
+ * 卡片填了更大值就按更大值发（见 effMaxTokens）。
  * 3.5 系本身不支持 thinking 参数，400 会如实透出（属用户配置问题）。
  */
 const ANTHROPIC_MAX_THINKING_BUDGET = 7168;
 
-/** 把 thinkingStrength 转成 Anthropic thinking 参数；'off'/无则返回 null */
+/** 把 thinkingStrength 转成 Anthropic thinking 参数；'default'（厂商默认）/'off'/无则返回 null */
 function mapAnthropicThinking(strength) {
-  if (!strength || strength === 'off') return null;
+  if (!strength || strength === 'off' || strength === 'default') return null;
   const budget = ANTHROPIC_THINKING_BUDGET[strength];
   if (!budget) return null;
   return { type: 'enabled', budget_tokens: Math.min(budget, ANTHROPIC_MAX_THINKING_BUDGET) };
 }
 
 /**
- * max_tokens = max(用户设定, budget+1024)。启用 thinking 时整体压到 8192 内
- * （理由同上）；未启用时用户显式设置的 maxTokens 原样透传，不做截断。
+ * max_tokens = max(用户设定, budget+1024)。只保证合法性下限——Anthropic 要求
+ * max_tokens 大于 budget_tokens；上限一律以模型卡「最大输出 tokens」为准，不再替用户封顶。
+ * 留空时按 1024 起算（该厂商 max_tokens 是必填项）。
+ * 填得比该模型的真实输出上限还大，会由厂商自己报错，归因清楚，好过这里静默改数。
  */
 function effMaxTokens(maxTokens, thinking) {
   const budget = thinking?.budget_tokens || 0;
-  const want = Math.max(maxTokens ?? 1024, budget + 1024);
-  return budget ? Math.min(want, budget + 1024) : want;
+  return Math.max(maxTokens ?? 1024, budget + 1024);
 }
 
 export class AnthropicAdapter extends ModelClient {
   get endpoint() {
     return normalizeApiBase(this.config.apiBase) + '/messages';
+  }
+
+  /** 思考档位会把 max_tokens 顶到 budget+1024，判读额度时要用这个值而不是模型卡 */
+  outputCap(req) {
+    const { maxTokens, thinkingStrength } = (req && req.options) || {};
+    const t = effMaxTokens(maxTokens, mapAnthropicThinking(thinkingStrength));
+    return Number.isFinite(t) && t > 0 ? t : null;
   }
 
   _toVendor(req) {
@@ -93,6 +102,7 @@ export class AnthropicAdapter extends ModelClient {
       signal,
     }, this.config.timeoutMs);
 
+    let finishReason = '';
     for await (const line of streamLines(res.body)) {
       const data = sseData(line);
       if (data == null) continue;
@@ -102,14 +112,22 @@ export class AnthropicAdapter extends ModelClient {
       if (json.type === 'error') {
         throw new HttpError('server', `Anthropic 流式错误: ${json.error?.message || json.error?.type || 'unknown'}`);
       }
-      if (json.type === 'content_block_delta' && json.delta?.text) {
-        yield { delta: json.delta.text, done: false, meta: { raw: json } };
+      if (json.type === 'message_delta' && json.delta?.stop_reason) finishReason = json.delta.stop_reason;
+      if (json.type === 'content_block_delta') {
+        const d = json.delta || {};
+        // 思考块增量（thinking_delta）与正文增量（text）分两路产出；
+        // signature_delta 是思考块签名，仅供厂商校验，对用户无意义，忽略
+        if (d.type === 'thinking_delta' && d.thinking) {
+          yield { delta: '', thinking: d.thinking, done: false };
+        } else if (d.text) {
+          yield { delta: d.text, done: false, meta: { raw: json } };
+        }
       } else if (json.type === 'message_stop') {
-        yield { delta: '', done: true };
+        yield { delta: '', done: true, ...(finishReason ? { finishReason } : {}) };
         return;
       }
     }
-    yield { delta: '', done: true };
+    yield { delta: '', done: true, ...(finishReason ? { finishReason } : {}) };
   }
 
   async *_nonStream(req, signal) {
@@ -131,8 +149,13 @@ export class AnthropicAdapter extends ModelClient {
       this.config.timeoutMs,
       signal
     );
-    const text = (json.content || []).map(c => c.text || '').join('');
-    yield { delta: text, done: true, meta: { raw: json } };
+    let text = '', think = '';
+    for (const c of json.content || []) {
+      if (c.type === 'thinking' && c.thinking) think += c.thinking;
+      else text += c.text || '';
+    }
+    if (think) yield { delta: '', thinking: think, done: false };
+    yield { delta: text, done: true, ...(json.stop_reason ? { finishReason: json.stop_reason } : {}), meta: { raw: json } };
   }
 
   async *chat(req) {

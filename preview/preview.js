@@ -6,18 +6,21 @@ import { chatStream, chatOnce } from '../features/chat.js';
 import { summarizeStream, buildKbSourcesFooter, kbChunkSource } from '../features/summarize.js';
 import { buildToolSystemPrompt, parseToolCalls, stripToolCall } from '../features/automation.js';
 import { listModels } from '../core/list-models.js';
-import { thinkingLevels } from '../shared/utils.js';
+import { thinkingLevels, isTruncatedFinish } from '../shared/utils.js';
+import { THINKING_STYLES, splitInlineThink, maxTokensHint } from '../shared/thinking.js';
+import { migrateModels } from '../core/model-config.js';
 import { postJson, fetchWithTimeout } from '../core/http.js';
 import { normalizeKbState, defaultKbState } from '../shared/storage.js';
 import { safeImageSrc, safeMediaSrc } from '../shared/sanitize.js';
 import { describeError, formatErrorLine } from '../shared/errors.js';
 import { extractCodeBlocks, highlightCode } from '../shared/code-highlight.js';
-import { conversationToMarkdown, safeFilename } from '../shared/conv-export.js';
+import { conversationToMarkdown, safeFilename, trimSubsForPersist } from '../shared/conv-export.js';
 import {
   applyTemplate, listTemplateVars, cloneTemplate, validateTemplate,
   BUILTIN_TEMPLATES, TEMPLATE_VARS,
 } from '../shared/prompt-templates.js';
 import { KB_PROVIDERS, createKbConnector } from '../connectors/kb-registry.js';
+import { NAV_CONFIRM_TIMEOUT_MS } from '../shared/constants.js';
 
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => document.querySelectorAll(s);
@@ -43,6 +46,7 @@ function ensureBgPort() {
       // "Unchecked runtime.lastError: The page keeping the extension port
       // is moved into back/forward cache, so the message channel is closed."
       const _err = chrome.runtime.lastError;
+      console.debug('[ensureBgPort] 端口断开:', _err?.message);
       _bgPort = null;
       if (_bgHeartbeat) { clearInterval(_bgHeartbeat); _bgHeartbeat = null; }
       // SW 重启 / 页面从 bfcache 恢复后自动重连，维持保活
@@ -52,9 +56,10 @@ function ensureBgPort() {
     // 防止 MV3 service worker 在长时间异步自动化操作（executeScript 最长 ~30s）期间被闲置回收，
     // 从而避免 AUTOMATE 响应端口在收到响应前被关闭。
     _bgHeartbeat = setInterval(() => {
-      try { _bgPort && _bgPort.postMessage({ type: 'PING' }); } catch (_) {}
+      try { _bgPort && _bgPort.postMessage({ type: 'PING' }); } catch (e) { console.debug('[ensureBgPort] 心跳失败:', e.message); }
     }, 20000);
-  } catch (_) {
+  } catch (e) {
+    console.debug('[ensureBgPort] 建立端口失败:', e.message);
     _bgPort = null;
   }
   return _bgPort;
@@ -155,8 +160,8 @@ function confirmCrossOriginNav({ fromHost, toHost, url } = {}) {
     overlay.append(card);
     overlay.addEventListener('click', (e) => { if (e.target === overlay) finish(false); });
 
-    // 与后台 NAV_CONFIRM_TIMEOUT_MS(45s) 对齐，超时先本地关门，后台随后也会按拒绝兜底
-    const timer = setTimeout(() => finish(false), 44000);
+    // 与后台 NAV_CONFIRM_TIMEOUT_MS 对齐，超时先本地关门，后台随后也会按拒绝兜底
+    const timer = setTimeout(() => finish(false), NAV_CONFIRM_TIMEOUT_MS - 1000);
     document.addEventListener('keydown', onKey, true);
     (document.body || document.documentElement).appendChild(overlay);
     allow.focus();
@@ -167,7 +172,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg && msg.type === 'WEB_TRANSLATE_PROGRESS') { updateTranslateProgress(msg.payload); return; }
   if (msg && msg.type === 'AUTOMATE_CONFIRM_NAV') {
     confirmCrossOriginNav(msg).then((approved) => {
-      try { sendResponse({ approved }); } catch (_) { /* 端口已关闭，后台按拒绝兜底 */ }
+      try { sendResponse({ approved }); } catch (e) { /* 端口已关闭，后台按拒绝兜底 */ console.debug('[AUTOMATE_CONFIRM_NAV] 回传失败:', e.message); }
     });
     return true; // 异步 sendResponse
   }
@@ -181,7 +186,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 // 也避免页面 JS 被冻结期间定时器（心跳）与在途请求被挂起。
 window.addEventListener('pagehide', (e) => {
   if (e.persisted) { // 页面被缓存（而非真正卸载）
-    if (_bgPort) { try { _bgPort.disconnect(); } catch (_) {} _bgPort = null; }
+    if (_bgPort) { try { _bgPort.disconnect(); } catch (e) { console.debug('[pagehide] 断开端口失败:', e.message); } _bgPort = null; }
     if (_bgHeartbeat) { clearInterval(_bgHeartbeat); _bgHeartbeat = null; }
   }
 });
@@ -190,7 +195,7 @@ window.addEventListener('pageshow', (e) => {
 });
 // Page Lifecycle API：部分场景下比 pagehide/pageshow 更早、更可靠
 document.addEventListener('freeze', () => {
-  if (_bgPort) { try { _bgPort.disconnect(); } catch (_) {} _bgPort = null; }
+  if (_bgPort) { try { _bgPort.disconnect(); } catch (e) { console.debug('[freeze] 断开端口失败:', e.message); } _bgPort = null; }
   if (_bgHeartbeat) { clearInterval(_bgHeartbeat); _bgHeartbeat = null; }
 });
 document.addEventListener('resume', () => { _bgPort = null; ensureBgPort(); });
@@ -202,7 +207,7 @@ function defaultModel() {
     apiBase: 'https://openrouter.ai/api/v1', apiKey: '',
     model: 'openai/gpt-4o-mini',
     supportsVision: false, supportsStream: true, timeoutMs: 120000, enabled: true,
-    isPrimary: false, supportsThinking: false, thinkingStrength: 'off', reasoningEffortSupported: false,
+    isPrimary: false, supportsThinking: false, thinkingStrength: 'off', thinkingStyle: 'auto',
   };
 }
 
@@ -229,10 +234,10 @@ async function loadModelsFromStorage() {
   if (hasChromeStorage()) {
     try {
       const r = await chrome.storage.local.get('models');
-      if (Array.isArray(r.models) && r.models.length) return r.models;
+      if (Array.isArray(r.models) && r.models.length) return migrateModels(r.models);
     } catch (_) { /* 退回 localStorage */ }
   }
-  return LS.get('preview.models', [defaultModel()]);
+  return migrateModels(LS.get('preview.models', [defaultModel()]));
 }
 async function loadKbState() {
   if (hasChromeStorage()) {
@@ -278,6 +283,8 @@ async function persistImgUploadToStorage(cfg) {
 const MAX_CONVERSATIONS = 50;
 /** 单个附件随会话持久化的 base64 体积上限：超过则只存元信息，避免一条大图吃光配额 */
 const MAX_PERSIST_ATTACHMENT_B64 = 300000;
+/** 单条消息持久化的思考文本上限：长思考动辄上万字，超长截断避免会话撑爆 storage 配额 */
+const MAX_PERSIST_THINK_CHARS = 20000;
 async function loadConversationsFromStorage() {
   if (hasChromeStorage()) {
     try {
@@ -539,6 +546,7 @@ async function syncConfigFromStorage() {
     persistModelsToStorage(models);
     renderModels();
     renderModelSelect();
+    syncThinkingFromRef();   // 权威源模型更新后，聊天页思考强度跟随新配置
   }
   const wm = await loadWhisperFromStorage();
   if (wm && wm !== whisperModels) {
@@ -586,8 +594,28 @@ let chatModelId = models[0]?.id || null;  // 当前聊天所选模型（'__colla
 let thinkingStrength = 'off';             // 聊天界面“思考强度”下拉的当前选择
 let streaming = false;
 let activeAbort = null;     // 当前流式操作的中止控制器；非 null 时发送按钮切换为"停止"
+// 会话上下文代号：messages / currentConvId / chatScroll 被整体换掉时递增。
+// 在途的生成任务启动时捕获一份上下文（代号 + 它所属的 messages 数组与会话 id）；
+// 代号一变就说明用户切走了会话，此时界面写入全部跳过，但历史仍写回原会话自己的 messages 数组
+// ——换会话不会重新赋值旧数组，所以旧数组带着已推送的消息活得好好的。
+let chatEpoch = 0;
 let activeMode = null;      // 当前激活的功能模式（null | {type:'summarize'|'translate'|'explain'|'ocr'|'file', label?:string}）
 let translateTarget = '';    // 翻译模式下的目标语言（空 = 未选择，翻译不可用）
+
+function isStaleChat(epoch) { return epoch !== chatEpoch; }
+
+/** 捕获本轮生成所属的会话上下文，供收尾时判断是否已被切走、以及把历史写回哪个会话 */
+function captureChatContext() { return { epoch: chatEpoch, convId: currentConvId, messages }; }
+
+/** 离开当前会话上下文（新建 / 切换 / 删除当前会话）：中止在途生成、清状态条、令代号失效 */
+function leaveChatContext() {
+  chatEpoch++;
+  if (activeAbort) { activeAbort.abort(); activeAbort = null; }
+  streaming = false;
+  setStatus('');
+  closeSubPop();   // 子模型详情气泡浮在面板上，不随 chatScroll 一起被清掉，得显式收
+  updateSendState();
+}
 
 // 翻译目标语言列表（主流语言，下拉默认“选择语言”）
 const TARGET_LANGS = [
@@ -651,21 +679,28 @@ function formatConvTime(ts) {
   return `${d.getMonth() + 1}/${d.getDate()}`;
 }
 
-// 把当前 messages 持久化为一个会话：首次发送自动创建，之后每次发送自动更新
-function persistActiveConversation() {
-  if (!messages.length) return;
-  let conv = conversations.find(c => c.id === currentConvId);
+/**
+ * 把一份消息数组落盘为会话。convId 为空（或已不存在且 allowCreate）时新建会话。
+ * 只读参数、不读全局 messages / currentConvId，因此可供「用户已切走会话」的在途轮次回写原会话。
+ * @param {Array<{role:string, content:string}>} msgs 本轮所属会话的完整消息（含历史）
+ * @param {string|null} convId 归属会话 id
+ * @param {boolean} allowCreate convId 缺失/失效时是否新建会话
+ * @returns {string|null} 实际归属的会话 id（未写入时原样返回 convId）
+ */
+function persistMessagesAsConversation(msgs, convId, allowCreate = true) {
+  if (!msgs.length) return convId;
+  let conv = conversations.find(c => c.id === convId);
   if (!conv) {
+    if (!allowCreate) return null;   // 原会话已被删除：不复活用户刚删掉的内容
     conv = {
       id: 'c' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7),
       title: '',
       messages: [],
       createdAt: Date.now(),
     };
-    currentConvId = conv.id;
     conversations.unshift(conv);
   }
-  conv.messages = messages.map(m => {
+  conv.messages = msgs.map(m => {
     const o = {
       role: m.role,
       content: m.content,
@@ -687,6 +722,8 @@ function persistActiveConversation() {
       } : {}),
       // 多模态生成结果的结构化信息（历史回放时仍以媒体元素展示，而非纯 URL 文本）
       ...(m.media ? { media: { type: m.media.type, url: m.media.url, name: m.media.name || null } } : {}),
+      // 思考过程随会话持久化（历史回放渲染为默认收起的折叠区）；超长截断防撑爆配额
+      ...(m.think ? { think: String(m.think).slice(0, MAX_PERSIST_THINK_CHARS) } : {}),
     };
     // 保留工具调用结构化信息（历史回放时仍以 AI 消息归属渲染为工具卡片）
     if (m.tool) {
@@ -699,21 +736,44 @@ function persistActiveConversation() {
         // 注意：不持久化 shot（截图 base64），以免撑爆 chrome.storage
       };
     }
+    // 协作模式的子模型明细：写入前按条数与长度封顶（会话是整份写 storage.local 的）
+    if (m.subs) {
+      const subBlock = trimSubsForPersist(m.subs);
+      if (subBlock) o.subs = subBlock;
+    }
     return o;
   });
   conv.updatedAt = Date.now();
   if (!conv.title) {
-    const firstUser = messages.find(m => m.role === 'user');
+    const firstUser = msgs.find(m => m.role === 'user');
     conv.title = deriveTitle(firstUser ? firstUser.content : '新会话');
   }
   // 超出上限裁掉最旧会话（数组头部是最新）
   if (conversations.length > MAX_CONVERSATIONS) conversations.length = MAX_CONVERSATIONS;
   persistConversationsToStorage();
   if ($('#view-conversations').classList.contains('is-active')) renderConversationList();
+  return conv.id;
+}
+
+// 把当前会话持久化：首次发送自动创建，之后每次发送自动更新（并把新会话 id 认领为当前会话）
+function persistActiveConversation() {
+  if (!messages.length) return;
+  currentConvId = persistMessagesAsConversation(messages, currentConvId);
+}
+
+/**
+ * 在途轮次收尾时用户已经切走会话：把这一轮（中止时即已生成的部分）写回它自己的会话。
+ * 原会话已被删除则整轮放弃，不复活用户刚删掉的内容。
+ */
+function persistStaleTurn(ctx) {
+  // convId 为空 = 这一轮来自尚未落盘的新会话，应当为它建一条；
+  // convId 非空却找不到 = 原会话已被删除，放弃写入。
+  persistMessagesAsConversation(ctx.messages, ctx.convId, ctx.convId == null);
 }
 
 // 新建会话：清空当前聊天，回到空白欢迎态
 function startNewChat() {
+  leaveChatContext();
   messages = [];
   currentConvId = null;
   attachments = [];
@@ -738,6 +798,7 @@ function stripKbPrefix(text) {
 function loadConversation(id) {
   const conv = conversations.find(c => c.id === id);
   if (!conv) return;
+  leaveChatContext();
   currentConvId = id;
   messages = (conv.messages || []).map(m => ({
     role: m.role,
@@ -746,6 +807,9 @@ function loadConversation(id) {
     ...(m.media ? { media: { type: m.media.type, url: m.media.url, name: m.media.name || null } } : {}),
     // 恢复工具调用结构化信息，确保历史会话重新打开后仍以工具卡片渲染
     ...(m.tool ? { tool: { name: m.tool.name, args: m.tool.args, ok: m.tool.ok, summary: m.tool.summary || null, error: m.tool.error || null } } : {}),
+    ...(m.think ? { think: m.think } : {}),
+    // 协作子模型明细：已按持久化预算截断过的内容原样带回来，继续对话时一并再写回
+    ...(m.subs ? { subs: { total: m.subs.total, items: (m.subs.items || []).map(s => ({ ...s })) } } : {}),
   }));
   chatScroll.innerHTML = '';
   if (!messages.length) {
@@ -776,8 +840,20 @@ function loadConversation(id) {
             wireMultimodalMedia(bubble);
           } else {
             // 历史恢复同样走富文本渲染（代码块高亮 + 复制/折叠）
-            bubble.innerHTML = renderRichText(m.content || '');
-            wireCodeBlocks(bubble);
+            // 随会话保存的思考过程：以默认收起的折叠区展示在正文上方，可点击展开
+            if (m.think) {
+              const tb = buildThinkBox(() => {});
+              tb.body.textContent = m.think;
+              tb.box.classList.add('folded');
+              bubble.appendChild(tb.box);
+            }
+            // 协作子模型芯片：插在思考区与正文之间，与实时渲染的层级顺序一致
+            mountStoredSubRow(bubble, m.subs);
+            const rich = document.createElement('div');
+            rich.className = 'bubble-text';
+            rich.innerHTML = renderRichText(m.content || '');
+            bubble.appendChild(rich);
+            wireCodeBlocks(rich);
           }
         }
         chatScroll.appendChild(el);
@@ -797,8 +873,9 @@ function deleteConversation(id) {
   conversations.splice(idx, 1);
   persistConversationsToStorage();
   if (wasActive) {
-    // 被删除的是当前会话：清空主页面（聊天视图）DOM 并回到欢迎态，
+    // 被删除的是当前会话：中止在途生成 + 清空主页面（聊天视图）DOM 并回到欢迎态，
     // 避免用户删除后返回主页面仍残留已删除会话的内容。
+    leaveChatContext();
     currentConvId = null;
     messages = [];
     chatScroll.innerHTML = '';
@@ -964,7 +1041,17 @@ function setStatusError(e, prefix = '') {
     chatStatus.appendChild(det);
   }
 }
-function scrollBottom() { chatScroll.scrollTop = chatScroll.scrollHeight; }
+let scrollRafId = 0;
+function scrollBottom() {
+  // rAF 合并：流式期间每个 chunk 都触发一次「读 scrollHeight（强制重排）+ 写 scrollTop」，
+  // 与气泡渲染的 DOM 写入交错会形成逐帧多次重排。合并到动画帧后每帧最多滚动一次，
+  // 且 rAF 回调按注册顺序执行——渲染在前、滚动在后，滚动位置总是基于已渲染的最新内容。
+  if (scrollRafId) return;
+  scrollRafId = requestAnimationFrame(() => {
+    scrollRafId = 0;
+    chatScroll.scrollTop = chatScroll.scrollHeight;
+  });
+}
 
 function autosize() {
   input.style.height = 'auto';
@@ -1107,25 +1194,420 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && !$('#imgLightbox').hidden) closeImagePreview();
 });
 
+/**
+ * 增量更新一个纯文本容器：新文本是已渲染文本的直接延伸时只追加增量
+ *（流式逐字场景——每帧全量重写大文本会导致 O(n²) 的 DOM 开销，长思考必卡），
+ * 否则整体替换（agent 每轮清屏、错误消息、富文本切换回纯文本等非延伸场景）。
+ * @param {HTMLElement} host 文本节点的宿主元素（内容完全由本函数管理）
+ */
+function makeIncrementalText(host) {
+  let node = null;
+  let prev = '';
+  return {
+    /** 把宿主内容更新为给定全文 */
+    sync(text) {
+      // 宿主被外部直写过（如 setRich 的 innerHTML）或尚未建节点：全量重建
+      if (!node || node.parentNode !== host || host.firstChild !== node || host.childNodes.length > 1) {
+        host.textContent = '';
+        node = document.createTextNode(text);
+        host.appendChild(node);
+        prev = text;
+        return;
+      }
+      if (text === prev) return;
+      if (text.length > prev.length && text.startsWith(prev)) {
+        node.appendData(text.slice(prev.length));
+      } else {
+        node.data = text;
+      }
+      prev = text;
+    },
+    /** 解绑节点（宿主内容不动——rich 渲染刚直写过；下次 sync 走全量重建） */
+    reset() {
+      node = null;
+      prev = '';
+    },
+  };
+}
+
+/** 组装持久化用的 assistant 消息：正文 +（如有）本轮流式展示过的思考文本 */
+function assistantMsg(content, think) {
+  return think ? { role: 'assistant', content, think } : { role: 'assistant', content };
+}
+
+/**
+ * 同上，再带上协作模式的子模型明细（实时态存全文，落盘时才截断）。
+ * @param {string} content 正文
+ * @param {string} [think] 主模型思考
+ * @param {{snapshot:() => ({total:number, items:Array<object>}|null)}|null} [subs] 子模型状态采集器
+ */
+function assistantMsgWithSubs(content, think, subs) {
+  const m = assistantMsg(content, think);
+  const snap = subs && subs.snapshot ? subs.snapshot() : null;
+  if (snap) m.subs = snap;
+  return m;
+}
+
+/**
+ * 中止（用户点停止 / 切走会话）时这一轮写进历史的正文。
+ * 思考型模型在吐出第一个正文帧之前有好几秒 acc 恒为空，只认 acc 就会把整轮——
+ * 连同用户刚问的那句话——静默丢掉，历史里连「问过」的痕迹都不剩。
+ * @param {string} acc 已生成的正文
+ * @param {string} think 已生成的思考全文
+ * @returns {string} 空串 = 这一轮确实什么都没有，不入历史
+ */
+function partialTurnText(acc, think) {
+  return acc || (think ? '（已停止：只产出了思考，没有正文）' : '');
+}
+
+/** 输出被 token 上限截断时的提示语（正常结束返回空串）。追加进 acc：展示与下一轮上下文都让模型知道答案不完整 */
+function truncateNote(reason) {
+  return isTruncatedFinish(reason) ? '\n\n（⚠️ 输出因 max_tokens 上限被截断，可能不完整。可在模型卡调大「最大输出 tokens」）' : '';
+}
+
+/** 构建思考过程折叠区（点击头部切换展开/收起；展开时自动定位到最新内容） */
+function buildThinkBox(onUserScroll) {
+  const box = document.createElement('div');
+  box.className = 'think-box';
+  box.innerHTML = `<button type="button" class="think-toggle">💭 思考过程<span class="think-arrow">▾</span></button>`
+    + `<div class="think-body"></div>`;
+  const body = box.querySelector('.think-body');
+  // 用户在思考区内向上翻阅历史思考时暂停“贴底跟随”，滚回底部（距底 <24px）自动恢复
+  body.addEventListener('scroll', () => {
+    const atBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 24;
+    onUserScroll(atBottom);
+  });
+  box.querySelector('.think-toggle').onclick = () => {
+    box.classList.toggle('folded');
+    if (!box.classList.contains('folded')) body.scrollTop = body.scrollHeight;
+  };
+  return { box, body };
+}
+
+// ============================================================
+// 协作模式：子模型运行状态（一行芯片 + 点击弹出各自的思考与返回）
+// 子模型并发运行（上限见 COLLAB_MAX_CONCURRENCY），进行中的芯片显示已累计字数，
+// 展开着的气泡会随进度原地刷新。明细会随 assistant 消息写入会话历史，写入前由
+// shared/conv-export.js 的 trimSubsForPersist 按条数与长度封顶——会话是整份写
+// storage.local 的，而 N 个子模型的思考全文动辄上万字，不封顶一次协作就能撑爆一条会话。
+// ============================================================
+
+const SUB_PHASE_TEXT = { start: '思考中', done: '完成', empty: '无正文', error: '失败' };
+
+function fmtSubMs(ms) {
+  if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0) return '';
+  return ms < 1000 ? ms + 'ms' : (ms / 1000).toFixed(1) + 's';
+}
+
+let subPopEl = null;
+let subPopIdx = -1;
+let subPopOffs = [];
+let subPopRow = null;     // 气泡锚点所属的芯片行：只有它自己的那一轮能刷新它
+let subPopRefs = null;   // { head, thinkBody, textBody, idx, total, place }
+
+/** 收起子模型详情气泡并摘掉它的全局监听 */
+function closeSubPop() {
+  if (subPopEl) { subPopEl.remove(); subPopEl = null; }
+  subPopIdx = -1;
+  subPopRow = null;
+  subPopRefs = null;
+  subPopOffs.forEach((off) => off());
+  subPopOffs = [];
+}
+
+/** 气泡里一次最多渲染这么多字：子模型思考能远超它，整块重排长文本会拖垮面板 */
+const SUB_VIEW_MAX_CHARS = 20000;
+
+/** 超长内容只给尾部，并明确说明是「仅显示末尾」 */
+function subViewText(str, fallback) {
+  const s = String(str || '');
+  if (!s) return fallback || '';
+  if (s.length <= SUB_VIEW_MAX_CHARS) return s;
+  return '…（内容过长，仅显示末尾 ' + SUB_VIEW_MAX_CHARS + ' 字）\n' + s.slice(-SUB_VIEW_MAX_CHARS);
+}
+
+function subPopTitle(s, idx, total) {
+  return '子模型 ' + (idx + 1) + '/' + total + ' · ' + (s.name || '') + ' · ' + (SUB_PHASE_TEXT[s.phase] || s.phase)
+    + (typeof s.ms === 'number' ? ' · ' + fmtSubMs(s.ms) : '');
+}
+
+/** 气泡一节（正文节点留引用，供实时进度原地刷新，不重建 DOM） */
+function subSection(title) {
+  const wrap = document.createElement('div');
+  wrap.className = 'sub-sec';
+  const h = document.createElement('div');
+  h.className = 'sub-sec-title';
+  h.textContent = title;
+  const body = document.createElement('div');
+  body.className = 'sub-sec-body';
+  wrap.append(h, body);
+  return { wrap, body };
+}
+
+/** 按当前状态刷新已展开的气泡（打开时与实时进度都走这里） */
+function paintSubPop(s) {
+  if (!subPopRefs || !s) return;
+  // 模型输出按不可信处理：只走 textContent，绝不拼 innerHTML
+  subPopRefs.thinkBody.textContent = subViewText(s.thinking,
+    s.phase === 'start' ? '（进行中，思考还没返回）' : '（无思考内容：该模型没输出思考，或其思考风格不发送开关参数）');
+  subPopRefs.textBody.textContent = s.error ? '（调用失败）' + s.error
+    : subViewText(s.text, s.phase === 'empty' ? '（没有正文输出）' + (s.reason || '') : '（暂无）');
+  subPopRefs.head.textContent = subPopTitle(s, subPopRefs.idx, subPopRefs.total);
+  subPopRefs.place();
+}
+
+/** 弹出某个子模型的详情气泡（思考过程 + 返回内容），贴在芯片上方，放不下则翻到下方 */
+function openSubPop(anchor, s, idx, total) {
+  closeSubPop();
+  if (!s) return;
+  const pop = document.createElement('div');
+  pop.className = 'sub-pop';
+  const head = document.createElement('div');
+  head.className = 'sub-pop-head';
+  const thinkSec = subSection('💭 思考过程');
+  const textSec = subSection('📄 返回内容');
+  pop.append(head, thinkSec.wrap, textSec.wrap);
+  document.body.appendChild(pop);
+  subPopEl = pop;
+  subPopIdx = idx;
+  subPopRow = anchor.parentNode;
+
+  const place = () => {
+    const r = anchor.getBoundingClientRect();
+    if (r.bottom < 0 || r.top > window.innerHeight) { closeSubPop(); return; }  // 芯片滚出可视区就收起
+    const pw = pop.offsetWidth;
+    const ph = pop.offsetHeight;
+    pop.style.left = Math.max(8, Math.min(r.left, window.innerWidth - pw - 8)) + 'px';
+    // 优先上方；放不下翻到下方，再夹进视口（与 .tip-pop 同一套做法）
+    pop.style.top = Math.max(8, Math.min(r.top - ph - 8, window.innerHeight - ph - 8)) + 'px';
+  };
+  subPopRefs = { head, thinkBody: thinkSec.body, textBody: textSec.body, idx, total, place };
+  paintSubPop(s);
+  place();
+  const onDown = (e) => { if (!pop.contains(e.target) && e.target !== anchor) closeSubPop(); };
+  const onMove = () => place();
+  const onKey = (e) => { if (e.key === 'Escape') closeSubPop(); };
+  document.addEventListener('pointerdown', onDown, true);
+  document.addEventListener('scroll', onMove, true);
+  window.addEventListener('resize', onMove);
+  document.addEventListener('keydown', onKey);
+  subPopOffs = [
+    () => document.removeEventListener('pointerdown', onDown, true),
+    () => document.removeEventListener('scroll', onMove, true),
+    () => window.removeEventListener('resize', onMove),
+    () => document.removeEventListener('keydown', onKey),
+  ];
+}
+
+/** 芯片上的实时字数（进行中时显示已累计内容，让用户看出「它在动」而不是卡住） */
+function fmtSubChars(n) {
+  if (!n) return '';
+  return n >= 1000 ? (n / 1000).toFixed(1) + 'k字' : n + '字';
+}
+
+/**
+ * 渲染/刷新芯片行。实时（onSubModel 事件）与历史回放（存储的 subs）共用这一套 DOM。
+ * 芯片节点按 index 复用、绝不整行重建：重建会让已展开的详情气泡失去锚点。
+ * @param {HTMLElement} row 芯片容器
+ * @param {Array<object>} states 按 index 的子模型状态
+ * @param {number} total 子模型总数（回放时用存储里的真实总数，可能大于已记录条数）
+ */
+function renderSubRow(row, states, total) {
+  let sum = row.querySelector('.sub-sum');
+  if (!sum) {
+    sum = document.createElement('span');
+    sum.className = 'sub-sum';
+    row.appendChild(sum);
+  }
+  const settled = states.filter((x) => x && x.phase !== 'start').length;
+  sum.textContent = '子模型 ' + settled + '/' + (total || states.length);
+  states.forEach((s, idx) => {
+    if (!s) return;
+    let chip = row.querySelector('[data-idx="' + idx + '"]');
+    if (!chip) {
+      chip = document.createElement('button');
+      chip.type = 'button';
+      chip.className = 'sub-chip';
+      chip.dataset.idx = String(idx);
+      chip.addEventListener('click', () => {
+        if (subPopIdx === idx) { closeSubPop(); return; }   // 点第二下收起
+        openSubPop(chip, states[idx], idx, total || states.length);
+      });
+      row.appendChild(chip);
+    }
+    chip.dataset.phase = s.phase;
+    chip.title = (SUB_PHASE_TEXT[s.phase] || s.phase)
+      + (s.reason ? '：' + s.reason : '') + '（点击查看思考与返回）';
+    // 进行中显示已累计字数；「无正文」显示思考字数（额度被思考吃光却没产出，这个数才是要害）；
+    // 其余终态显示耗时
+    const bits = [];
+    if (s.phase === 'start') bits.push(fmtSubChars((s.thinking || '').length + (s.text || '').length));
+    else if (s.phase === 'empty') { const n = fmtSubChars((s.thinking || '').length); if (n) bits.push('思考' + n); }
+    if (typeof s.ms === 'number') bits.push(fmtSubMs(s.ms));
+    chip.textContent = (idx + 1) + '. ' + (s.name || '') + ' · ' + (SUB_PHASE_TEXT[s.phase] || s.phase)
+      + (bits.length ? ' · ' + bits.join(' · ') : '');
+  });
+}
+
+/**
+ * 协作模式的子模型状态芯片。
+ * @param {{subRow: () => HTMLElement}} a 本轮 assistant 气泡句柄
+ * @returns {{onSubModel:(evt:object)=>void, snapshot:() => ({total:number, items:Array<object>}|null)}}
+ */
+function subStatusRenderer(a) {
+  const states = [];
+  let row = null;
+  let total = 0;
+  let lastPaint = 0;
+  /**
+   * 绘制本轮芯片与展开中的气泡。
+   * 逐字进度用「时间节流 + 同步绘制」而不是 rAF 合帧：侧边栏没显示时 rAF 一帧都不走，
+   * 累计字数与气泡内容会整段不动，看起来像卡死。
+   */
+  function paint(force) {
+    const now = Date.now();
+    if (!force && now - lastPaint < 120) return;
+    lastPaint = now;
+    if (row) renderSubRow(row, states, total);
+    // 展开着就原地刷新内容，不重建气泡。必须核对锚点行归属：subPopIdx 是全局的，
+    // 而 states 是本轮私有的——用户点开上一轮（或历史会话）的芯片时，若不判归属
+    // 就把本轮的进行中数据刷进去，「刚才那个模型答了什么」会变成正在跑的新一轮内容。
+    if (subPopIdx >= 0 && subPopRow === row) paintSubPop(states[subPopIdx]);
+  }
+  function onSubModel(evt) {
+    total = evt.total;
+    if (!row) row = a.subRow();
+    const s = states[evt.index] || (states[evt.index] = {});
+    s.name = evt.name;
+    s.phase = evt.phase === 'progress' ? (s.phase || 'start') : evt.phase;
+    if (typeof evt.ms === 'number') s.ms = evt.ms;
+    // progress 带增量；done 带终态全文，直接覆盖更可靠（避免丢帧造成的缺口）
+    if (evt.thinkingDelta) s.thinking = (s.thinking || '') + evt.thinkingDelta;
+    if (evt.textDelta) s.text = (s.text || '') + evt.textDelta;
+    if (evt.thinking != null) s.thinking = evt.thinking;
+    if (evt.text != null) s.text = evt.text;
+    if (evt.error != null) s.error = evt.error;
+    if (evt.reason != null) s.reason = evt.reason;   // phase=empty 时的成因，芯片悬停与气泡里都要能看到
+    // start/done/error 数量少，强制绘制；progress 走节流
+    paint(evt.phase !== 'progress');
+  }
+  return {
+    onSubModel,
+    /** 本轮的子模型明细（供写入 assistant 消息，最终由 trimSubsForPersist 封顶） */
+    snapshot: () => (total ? { total, items: states.filter(Boolean) } : null),
+  };
+}
+
+/** 历史回放：把存储里的子模型明细渲染成与实时同款的芯片行（内容已按预算截断） */
+function mountStoredSubRow(bubble, subs) {
+  const items = subs && Array.isArray(subs.items) ? subs.items : null;
+  if (!items || !items.length) return;
+  const row = document.createElement('div');
+  row.className = 'sub-row';
+  bubble.appendChild(row);
+  renderSubRow(row, items, subs.total || items.length);
+}
+
 function newAssistant() {
   const el = document.createElement('div');
   el.className = 'msg assistant';
   el.innerHTML = `<div class="avatar">AI</div><div class="bubble"><div class="typing"><span></span><span></span><span></span></div></div>`;
   chatScroll.appendChild(el);
   const bubble = el.querySelector('.bubble');
+  // 气泡内容双轨状态：think 为思考过程（折叠区，始终纯文本流式），
+  // text 为正文（流式纯文本 / 最终态富文本）。渲染统一走 render()，保证两类内容共存。
+  const st = { think: '', text: '', rich: false };
+  let thinkBox = null;      // { box, body }
+  let thinkSync = null;     // 思考区文本增量渲染器（随折叠区重建）
+  let thinkStick = true;    // 思考区是否贴底跟随（用户上翻即暂停）
+  let textEl = null;
+  let textSync = null;      // 正文纯文本增量渲染器
+  let subRowEl = null;      // 协作模式子模型状态行（挂在气泡内、正文节点之外）
+  let rafId = 0;
+
+  const ensureTextEl = () => {
+    if (!textEl || textEl.parentNode !== bubble) {
+      textEl = document.createElement('div');
+      textEl.className = 'bubble-text';
+      bubble.appendChild(textEl);
+      textSync = makeIncrementalText(textEl);
+    }
+    return textEl;
+  };
+
+  const render = () => {
+    rafId = 0;
+    const typing = bubble.querySelector('.typing');
+    if (typing && (st.think || st.text)) typing.remove();
+    if (st.think) {
+      if (!thinkBox || thinkBox.box.parentNode !== bubble) {
+        thinkBox = buildThinkBox((atBottom) => { thinkStick = atBottom; });
+        bubble.insertBefore(thinkBox.box, bubble.firstChild);
+        thinkSync = makeIncrementalText(thinkBox.body);
+        thinkStick = true;   // 新一轮思考默认贴底跟随
+      }
+      thinkSync.sync(st.think);
+      if (thinkStick) thinkBox.body.scrollTop = thinkBox.body.scrollHeight;
+    } else if (thinkBox) {
+      thinkBox.box.remove();
+      thinkBox = null;
+      thinkSync = null;
+    }
+    if (st.rich) {
+      const t = ensureTextEl();
+      t.innerHTML = renderRichText(st.text || '');
+      wireCodeBlocks(t);
+      textSync.reset();    // rich 直写 innerHTML，增量通道失效待重建
+    } else if (st.text) {
+      ensureTextEl();
+      textSync.sync(st.text);
+    } else if (textEl) {
+      textSync.sync('');   // 显式清空（agent 循环每轮清屏用），不删节点以省重排
+    }
+  };
+
+  // 流式帧合并到动画帧渲染：SSE 帧率可远高于屏幕帧率，逐帧同步改 DOM 会与
+  // scrollBottom 的 scrollHeight 读取形成「写后读」强制重排（长思考卡顿的根源）。
+  // 合并后每帧最多渲染一次，同帧到达的多个增量自动合成一次追加。
+  const scheduleRender = () => { if (!rafId) rafId = requestAnimationFrame(render); };
+
   return {
     el,
-    setText(t) { bubble.textContent = t; this._last = t; },
+    setText(t) { st.text = t == null ? '' : String(t); st.rich = false; this._last = st.text; scheduleRender(); },
+    /** 更新思考过程折叠区（传全量累积文本；空串隐藏折叠区）。流式期间保持展开并贴底滚动 */
+    setThinking(t) {
+      st.think = t == null ? '' : String(t);
+      scheduleRender();
+      if (thinkBox) thinkBox.box.classList.remove('folded');
+    },
     /**
      * 最终态富文本渲染：把气泡内容里的 ``` 代码块转为高亮卡片（复制/折叠）。
      * 流式期间保持 setText 纯文本以保证性能，仅在流结束/历史恢复时调用。
      */
     setRich(t) {
       const text = (t !== undefined) ? t : this._last;
-      bubble.innerHTML = renderRichText(text || '');
-      wireCodeBlocks(bubble);
+      st.text = text == null ? '' : String(text);
+      st.rich = true;
+      if (rafId) { cancelAnimationFrame(rafId); rafId = 0; }   // 丢弃挂起渲染，立即按最终状态渲染
+      render();
+      if (thinkBox) thinkBox.box.classList.add('folded');   // 完成后自动收起思考区
     },
-    stopTyping() { bubble.innerHTML = ''; },
+    stopTyping() {
+      const typing = bubble.querySelector('.typing');
+      if (typing) typing.remove();
+    },
+    /**
+     * 协作模式的子模型状态行（懒建，同一气泡内复用）。
+     * 必须挂在 .bubble 而不是 .bubble-text 里：setRich() 会整块重建正文的 innerHTML。
+     */
+    subRow() {
+      if (!subRowEl || subRowEl.parentNode !== bubble) {
+        subRowEl = document.createElement('div');
+        subRowEl.className = 'sub-row';
+        bubble.appendChild(subRowEl);
+      }
+      return subRowEl;
+    },
   };
 }
 
@@ -1186,6 +1668,7 @@ function buildContent(text, atts) {
 }
 
 async function send() {
+  const ctx = captureChatContext();   // 本轮所属会话上下文，收尾时校验（见 isStaleChat）
   const text = input.value.trim();
 
   // 网页操作模式：交给 ReAct 工具循环处理（不包指令、不清理标签，循环结束再清理）
@@ -1330,6 +1813,8 @@ async function send() {
   if (funcMode === 'ocr' && imageAttachments.length === 0) {
     setStatus('请先添加要识别的图片', 'err'); return;
   }
+  // 多模态预判与知识库检索都是 await：期间用户可能已切换会话，此时本轮不得再写聊天区
+  if (isStaleChat(ctx.epoch)) return;
   // 历史与气泡只存用户原文（content）；发给模型的上下文保留原始 user 消息 +
   // KB 系统指令（system role），让模型将 KB 引用视为强制性规则而非可选建议。
   const userMsg = { role: 'user', content, ...(imageAttachments.length ? { attachments: imageAttachments } : {}) };
@@ -1367,6 +1852,9 @@ async function send() {
   const ts = (ref && ref.supportsThinking) ? thinkingStrength : undefined;
 
   const a = newAssistant();
+  // 协作模式：子模型各跑一次，原来它们的思考与返回被静默丢弃（runSingle 只取 delta），
+  // 界面上只看到主模型一段很长的整合思考。这里挂一行芯片，点击可逐个查看，并随消息落历史。
+  const subs = mode === 'collab' ? subStatusRenderer(a) : null;
   streaming = true;
   activeAbort = new AbortController();   // 支持"停止生成"
   updateSendState();
@@ -1375,15 +1863,21 @@ async function send() {
   setStatus(funcMode === 'ocr' ? '正在识别图片中的文字…' : '思考中…');
 
   let acc = '';
+  let thinkAcc = '';   // 思考流累积（reasoning_content / thinking_delta 等思考增量帧）
+
+  let lastFinish = '';
+  let shownThink = '';   // 本轮实际展示过的思考全文（随消息持久化）
   let started = false;
   try {
     for await (const chunk of chatStream({ models, backupModels }, apiMessages, {
       mode,
       selectedId: mode === 'single' ? chatModelId : undefined,
       thinkingStrength: ts,
+      ...(subs ? { onSubModel: subs.onSubModel } : {}),
       signal: activeAbort.signal,
       onFallback: (i, cfg, reason) => setStatus(`已切换到备用模型 #${i + 1}：${cfg.name}（${reason}）`),
     })) {
+      if (isStaleChat(ctx.epoch)) break;   // 会话已切换：不再消费后续增量（中止生效后循环随即结束）
       if (chunk.error === 'NO_PRIMARY') {
         a.stopTyping();
         a.setText('请在模型配置页面选择主模型后再进行聊天');
@@ -1392,9 +1886,31 @@ async function send() {
       }
       if (!started) { started = true; a.stopTyping(); setStatus(funcMode === 'ocr' ? '正在返回识别结果…' : kbUsed ? '📚 基于知识库回复中…' : '正在回复…'); }
       else a.stopTyping();
-      acc += chunk.delta;
-      a.setText((kbPrefix && !acc.startsWith(kbPrefix) ? kbPrefix : '') + acc);
+      if (chunk.thinking) thinkAcc += chunk.thinking;
+      if (chunk.finishReason) lastFinish = chunk.finishReason;
+      acc += chunk.delta || '';
+      // 正文里的内联 <think> 标签（部分网关的思考透出方式）统一剥离进思考区渲染
+      const parts = splitInlineThink(acc);
+      // 无内联思考时直接复用 thinkAcc 引用，避免每帧重拼大字符串（O(n²) 拷贝）
+      let thinkAll = thinkAcc;
+      if (parts.think) thinkAll = thinkAll ? thinkAll + '\n\n' + parts.think : parts.think;
+      if (thinkAll) a.setThinking(thinkAll);
+      shownThink = thinkAll;
+      a.setText((kbPrefix && !parts.answer.startsWith(kbPrefix) ? kbPrefix : '') + parts.answer);
       scrollBottom();
+    }
+    // 会话已切换：acc 的整理与气泡写入照常（气泡已从 DOM 摘除，无副作用），
+    // 历史在下方写回原会话，界面留给新会话
+    // 流式结束：acc 收敛为纯净正文（footer 检测 / 历史持久化 / 最终渲染都用干净文本）。
+    // 整条回复只有未闭合思考块时保留原文，避免历史内容丢失。
+    const sp = splitInlineThink(acc);
+    if (thinkAcc || sp.think) acc = sp.answer;   // 未闭合思考（截断）时正文为空：宁可不入历史，也不把带标签的原始思考当正文保存
+
+    const tnote = truncateNote(lastFinish);
+    if (tnote) {
+      acc += tnote;
+      a.setText((kbPrefix && !acc.startsWith(kbPrefix) ? kbPrefix : '') + acc);
+      if (!isStaleChat(ctx.epoch)) scrollBottom();   // 已切会话：别把新会话的滚动位置拽到底
     }
     // 知识库：流式结束后确定性附上「数据来源」区块（不依赖模型是否自觉列出），便于核对模型是否真基于知识库作答
     if (kbUsed && kbChunks && kbChunks.length) {
@@ -1458,32 +1974,43 @@ async function send() {
       a.setText((kbPrefix && !acc.startsWith(kbPrefix) ? kbPrefix : '') + acc + displayNote);
       acc += historyNote;
     }
-    messages.push(userMsg);                 // 含图片附件，确保会话持久化保留原图数据
-    messages.push({ role: 'assistant', content: acc });
+    ctx.messages.push(userMsg);             // 含图片附件，确保会话持久化保留原图数据
+    ctx.messages.push(assistantMsgWithSubs(acc, shownThink, subs));
+    if (isStaleChat(ctx.epoch)) return;   // 历史已写回原会话，界面留给新会话
     a.setRich();   // 最终态：代码块高亮渲染
     setStatus('');
   } catch (e) {
-    a.stopTyping();
-    if (activeAbort && activeAbort.signal.aborted) {
-      // 用户主动停止：保留已生成的部分并写入历史（下轮可继续追问）
+    acc = splitInlineThink(acc).answer;   // 中断时展示/持久化干净正文（未闭合思考不再回退原文）
+    // 用户主动停止，或切换会话造成的中止：已生成的部分都写回本轮所属的会话
+    if (isStaleChat(ctx.epoch) || (activeAbort && activeAbort.signal.aborted)) {
+      const keep = partialTurnText(acc, shownThink);
+      if (keep) {
+        ctx.messages.push(userMsg);
+        ctx.messages.push(assistantMsgWithSubs(keep, shownThink, subs));
+      }
+      if (isStaleChat(ctx.epoch)) return;   // 界面已属于新会话：不写气泡、不把状态条留给它
+      a.stopTyping();
       a.setText(acc ? acc + '\n\n（已停止）' : '（已停止，未收到回复内容）');
       a.setRich();
       setStatus('已停止生成');
-      if (acc) {
-        messages.push(userMsg);
-        messages.push({ role: 'assistant', content: acc });
-      }
     } else {
+      a.stopTyping();
       a.setText(acc ? acc + '\n\n[中断] ' + e.message : '错误：' + e.message);
       setStatusError(e);
     }
   } finally {
-    activeAbort = null;
-    streaming = false; updateSendState(); scrollBottom();
-    // 发送消息后功能标签消失（翻译 / 解释 / 文件模式在此清除；总结网页为即时执行，
-    // 标签在其执行期间保留，直至用户发送下一条消息或手动关闭）
-    clearFuncMode();
-    persistActiveConversation();   // 每次成功发送后自动保存 / 更新当前会话
+    if (isStaleChat(ctx.epoch)) {
+      // 用户已切走会话：全局 streaming/activeAbort 由 leaveChatContext 复位过，
+      // 这里只把本轮（中止时即已生成的部分）写回它自己的会话
+      persistStaleTurn(ctx);
+    } else {
+      activeAbort = null;
+      streaming = false; updateSendState(); scrollBottom();
+      // 发送消息后功能标签消失（翻译 / 解释 / 文件模式在此清除；总结网页为即时执行，
+      // 标签在其执行期间保留，直至用户发送下一条消息或手动关闭）
+      clearFuncMode();
+      persistActiveConversation();   // 每次成功发送后自动保存 / 更新当前会话
+    }
   }
 }
 
@@ -1534,23 +2061,53 @@ function sendAutomateOnce(name, args, timeoutMs = 60000) {
  * - collaborators：其它启用的推理模型（不含执行模型与视觉模型）。
  * - observation：用户任务 + 当前页面观察（pageCtx + 已发生的操作步骤，均为文本）。
  * - 并行征询；单个模型失败/超限不影响主流程（其建议被跳过）。仅返回文本建议，绝不操作页面。
+ * - onAdvisor：与聊天页协作芯片同一套事件契约（start/progress/done/empty/error），
+ *   顾问的思考过程此前被静默丢弃，界面上只剩一句「思考中…」，看不出是谁在跑、跑到哪一步。
+ *   这里把它回报出去，由 subStatusRenderer 渲染成可点开的芯片行。
  */
-async function consultCollaborators(collaborators, observation, models, backupModels) {
+async function consultCollaborators(collaborators, observation, models, backupModels, onAdvisor) {
   if (!collaborators || !collaborators.length) return [];
+  const total = collaborators.length;
+  const emit = onAdvisor ? (evt) => { try { onAdvisor(evt); } catch (_) { /* UI 回调不参与成败 */ } } : null;
   const advices = [];
-  await Promise.all(collaborators.map(async (m) => {
+  await Promise.all(collaborators.map(async (m, index) => {
+    const base = { index, total, id: m.id, name: m.name || m.id };
+    const t0 = Date.now();
+    if (emit) emit({ ...base, phase: 'start' });
+    let think = '';
+    let raw = '';
     try {
       const msgs = [
         { role: 'system', content: '你是网页自动化任务的规划顾问。你不能直接操作网页，只能基于给定的「用户任务」与「当前页面观察」，用简洁的中文给出下一步操作的建议及理由。不要输出 toolcall / 函数调用，只输出建议文字。' },
         { role: 'user', content: observation },
       ];
-      let text = '';
       for await (const chunk of chatStream({ models, backupModels }, msgs, { mode: 'single', selectedId: m.id, signal: activeAbort?.signal })) {
-        if (chunk.delta) text += chunk.delta;
+        const d = chunk.delta || '';
+        const t = chunk.thinking || '';
+        if (t) think += t;
+        if (d) raw += d;
+        if ((d || t) && emit) emit({ ...base, phase: 'progress', thinkingDelta: t, textDelta: d });
       }
-      text = (text || '').trim();
-      if (text) advices.push(`【${m.name || m.id}】${text}`);
-    } catch (_) { /* 单个协作模型失败不影响主流程 */ }
+      // 剥离内联思考标签：协作建议会回灌给执行模型，思考混进去会污染上下文。
+      // 剥出来的部分并进思考区，用户在芯片详情里仍能看到全文。
+      const sp = splitInlineThink(raw);
+      const text = sp.answer.trim();
+      const thinkAll = sp.think ? (think ? think + '\n\n' + sp.think : sp.think) : think;
+      if (text) {
+        advices.push(`【${base.name}】${text}`);
+        if (emit) emit({ ...base, phase: 'done', ms: Date.now() - t0, thinking: thinkAll, text });
+      } else if (emit) {
+        emit({
+          ...base, phase: 'empty', ms: Date.now() - t0, thinking: thinkAll, text: '',
+          reason: thinkAll ? `只有思考、没有给出建议（已思考 ${thinkAll.length} 字）` : '未返回内容',
+        });
+      }
+    } catch (e) { /* 单个协作模型失败不影响主流程 */
+      if (emit) {
+        emit({ ...base, phase: 'error', ms: Date.now() - t0,
+          error: (activeAbort && activeAbort.signal.aborted) ? '已中止' : (e && e.message) || String(e) });
+      }
+    }
   }));
   return advices;
 }
@@ -1630,11 +2187,12 @@ function pushToolMessage(m) {
 /** 网页操作主循环 */
 async function runAutomation(userText) {
   if (streaming) return;
+  const ctx = captureChatContext();   // 本轮所属会话上下文，收尾时校验（见 isStaleChat）
   const content = (userText || '').trim();
   if (!content) return;
 
   pushUser(content);
-  messages.push({ role: 'user', content });
+  ctx.messages.push({ role: 'user', content });
 
   // A. 发起自动化前，先取“当前网页”快照（标题/网址/首屏正文）注入系统提示，
   // 让模型开局就知道自己正在操作哪个页面，避免弱模型凭空假设页面结构（如乱点不存在的按钮、擅自新开标签）。
@@ -1653,6 +2211,8 @@ async function runAutomation(userText) {
     }
   } catch (_) { /* 取不到也不阻断主流程，仅缺少页面上下文 */ }
 
+  // 取页面快照是 await：期间用户可能已切换会话，此时本轮不再启动工具循环
+  if (isStaleChat(ctx.epoch)) return;
   const sysMsg = { role: 'system', content: buildToolSystemPrompt() + pageCtx };
   // 后台循环上下文（仅用于把工具返回结果回灌给 AI 续跑），不写入用户可见历史
   const loop = [];
@@ -1696,6 +2256,10 @@ async function runAutomation(userText) {
 
   let a = null;
   let acc = '';
+  let thinkAcc = '';        // 思考流累积（agent 模型的推理过程，不参与工具解析）
+
+  let lastFinish = '';
+  let shownThink = '';   // 本轮实际展示过的思考全文（随消息持久化）
   let pendingShot = null;   // 待回灌给「下一轮」模型的截图：仅发送一次，避免大图被每轮重复回灌导致 token 暴涨 / 触发模型 API 限流
   streaming = true;
   activeAbort = new AbortController();   // 支持"停止生成"（中止当前轮模型调用；已派发的单次工具操作会先执行完）
@@ -1704,18 +2268,26 @@ async function runAutomation(userText) {
     let iter = 0;
     let finished = false;
     while (iter < MAX_TOOL_ITERS) {
+      if (isStaleChat(ctx.epoch)) return;   // 会话已切换：不再发起下一轮模型调用
       iter++;
       a = a || newAssistant();
       acc = '';
+      thinkAcc = '';
+      lastFinish = '';
       a.setText('');
+      a.setThinking('');
       let started = false;
-      setStatus('思考中…');
+      // 顾问运行状态：与聊天页协作同款的一行芯片。每轮的气泡都是新建的（工具执行后 a=null），
+      // 所以芯片行天然按轮分开，不会与上一轮混在一起。
+      const advise = collaborators.length ? subStatusRenderer(a) : null;
+      setStatus(collaborators.length ? '正在征询协作模型建议…' : '思考中…');
       // 多模型协作：征询规划顾问建议（仅文本，不操作页面），回灌给执行模型作参考
       if (collaborators.length) {
         const observation = (pageCtx || '') + '\n\n【已发生的操作步骤】\n' +
           (loop.length ? loop.map(m => m.content).join('\n---\n') : '（尚无操作步骤）') +
           '\n\n请基于以上用户任务与页面观察，给出下一步操作的建议（只输出建议文字，不要调用工具）。';
-        const advices = await consultCollaborators(collaborators, observation, models, backupModels);
+        const advices = await consultCollaborators(
+          collaborators, observation, models, backupModels, advise ? advise.onSubModel : undefined);
         if (advices.length) latestCollabAdvice = advices.join('\n');
       }
       const apiMessages = [sysMsg, ...messages, ...loop];
@@ -1735,6 +2307,7 @@ async function runAutomation(userText) {
         signal: activeAbort.signal,
         onFallback: (i, cfg, reason) => setStatus(`已切换到备用模型 #${i + 1}：${cfg.name}（${reason}）`),
       })) {
+        if (isStaleChat(ctx.epoch)) return;   // 会话已切换：本轮增量与后续工具调用一律丢弃
         if (chunk.error === 'NO_PRIMARY') {
           a.stopTyping();
           a.setText('请在模型配置页面选择主模型后再进行聊天');
@@ -1743,11 +2316,22 @@ async function runAutomation(userText) {
         }
         if (!started) { started = true; a.stopTyping(); setStatus('正在回复…'); }
         else a.stopTyping();
-        acc += chunk.delta;
-        a.setText(acc);
+        if (chunk.thinking) thinkAcc += chunk.thinking;
+        if (chunk.finishReason) lastFinish = chunk.finishReason;
+        acc += chunk.delta || '';
+        const parts = splitInlineThink(acc);
+        // 无内联思考时直接复用 thinkAcc 引用，避免每帧重拼大字符串（O(n²) 拷贝）
+        let thinkAll = thinkAcc;
+        if (parts.think) thinkAll = thinkAll ? thinkAll + '\n\n' + parts.think : parts.think;
+        if (thinkAll) a.setThinking(thinkAll);
+        shownThink = thinkAll;
+        a.setText(parts.answer);
         scrollBottom();
       }
 
+      // 剥离内联思考标签得到纯净正文：工具解析 / 工具意图 / DONE 判定 / 历史持久化
+      // 全部基于干净正文，防止思考文本里出现 "DONE"、"调用工具" 等字样触发误判
+      acc = splitInlineThink(acc).answer;
       const calls = parseToolCalls(acc);
       if (calls.length) {
         const display = stripToolCall(acc).trim();
@@ -1781,7 +2365,7 @@ async function runAutomation(userText) {
           // 移除本轮流式气泡，改用工具卡片展示，避免重复呈现
           if (a && a.el) a.el.remove();
           pushToolMessage(toolMsg);
-          messages.push(toolMsg);
+          ctx.messages.push(toolMsg);
           // 后台循环上下文：把工具返回结果回灌给 AI 续跑（仅用于模型上下文，不写入用户可见历史）。
           // 回灌文本剔除截图 base64（图片已作为附件单独传递），避免上下文臃肿。
           const resForText = (result && result.ok && result.result) ? { ...result.result } : null;
@@ -1843,12 +2427,14 @@ async function runAutomation(userText) {
       }
 
       // 无工具调用、且已输出 DONE（或已达上限）→ 任务结束
-      messages.push({ role: 'assistant', content: acc });
+      const tnote = truncateNote(lastFinish);
+      if (tnote) { acc += tnote; if (a && a.el) a.setText(acc); }
+      ctx.messages.push(assistantMsg(acc, shownThink));
       if (iter >= MAX_TOOL_ITERS && !/^\s*DONE\s*$/m.test(acc)) {
         // 已达轮次上限仍未给出 DONE 标记：明确告知用户任务可能未完整完成，避免被误当结论
         const note = '\n\n[提示] 已达到最大操作轮次（' + MAX_TOOL_ITERS + '）仍未收到完成标记，任务可能尚未全部完成。可继续补充指令或重新发起。';
-        messages[messages.length - 1].content += note;
-        if (a && a.el) a.setText(messages[messages.length - 1].content);
+        ctx.messages[ctx.messages.length - 1].content += note;
+        if (a && a.el) a.setText(ctx.messages[ctx.messages.length - 1].content);
       }
       if (a && a.el) a.setRich();   // 最终态：代码块高亮渲染
       setStatus('');
@@ -1861,12 +2447,16 @@ async function runAutomation(userText) {
     if (!finished && iter >= MAX_TOOL_ITERS) {
       const note = '⚠️ 已达到最大操作轮次（' + MAX_TOOL_ITERS + '），期间工具调用均失败或未能完成任务。' +
         '可调整指令（选择器 / 步骤）或换用更稳定的模型后重新发起。';
-      messages.push({ role: 'assistant', content: note });
+      ctx.messages.push({ role: 'assistant', content: note });
       const fin = newAssistant();
       fin.setText(note);
       setStatus('已达上限，任务未完成', 'warn');
     }
   } catch (e) {
+    // 切会话造成的中止：界面已属于新会话，只跳过渲染与状态条，
+    // 已发生的用户消息与工具卡片都在 ctx.messages 里，由 finally 写回原会话
+    if (isStaleChat(ctx.epoch)) return;
+    acc = splitInlineThink(acc).answer;   // 中断时展示干净正文（思考已在折叠区，未闭合不回退原文）
     if (activeAbort && activeAbort.signal.aborted) {
       // 用户主动停止：ReAct 循环中途不写历史（半截工具调用上下文不完整），仅展示已生成内容
       if (a) {
@@ -1883,10 +2473,13 @@ async function runAutomation(userText) {
       setStatusError(e);
     }
   } finally {
-    activeAbort = null;
-    streaming = false; updateSendState(); scrollBottom();
-    clearFuncMode();
-    persistActiveConversation();
+    if (isStaleChat(ctx.epoch)) persistStaleTurn(ctx);   // 已执行到的轮次写回原会话
+    else {
+      activeAbort = null;
+      streaming = false; updateSendState(); scrollBottom();
+      clearFuncMode();
+      persistActiveConversation();
+    }
   }
 }
 
@@ -2663,6 +3256,7 @@ async function getActivePage() {
 /** 在聊天中内联总结当前网页（点击“总结网页”后立即执行） */
 async function runSummarizeInChat(instruction) {
   if (streaming) return;
+  const ctx = captureChatContext();   // 本轮所属会话上下文，收尾时校验（见 isStaleChat）
   setStatus('正在获取当前网页…');
   let page;
   try { page = await getActivePage(); }
@@ -2670,6 +3264,8 @@ async function runSummarizeInChat(instruction) {
   if (!page.text || !page.text.trim()) {
     setStatus('未能从当前网页提取到正文', 'err'); clearFuncMode(); return;
   }
+  // 取正文是 await：期间用户可能已切换会话，此时本轮不再写入聊天区
+  if (isStaleChat(ctx.epoch)) return;
 
   const welcome = $('#welcome');
   if (welcome) welcome.remove();
@@ -2680,7 +3276,7 @@ async function runSummarizeInChat(instruction) {
   const a = newAssistant();
   streaming = true; sendBtn.disabled = true; setStatus('正在总结…');
 
-  let acc = ''; let started = false;
+  let acc = ''; let started = false; let thinkAcc = ''; let lastFinish = ''; let shownThink = '';
   const sumMode = chatModelId === '__collab__' ? 'collab' : 'single';
   if (sumMode === 'collab' && !models.filter(m => m.enabled !== false).some(m => m.isPrimary)) {
     a.stopTyping();
@@ -2691,6 +3287,8 @@ async function runSummarizeInChat(instruction) {
   }
   const sumRef = currentRefModel();
   const sumTs = (sumRef && sumRef.supportsThinking) ? thinkingStrength : undefined;
+  // 协作总结同样是「子模型并发 + 主模型整合」，芯片行为与聊天完全一致
+  const subs = sumMode === 'collab' ? subStatusRenderer(a) : null;
   activeAbort = new AbortController();   // 支持"停止生成"
   updateSendState();
   try {
@@ -2700,46 +3298,74 @@ async function runSummarizeInChat(instruction) {
       instruction: prompt,
       mode: sumMode,
       thinkingStrength: sumTs,
+      ...(subs ? { onSubModel: subs.onSubModel } : {}),
       signal: activeAbort.signal,
       onFallback: (i, cfg, reason) => setStatus(`已切换到备用模型 #${i + 1}：${cfg.name}（${reason}）`),
     })) {
+      if (isStaleChat(ctx.epoch)) break;   // 会话已切换：不再消费后续增量
       if (!started) { started = true; a.stopTyping(); setStatus('正在回复…'); }
       else a.stopTyping();
-      acc += chunk.delta;
-      a.setText(acc);
+      if (chunk.thinking) thinkAcc += chunk.thinking;
+      if (chunk.finishReason) lastFinish = chunk.finishReason;
+      acc += chunk.delta || '';
+      const parts = splitInlineThink(acc);
+      // 无内联思考时直接复用 thinkAcc 引用，避免每帧重拼大字符串（O(n²) 拷贝）
+      let thinkAll = thinkAcc;
+      if (parts.think) thinkAll = thinkAll ? thinkAll + '\n\n' + parts.think : parts.think;
+      if (thinkAll) a.setThinking(thinkAll);
+      shownThink = thinkAll;
+      a.setText(parts.answer);
       scrollBottom();
     }
-    messages.push({ role: 'user', content: prompt });
-    messages.push({ role: 'assistant', content: acc });
+    const sumSp = splitInlineThink(acc);
+    if (thinkAcc || sumSp.think) acc = sumSp.answer;   // 未闭合思考（截断）时正文为空：宁可不入历史，也不把带标签的原始思考当正文保存
+
+    const tnote = truncateNote(lastFinish);
+    if (tnote) {
+      acc += tnote;
+      a.setText(acc);
+      if (!isStaleChat(ctx.epoch)) scrollBottom();
+    }
+    ctx.messages.push({ role: 'user', content: prompt });
+    ctx.messages.push(assistantMsgWithSubs(acc, shownThink, subs));
+    if (isStaleChat(ctx.epoch)) return;   // 历史已写回原会话，界面留给新会话
     a.setRich();   // 最终态：代码块高亮渲染
     setStatus('');
   } catch (e) {
-    a.stopTyping();
-    if (activeAbort && activeAbort.signal.aborted) {
-      // 用户主动停止：保留已生成的部分并写入历史
+    acc = splitInlineThink(acc).answer;
+    // 用户主动停止，或切换会话造成的中止：已生成的部分都写回本轮所属的会话
+    if (isStaleChat(ctx.epoch) || (activeAbort && activeAbort.signal.aborted)) {
+      const keepSum = partialTurnText(acc, shownThink);
+      if (keepSum) {
+        ctx.messages.push({ role: 'user', content: prompt });
+        ctx.messages.push(assistantMsgWithSubs(keepSum, shownThink, subs));
+      }
+      if (isStaleChat(ctx.epoch)) return;
+      a.stopTyping();
       a.setText(acc ? acc + '\n\n（已停止）' : '（已停止，未收到回复内容）');
       a.setRich();
       setStatus('已停止生成');
-      if (acc) {
-        messages.push({ role: 'user', content: prompt });
-        messages.push({ role: 'assistant', content: acc });
-      }
     } else {
+      a.stopTyping();
       a.setText(acc ? acc + '\n\n[中断] ' + e.message : '错误：' + e.message);
       setStatusError(e);
     }
   } finally {
-    activeAbort = null;
-    streaming = false; updateSendState(); scrollBottom();
-    // 发送消息（或手动关闭）后功能标签消失；总结现已改为“手动发送”，故发送后清除标签
-    clearFuncMode();
-    persistActiveConversation();   // 总结网页会话同样自动保存
+    if (isStaleChat(ctx.epoch)) persistStaleTurn(ctx);   // 本轮总结写回它自己的会话
+    else {
+      activeAbort = null;
+      streaming = false; updateSendState(); scrollBottom();
+      // 发送消息（或手动关闭）后功能标签消失；总结现已改为“手动发送”，故发送后清除标签
+      clearFuncMode();
+      persistActiveConversation();   // 总结网页会话同样自动保存
+    }
   }
 }
 
 /** 一键把当前网页做成 PPT（走 summarize_to_ppt 工作流模板：网页正文 → 摘要 → 导出 PPT） */
 async function runWebToPpt(templateId = 'classic-blue') {
   if (streaming) return;
+  const ctx = captureChatContext();   // 本轮所属会话上下文，收尾时校验（见 isStaleChat）
   closeFuncMenu();
   setStatus('正在提取网页并生成 PPT…');
   const welcome = document.getElementById('welcome');
@@ -2753,13 +3379,18 @@ async function runWebToPpt(templateId = 'classic-blue') {
     const resp = await new Promise((resolve) => {
       chrome.runtime.sendMessage({ type: 'WORKFLOW_RUN', templateId: 'summarize_to_ppt', template: templateId }, (r) => resolve(r || { ok: false, error: '无响应' }));
     });
+    // 工作流为数分钟的 await：期间用户可能已切换会话。
+    // 界面已交给新会话，本轮的状态条提示一律不再画；结果照常记进它自己的会话。
+    const stale = isStaleChat(ctx.epoch);
     if (!resp || !resp.ok) {
+      if (stale) return;
       done('❌ ' + ((resp && resp.error) || '工作流执行失败'));
       setStatus('生成失败', 'err');
       return;
     }
     const ppt = resp.results && resp.results.export_ppt;
     if (!ppt || !ppt.dataUrl) {
+      if (stale) return;
       done('⚠️ 已执行但缺少可下载的 PPT 数据' + (resp.errors && resp.errors.export_ppt ? '：' + JSON.stringify(resp.errors.export_ppt) : ''));
       setStatus('生成异常', 'err');
       return;
@@ -2773,22 +3404,29 @@ async function runWebToPpt(templateId = 'classic-blue') {
     link.remove();
     const fname = ppt.filename || '演示文稿.pptx';
     done(`✅ PPT 已生成并开始下载：${fname}\n\n（由「网页正文 → 摘要 → 导出 PPT」工作流自动完成）`);
-    messages.push({ role: 'user', content: '把当前网页做成 PPT' });
-    messages.push({ role: 'assistant', content: acc });
+    ctx.messages.push({ role: 'user', content: '把当前网页做成 PPT' });
+    ctx.messages.push({ role: 'assistant', content: acc });
+    if (stale) return;
     setStatus('');
   } catch (e) {
+    // 切会话后本轮的错误属于上一个会话：界面已交给新会话，不再画红色错误条
+    if (isStaleChat(ctx.epoch)) return;
     done('❌ 错误：' + e.message);
     setStatusError(e);
   } finally {
-    streaming = false; updateSendState(); scrollBottom();
-    clearFuncMode();
-    persistActiveConversation();
+    if (isStaleChat(ctx.epoch)) persistStaleTurn(ctx);   // PPT 轮次写回它自己的会话
+    else {
+      streaming = false; updateSendState(); scrollBottom();
+      clearFuncMode();
+      persistActiveConversation();
+    }
   }
 }
 
 /** 联网搜索：抓取实时搜索结果 → 交由当前模型链路基于结果流式作答 */
 async function runWebSearchInChat(query) {
   if (streaming) return;
+  const ctx = captureChatContext();   // 本轮所属会话上下文，收尾时校验（见 isStaleChat）
   const welcome = $('#welcome');
   if (welcome) welcome.remove();
   pushUser(query);
@@ -2833,6 +3471,8 @@ async function runWebSearchInChat(query) {
     }
     if (!results.length) throw new Error('未获取到搜索结果');
   } catch (e) {
+    // 切会话触发的是「已停止」而非真正的错误：静默丢弃，别把红色错误条画到新会话上
+    if (isStaleChat(ctx.epoch)) return;
     a.stopTyping();
     a.setText('联网搜索失败：' + formatErrorLine(e));
     setStatusError(e, '联网搜索失败');
@@ -2840,6 +3480,8 @@ async function runWebSearchInChat(query) {
     persistActiveConversation();
     return;
   }
+  // 搜索抓取是 await：期间用户可能已切换会话，本轮结果不再写入新会话
+  if (isStaleChat(ctx.epoch)) return;
 
   // 2) 构造上下文并交给模型作答
   const refs = results
@@ -2872,9 +3514,11 @@ async function runWebSearchInChat(query) {
   }
   const ref = currentRefModel();
   const ts = (ref && ref.supportsThinking) ? thinkingStrength : undefined;
+  // 协作搜索同样是「子模型并发 + 主模型整合」，芯片行为与聊天完全一致
+  const subs = mode === 'collab' ? subStatusRenderer(a) : null;
 
   setStatus('正在整理搜索结果…');
-  let acc = ''; let started = false;
+  let acc = ''; let started = false; let thinkAcc = ''; let lastFinish = ''; let shownThink = '';
   activeAbort = new AbortController();   // 支持"停止生成"（搜索抓取阶段不支持，仅作答阶段可停）
   updateSendState();
   try {
@@ -2882,9 +3526,11 @@ async function runWebSearchInChat(query) {
       mode,
       selectedId: mode === 'single' ? chatModelId : undefined,
       thinkingStrength: ts,
+      ...(subs ? { onSubModel: subs.onSubModel } : {}),
       signal: activeAbort.signal,
       onFallback: (i, cfg, reason) => setStatus(`已切换到备用模型 #${i + 1}：${cfg.name}（${reason}）`),
     })) {
+      if (isStaleChat(ctx.epoch)) break;   // 会话已切换：不再消费后续增量
       if (chunk.error === 'NO_PRIMARY') {
         a.stopTyping(); a.setText('请在模型配置页面选择主模型后再进行联网搜索');
         setStatus('未选择主模型', 'err');
@@ -2892,34 +3538,59 @@ async function runWebSearchInChat(query) {
       }
       if (!started) { started = true; a.stopTyping(); setStatus('正在回复…'); }
       else a.stopTyping();
-      acc += chunk.delta;
-      a.setText(acc);
+      if (chunk.thinking) thinkAcc += chunk.thinking;
+      if (chunk.finishReason) lastFinish = chunk.finishReason;
+      acc += chunk.delta || '';
+      const parts = splitInlineThink(acc);
+      // 无内联思考时直接复用 thinkAcc 引用，避免每帧重拼大字符串（O(n²) 拷贝）
+      let thinkAll = thinkAcc;
+      if (parts.think) thinkAll = thinkAll ? thinkAll + '\n\n' + parts.think : parts.think;
+      if (thinkAll) a.setThinking(thinkAll);
+      shownThink = thinkAll;
+      a.setText(parts.answer);
       scrollBottom();
     }
+    const srchSp = splitInlineThink(acc);
+    if (thinkAcc || srchSp.think) acc = srchSp.answer;   // 未闭合思考（截断）时正文为空：宁可不入历史，也不把带标签的原始思考当正文保存
+
+    const tnote = truncateNote(lastFinish);
+    if (tnote) {
+      acc += tnote;
+      a.setText(acc);
+      if (!isStaleChat(ctx.epoch)) scrollBottom();   // 已切会话：别把新会话的滚动位置拽到底
+    }
     // 持久化：用户消息只记原始问题（不含长搜索上下文），保持会话清爽
-    messages.push({ role: 'user', content: query });
-    messages.push({ role: 'assistant', content: acc });
+    ctx.messages.push({ role: 'user', content: query });
+    ctx.messages.push(assistantMsgWithSubs(acc, shownThink, subs));
+    if (isStaleChat(ctx.epoch)) return;   // 历史已写回原会话，界面留给新会话
     a.setRich();   // 最终态：代码块高亮渲染
     setStatus('');
   } catch (e) {
-    a.stopTyping();
-    if (activeAbort && activeAbort.signal.aborted) {
-      // 用户主动停止：保留已生成的部分并写入历史
+    acc = splitInlineThink(acc).answer;
+    // 用户主动停止，或切换会话造成的中止：已生成的部分都写回本轮所属的会话
+    if (isStaleChat(ctx.epoch) || (activeAbort && activeAbort.signal.aborted)) {
+      const keepSrch = partialTurnText(acc, shownThink);
+      if (keepSrch) {
+        ctx.messages.push({ role: 'user', content: query });
+        ctx.messages.push(assistantMsgWithSubs(keepSrch, shownThink, subs));
+      }
+      if (isStaleChat(ctx.epoch)) return;
+      a.stopTyping();
       a.setText(acc ? acc + '\n\n（已停止）' : '（已停止，未收到回复内容）');
       a.setRich();
       setStatus('已停止生成');
-      if (acc) {
-        messages.push({ role: 'user', content: query });
-        messages.push({ role: 'assistant', content: acc });
-      }
     } else {
+      a.stopTyping();
       a.setText(acc ? acc + '\n\n[中断] ' + e.message : '错误：' + e.message);
       setStatusError(e);
     }
   } finally {
-    activeAbort = null;
-    streaming = false; updateSendState(); scrollBottom();
-    persistActiveConversation();
+    if (isStaleChat(ctx.epoch)) persistStaleTurn(ctx);   // 本轮回答写回它自己的会话
+    else {
+      activeAbort = null;
+      streaming = false; updateSendState(); scrollBottom();
+      persistActiveConversation();
+    }
   }
 }
 
@@ -3006,6 +3677,7 @@ async function detectMultimodalTask(text) {
  */
 async function routeMultimodalTask(task, prompt) {
   if (streaming) return;
+  const ctx = captureChatContext();   // 本轮所属会话上下文，收尾时校验（见 isStaleChat）
   input.value = ''; autosize();
   attachments = []; renderAttachments();
   const welcome = $('#welcome');
@@ -3031,14 +3703,19 @@ async function routeMultimodalTask(task, prompt) {
       const cfg = candidates[0];
       const payload = await callMultimodalModel(cfg, task.type, prompt);
       if (payload.blobUrl) blobUrlToRevoke = payload.blobUrl;
-      renderMultimodalResult(a, task.type, cfg, payload);
-      messages.push({ role: 'user', content: prompt });
+      // 生成为数分钟的 await：期间用户可能已切换会话——结果仍记进它自己的会话，只是不再渲染
+      const stale = isStaleChat(ctx.epoch);
+      if (!stale) renderMultimodalResult(a, task.type, cfg, payload);
+      ctx.messages.push({ role: 'user', content: prompt });
       // 保存结构化 media 信息，确保历史会话回放时仍能以图片/音频/视频直接展示（而非纯 URL 文本）
-      messages.push({ role: 'assistant', content: `[${label}] ${payload.url}`,
+      ctx.messages.push({ role: 'assistant', content: `[${label}] ${payload.url}`,
         media: { type: task.type, url: payload.url, name: cfg.name || cfg.model } });
+      if (stale) return;
     }
     setStatus('');
   } catch (e) {
+    // 切会话后本轮的错误属于上一个会话：界面已交给新会话，不再画红色错误条
+    if (isStaleChat(ctx.epoch)) return;
     a.stopTyping();
     a.setText('多模态生成失败：' + formatErrorLine(e));
     setStatusError(e, '多模态生成失败');
@@ -3047,8 +3724,11 @@ async function routeMultimodalTask(task, prompt) {
     if (blobUrlToRevoke) {
       try { URL.revokeObjectURL(blobUrlToRevoke); } catch (_) {}
     }
-    streaming = false; updateSendState(); scrollBottom();
-    persistActiveConversation();
+    if (isStaleChat(ctx.epoch)) persistStaleTurn(ctx);   // 生成结果写回它自己的会话
+    else {
+      streaming = false; updateSendState(); scrollBottom();
+      persistActiveConversation();
+    }
   }
 }
 
@@ -3262,6 +3942,7 @@ function renderModels() {
   const wrap = $('#modelList');
   wrap.innerHTML = models.map((m, i) => {
     const vlabel = (v) => (v === 'openai' || v === 'anthropic') ? `${v}（兼容）` : v;
+    const mtHint = maxTokensHint(m);
     const modelOpts = (fetchedModels[m.id] || [])
       .map(id => `<option value="${escapeHtml(id)}"></option>`)
       .join('');
@@ -3291,6 +3972,9 @@ function renderModels() {
           <span class="model-status"></span>
         </label>
         <label>超时 ms <input data-f="timeoutMs" type="number" value="${m.timeoutMs || 60000}" /></label>
+        <label class="full" data-tip="单次回复的最大输出 token 上限：思考与正文共用这一份额度，过小会让正文被 max_tokens 截断；留空=厂商默认">最大输出 tokens <input data-f="maxTokens" type="number" min="1" placeholder="留空=厂商默认" value="${typeof m.maxTokens === 'number' ? m.maxTokens : ''}" />
+          ${mtHint ? `<span class="field-hint">${mtHint}</span>` : ''}
+        </label>
         <label class="full">API Base <input data-f="apiBase" value="${escapeHtml(m.apiBase || '')}" /></label>
         <label class="full">API Key <input data-f="apiKey" type="password" value="${escapeHtml(m.apiKey || '')}" /></label>
       </div>
@@ -3316,7 +4000,18 @@ function renderModels() {
         <label data-tip="逐字流式输出；关闭则等待完整结果后一次性返回"><input type="checkbox" data-f="supportsStream" ${m.supportsStream !== false ? 'checked' : ''}/> 流式</label>
         <label data-tip="多模型协作时由它整合各子模型结果；只能勾选一个主模型"><input type="checkbox" data-f="isPrimary" ${m.isPrimary ? 'checked' : ''}/> 主模型</label>
         <label data-tip="开启推理/思考能力，推理模型会先思考再作答（Anthropic 走 thinking budget）"><input type="checkbox" data-f="supportsThinking" ${m.supportsThinking ? 'checked' : ''}/> 思考</label>
-        <label class="res-flag" data-tip="OpenAI 兼容推理模型（o1/o3 等）专用：开启后发送 reasoning_effort 参数；普通模型（如 gpt-4o）请勿勾选，否则会报 HTTP 400" style="display:${m.supportsThinking && m.vendor !== 'anthropic' ? '' : 'none'}"><input type="checkbox" data-f="reasoningEffortSupported" ${m.reasoningEffortSupported ? 'checked' : ''}/> 推理</label>
+      </div>
+      <div class="mc-think">
+        <label class="think-style" data-tip="各网关「让模型思考」的参数不同：默认按模型名自动识别；识别不准时手动指定。仅 OpenAI 兼容厂商需要，Anthropic / Gemini / Ollama 用各自原生参数">思考参数
+          <select data-f="thinkingStyle">
+            ${THINKING_STYLES.map(s => `<option value="${s.value}" ${(m.thinkingStyle || 'auto') === s.value ? 'selected' : ''}>${s.label}</option>`).join('')}
+          </select>
+        </label>
+        <label class="think-strength" data-tip="思考强度：reasoning_effort 直接映射档位；Qwen 映射 thinking_budget；GLM 仅开/关有效；Anthropic 按档位分配思考预算">思考强度
+          <select data-f="thinkingStrength">
+            ${thinkingLevels(m.vendor).map(l => `<option value="${l.value}" ${(m.thinkingStrength || 'off') === l.value ? 'selected' : ''}>${l.label}</option>`).join('')}
+          </select>
+        </label>
       </div>
     </div>`;
   }).join('');
@@ -3327,7 +4022,13 @@ function renderModels() {
       const i = +card.dataset.i;
       const f = inp.dataset.f;
       const val = inp.type === 'checkbox' ? inp.checked : inp.value;
-      models[i][f] = (f === 'timeoutMs' || f === 'temperature' || f === 'top_p') ? Number(val) : val;
+      if (f === 'maxTokens') {
+        // 最大输出 tokens：空串/非正数视为未配置（发厂商默认），避免 max_tokens:0 这类非法值进请求体
+        const n = Number(val);
+        models[i][f] = (val === '' || !Number.isFinite(n) || n <= 0) ? undefined : n;
+      } else {
+        models[i][f] = (f === 'timeoutMs' || f === 'temperature' || f === 'top_p') ? Number(val) : val;
+      }
 
       // ---- 复选框联动规则 ----
       if (f === 'supportsVision' && val) {
@@ -3354,7 +4055,14 @@ function renderModels() {
         syncAlias(card, models, i, '');
       }
       persistModelsToStorage(models);
-      refreshCheckboxUI();              // 重算各复选框的禁用/选中态
+      refreshCheckboxUI();              // 重算各复选框的禁用/选中态与思考选择器可见性
+      // 思考相关配置（含主模型/启用变化会改变参考模型）变更时，聊天页下拉同步为模型卡新值；
+      // 其它字段编辑仅刷新显隐，不打断用户在聊天页的手动选择
+      if (['supportsThinking', 'thinkingStrength', 'thinkingStyle', 'isPrimary', 'enabled'].includes(f)) {
+        syncThinkingFromRef();
+      } else {
+        renderThinkingSelect();
+      }
       if (f === 'apiBase' || f === 'apiKey' || f === 'vendor') refreshModelList(models, i, wrap);
       if (f === 'name' || f === 'model' || f === 'vendor' || f === 'enabled' || f === 'isPrimary' || f === 'supportsVision') renderModelSelect();
     });
@@ -3422,6 +4130,7 @@ function renderModels() {
   // 配置变更后实时同步聊天框的模型下拉，避免选项不同步/缺失
   refreshCheckboxUI();
   renderModelSelect();
+  syncThinkingFromRef();
 }
 
 /**
@@ -3904,10 +4613,22 @@ function refreshCheckboxUI() {
     streamCb.disabled = isVision;
     thinkCb.disabled = isVision;
 
-    // reasoning_effort 开关：仅 OpenAI 兼容厂商（openai/ollama/gemini）+ 开启思考时显示
-    const resFlagLabel = card.querySelector('.res-flag');
-    if (resFlagLabel) {
-      resFlagLabel.style.display = (m.supportsThinking && m.vendor !== 'anthropic') ? '' : 'none';
+    // 思考相关选择器：仅开启「思考」且非视觉模型时显示。
+    // 思考参数（风格）下拉仅 OpenAI 兼容（openai）厂商有意义；强度下拉按厂商刷新选项
+    //（anthropic 展示预算档位），避免切换厂商后残留旧选项
+    const showThink = m.supportsThinking && !isVision;
+    const styleLabel = card.querySelector('.think-style');
+    if (styleLabel) styleLabel.style.display = (showThink && m.vendor === 'openai') ? '' : 'none';
+    const strengthLabel = card.querySelector('.think-strength');
+    if (strengthLabel) {
+      strengthLabel.style.display = showThink ? '' : 'none';
+      const sel = strengthLabel.querySelector('select[data-f="thinkingStrength"]');
+      if (sel) {
+        const cur = m.thinkingStrength || 'off';
+        sel.innerHTML = thinkingLevels(m.vendor)
+          .map(l => `<option value="${l.value}" ${l.value === cur ? 'selected' : ''}>${l.label}</option>`).join('');
+        sel.value = cur;
+      }
     }
 
     // 主模型：仅“已启用且非视觉”的模型可选；且全局单选（已有主模型时其余禁用并取消勾选）
@@ -3928,13 +4649,26 @@ function currentRefModel() {
   return models.find(m => m.id === chatModelId) || null;
 }
 
+/**
+ * 把聊天页“思考强度”下拉同步为当前参考模型（单模型=所选模型 / 协作=主模型）的配置档。
+ * 修复覆盖回归：全局值此前只在手动切换模型时同步，页面加载后停在硬编码的 'off'，
+ * 并以最高优先级覆盖模型卡设置的 低/中/高（GLM/Qwen/Ollama 风格会被显式禁用，
+ * 表现为“模型卡设了思考强度但聊天气泡没有思考过程”）。
+ */
+function syncThinkingFromRef() {
+  const ref = currentRefModel();
+  thinkingStrength = ref?.thinkingStrength || 'off';
+  renderThinkingSelect();
+}
+
 /** 渲染聊天界面“思考强度”下拉：仅当参考模型开启“思考”时显示，选项按厂商动态生成 */
 function renderThinkingSelect() {
   const sel = document.getElementById('thinkingSelect');
   if (!sel) return;
   const ref = currentRefModel();
-  // 仅当参考模型真正支持思考才显示：Anthropic 看 supportsThinking；OpenAI 兼容厂商看 reasoningEffortSupported
-  const canThink = ref && (ref.vendor === 'anthropic' ? ref.supportsThinking : ref.reasoningEffortSupported);
+  // 「是否发思考参数、发哪种」由思考参数风格兜底（识别不出 = 不发送，不会 400），
+  // 因此这里只看思考总开关，不再依赖旧的 reasoningEffortSupported
+  const canThink = !!(ref && ref.supportsThinking);
   if (!canThink) { sel.hidden = true; sel.innerHTML = ''; return; }
   const levels = thinkingLevels(ref.vendor);
   const cur = thinkingStrength || ref.thinkingStrength || 'off';
@@ -3990,9 +4724,7 @@ function renderModelSelect() {
   sel.onchange = () => {
     chatModelId = sel.value;
     // 切换模型时，思考强度重置为该模型的配置值
-    const ref = currentRefModel();
-    thinkingStrength = ref?.thinkingStrength || 'off';
-    renderThinkingSelect();
+    syncThinkingFromRef();
   };
   renderThinkingSelect();
 }
@@ -4810,6 +5542,7 @@ renderBackupModels();
 renderWhisperModels();
 renderMultimodalModels();
 renderModelSelect();
+syncThinkingFromRef();   // 启动即按当前模型卡同步思考强度（修复默认停在「关闭」覆盖模型卡的回归）
 initPageTranslate();
 initLiveCaption();
 showView('chat');
@@ -4826,6 +5559,7 @@ if (hasChromeStorage()) {
       LS.set('preview.models', models);
       renderModels();
       renderModelSelect();
+      syncThinkingFromRef();   // 选项页保存后，聊天页思考强度跟随新配置
     }
     if (changes.whisperModels && Array.isArray(changes.whisperModels.newValue)) {
       whisperModels = changes.whisperModels.newValue;
@@ -4850,6 +5584,7 @@ if (hasChromeStorage()) {
       LS.set('preview.conversations', conversations);
       if (currentConvId && !conversations.some(c => c.id === currentConvId)) {
         // 当前会话已被删除：同步清理主页面聊天区
+        leaveChatContext();
         currentConvId = null;
         messages = [];
         chatScroll.innerHTML = '';
